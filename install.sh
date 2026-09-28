@@ -79,7 +79,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.10'
+VERSION = '1.0.11'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -376,13 +376,20 @@ def process_name(line):
 
 
 def read_socket_table():
-    commands = [['ss', '-H', '-lntup'], ['ss', '-lntup']] if shutil.which('ss') else [['netstat', '-lntup']]
+    # TCP 和 UDP 都要列出来：hy2 这类纯 UDP 代理只监听 UDP，
+    # 以前只跑 -lntup（t = 仅 TCP），它的端口根本看不见。
+    if shutil.which('ss'):
+        commands = [['ss', '-H', '-lntup'], ['ss', '-H', '-lnup'],
+                    ['ss', '-lntup'], ['ss', '-lnup']]
+    else:
+        commands = [['netstat', '-lntup'], ['netstat', '-lnup']]
+    chunks = []
     for cmd in commands:
         try:
-            return run(cmd, capture_output=True).stdout
+            chunks.append(run(cmd, capture_output=True).stdout)
         except (OSError, subprocess.CalledProcessError):
             continue
-    return ''
+    return '\n'.join(chunks)
 
 
 def iter_sockets(text):
@@ -434,7 +441,11 @@ def server_ports(group, bounds):
 
 
 def detect_ports(proxy_only=True):
-    """返回 (端口列表, 来源)。来源是 proxy / frontend / loopback / fallback / none。"""
+    """返回 (端口列表, 来源)。来源是 proxy / frontend / loopback / service / fallback / none。
+
+    除了代理端口（TCP+UDP），还会带上其他对外服务的 TCP 端口
+    （比如文件传输网站），SSH 22 除外，这样哪台机器上的网站被谁访问了也能看到。
+    """
     bounds = ephemeral_bounds()
     sockets = list(iter_sockets(read_socket_table()))
     grouped = {}
@@ -450,18 +461,22 @@ def detect_ports(proxy_only=True):
                 public.add(port)
             else:
                 loopback.add(port)
-    if proxy_only and public:
-        return sorted(public), 'proxy'
-    if proxy_only and loopback:
-        frontend = sorted({
-            item['port'] for item in sockets
-            if item['proto'] == 'tcp' and item['port'] != 22 and item['scope'] != 'loop' and not item['name'].startswith('sshd')
-            and not PROXY_PROCESS.search(item['line'])
-        })
-        if frontend:
-            return frontend, 'frontend'
-        return sorted(loopback), 'loopback'
+    # 非代理进程的对外 TCP 端口：文件传输网站、面板等。UDP 不收，
+    # 不然 dhclient 这类客户端的 UDP 端口会混进来。
+    service = {
+        item['port'] for item in sockets
+        if item['proto'] == 'tcp' and item['port'] != 22 and item['scope'] != 'loop'
+        and not item['name'].startswith('sshd') and not PROXY_PROCESS.search(item['line'])
+    }
     if proxy_only:
+        if public:
+            return sorted(public | service), 'proxy'
+        if loopback:
+            if service:
+                return sorted(service), 'frontend'
+            return sorted(loopback), 'loopback'
+        if service:
+            return sorted(service), 'service'
         return [], 'none'
     fallback = set()
     for item in sockets:
@@ -475,8 +490,10 @@ def detect_ports(proxy_only=True):
 def listening_ports(proxy_only=True):
     """Return sorted ports to account.
 
-    proxy_only=True: proxy listen ports. Loopback-only proxies fall through to
-    the public TCP ports in front of them (nginx/caddy), because client
+    proxy_only=True: proxy listen ports (TCP and UDP, so a pure-UDP proxy like
+    hysteria2 is included) plus other public TCP service ports (e.g. a
+    file-transfer website), except SSH 22. Loopback-only proxies fall through
+    to the public TCP ports in front of them (nginx/caddy), because client
     addresses never appear on 127.0.0.1. UDP client sockets are not included.
     proxy_only=False: public TCP listeners except SSH 22, plus UDP listeners
     outside the ephemeral range.
@@ -498,14 +515,18 @@ def saved_config():
 def resolve_install(existing, args, detected=None):
     """决定这次安装用哪些端口、是否查城市、是不是在更新。
 
-    更新时保留原来的端口和城市查询开关。只有命令行明确写了 --ports / --geo 才覆盖。
-    流量数据库不在这里处理，调用方不能删它。
+    更新时保留原来的端口和城市查询开关：新检测到的端口会自动并进来
+    （老版本可能漏检，比如纯 UDP 代理的端口），但已有端口一个不删，
+    避免代理重启瞬间检测不到导致端口丢失。只有命令行明确写了 --ports
+    / --geo 才覆盖。流量数据库不在这里处理，调用方不能删它。
     """
     updating = existing is not None
     if args.ports:
         selected = ports(args.ports)
     elif updating:
-        selected = ports(','.join(str(port) for port in existing['ports']))
+        saved = ports(','.join(str(port) for port in existing['ports']))
+        new_ports = sorted(set(saved) | set(detected or []))[:64]
+        selected = ports(','.join(str(port) for port in new_ports))
     elif detected:
         selected = ports(','.join(str(port) for port in detected))
     else:
@@ -557,9 +578,11 @@ def install(args):
         raise RuntimeError('需要正在使用 systemd 或 OpenRC 的 Linux VPS')
     existing = saved_config()
     detected, mode = [], None
-    if not args.ports and not (existing and existing.get('ports')):
-        # 全自动：代理的真实监听端口优先。UDP 临时端口不算；代理若只绑在回环上，
-        # 改统计前面的对外端口。都没有时再用本机对外监听端口（不含 SSH 22）。
+    if not args.ports:
+        # 全自动：代理端口（TCP+UDP，hy2 的纯 UDP 端口也能认出来）+ 其他对外
+        # 服务的 TCP 端口（比如文件传输网站）。UDP 临时端口不算；代理若只绑在
+        # 回环上，改统计前面的对外端口。都没有时再用本机对外监听端口（不含 SSH 22）。
+        # 更新时也会重新检测，新端口自动并入（已有端口保留）。
         detected, mode = detect_ports(proxy_only=True)
         if not detected:
             detected, mode = detect_ports(proxy_only=False)
@@ -570,17 +593,23 @@ def install(args):
     selected, geo, updating = resolve_install(existing, args, detected)
     listed = ','.join(map(str, selected))
     if updating and not args.ports:
-        print('已安装 liuliang，更新到 ' + VERSION + '。保留端口 ' + listed + ' 和已有流量。')
+        added = sorted(set(selected) - set(existing['ports']))
+        if added:
+            print('已安装 liuliang，更新到 ' + VERSION + '。新增检测到端口 ' + ','.join(map(str, added)) + '，已并入统计（原有端口保留）。已有流量保留。')
+        else:
+            print('已安装 liuliang，更新到 ' + VERSION + '。保留端口 ' + listed + ' 和已有流量。')
     elif updating:
         print('已安装 liuliang，更新到 ' + VERSION + '。端口改为 ' + listed + '。已有流量保留。')
     elif args.ports:
         print('使用手动指定的端口：' + listed)
     elif mode == 'proxy':
-        print('自动检测到代理端口：' + listed + '（NAT VPS 取内部监听端口）')
+        print('自动检测到端口：' + listed + '（代理端口 + 其他对外服务端口；NAT VPS 取内部监听端口）')
     elif mode == 'frontend':
         print('代理只监听在回环地址，已改统计对外端口：' + listed + '（常见于前面还有 nginx/caddy）')
     elif mode == 'loopback':
         print('只检测到回环地址上的代理端口：' + listed)
+    elif mode == 'service':
+        print('未识别出代理进程，已自动选用本机对外服务端口：' + listed + '（不含 SSH 22）')
     else:
         print('未识别出代理进程，已自动选用本机对外监听端口：' + listed + '（不含 SSH 22）')
     if not updating or args.geo is not None:
