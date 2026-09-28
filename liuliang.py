@@ -16,7 +16,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.11'
+VERSION = '1.0.12'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -487,6 +487,30 @@ def stop_service(init):
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def check_nft_or_die(nft_text):
+    """装之前先确认这台机器真能用 nftables，不行就直接报错退出。
+
+    有些容器型 VPS（LXC/OpenVZ 这类 NAT 小鸡）没给 NET_ADMIN 权限，
+    nft 连 netlink 都打不开（Operation not permitted），后面建表、采
+    样全都会失败。与其装到一半崩掉，不如在动任何东西之前就说清楚。
+    """
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.nft') as handle:
+        handle.write(nft_text)
+        handle.flush()
+        try:
+            run(['nft', '-c', '-f', handle.name], capture_output=True)
+        except subprocess.CalledProcessError as exc:
+            detail = exc.stderr.strip().splitlines()[-1] if exc.stderr else ''
+            raise RuntimeError(
+                '这台机器用不了 nftables'
+                + ('（' + detail + '）' if detail else '')
+                + '，多半是容器型 VPS 没给网络管理权限。'
+                  'liuliang 靠 nftables 统计每个 IP 的流量，这台机器装不了。'
+                  '办法：换一台 KVM 架构的 VPS 重装，或问服务商能不能开 nftables 权限。'
+            )
+
+
 def apply_nft(text):
     """写入规则文件。内容和正在用的表一致时不动内核计数器，变了才换表。"""
     import tempfile
@@ -529,6 +553,10 @@ def install(args):
             detected = detected[:64]
     selected, geo, updating = resolve_install(existing, args, detected)
     listed = ','.join(map(str, selected))
+    # nftables 是统计流量的命根子：先确认这台机器真能用，不行直接说清楚原因，
+    # 别等到停了服务、写了配置才报错。容器型 VPS 没给权限时这里就会拦下来。
+    nft_text = rules(selected)
+    check_nft_or_die(nft_text)
     if updating and not args.ports:
         added = sorted(set(selected) - set(existing['ports']))
         if added:
@@ -567,7 +595,7 @@ def install(args):
     DATA.chmod(0o700)
     CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n')
     CONFIG.chmod(0o600)
-    apply_nft(rules(selected))
+    apply_nft(nft_text)
     PROGRAM.write_bytes(Path(__file__).read_bytes()); PROGRAM.chmod(0o755)
     wrapper = Path('/usr/local/bin/liuliang')
     wrapper.write_text('#!/bin/sh\nexec /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py "$@"\n'); wrapper.chmod(0o755)
