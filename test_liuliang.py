@@ -262,6 +262,23 @@ class TrafficTests(unittest.TestCase):
             text=out.getvalue()
             self.assertNotIn('1.1.1.1',text)
             self.assertIn('2.2.2.2',text)
+    def test_nft_check_fails_fast_with_friendly_error(self):
+        # 容器型 VPS 没给 nftables 权限时，安装应在动任何东西之前就报错，
+        # 而不是装到一半崩掉。
+        def fake(args, **kwargs):
+            raise m.subprocess.CalledProcessError(
+                1, args,
+                stderr='netlink: Error: cache initialization failed: Operation not permitted')
+        with patch.object(m, 'run', side_effect=fake):
+            with self.assertRaises(RuntimeError) as ctx:
+                m.check_nft_or_die('table inet liuliang_v1 { }')
+        message = str(ctx.exception)
+        self.assertIn('nftables', message)
+        self.assertIn('KVM', message)
+    def test_nft_check_passes_when_usable(self):
+        with patch.object(m, 'run') as run:
+            run.return_value.stdout = ''
+            m.check_nft_or_die('table inet liuliang_v1 { }')  # 不抛异常就算过
     def test_payload_is_self_contained(self):
         s=Path(__file__).with_name('install.sh').read_text()
         payload=s.split("<<'LIULIANG_PYTHON'\n",1)[1].split('\nLIULIANG_PYTHON\n',1)[0]+'\n'
