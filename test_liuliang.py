@@ -20,6 +20,18 @@ class TrafficTests(unittest.TestCase):
         self.c.close()
     def amount(self):
         return self.c.execute('select coalesce(sum(bytes),0) from traffic').fetchone()[0]
+    def test_update_merges_newly_detected_ports(self):
+        # 老版本漏检的端口（如 hy2 的 UDP 端口、网站端口），更新时自动并入
+        args = argparse.Namespace(ports=None, geo=None)
+        selected, geo, updating = m.resolve_install({'ports':[40000], 'geo': True}, args, [8080, 40000, 40001])
+        self.assertEqual((selected, geo, updating), ([8080, 40000, 40001], True, True))
+    def test_update_never_drops_saved_ports(self):
+        # 检测不到任何端口时（比如代理正在重启），已有端口一个不能少
+        args = argparse.Namespace(ports=None, geo=None)
+        selected, _, _ = m.resolve_install({'ports':[40000], 'geo': True}, args, [])
+        self.assertEqual(selected, [40000])
+        selected, _, _ = m.resolve_install({'ports':[40000], 'geo': True}, args)
+        self.assertEqual(selected, [40000])
     def test_update_keeps_saved_ports_and_geo(self):
         args = argparse.Namespace(ports=None, geo=None)
         selected, geo, updating = m.resolve_install({'ports':[443, 8443], 'geo': False}, args)
@@ -150,14 +162,45 @@ class TrafficTests(unittest.TestCase):
     def test_hysteria_nat_high_port_kept(self):
         output='udp UNCONN 0 0 *:45678 *:* users:(("hysteria",pid=1,fd=3))\n'
         self.assertEqual(self._ports(output), ([45678], 'proxy'))
-    def test_public_proxy_port_wins_over_nginx(self):
+    def test_proxy_ports_merged_with_other_service_ports(self):
+        # 新行为：代理端口 + 其他对外服务端口一起统计（比如文件传输网站），
+        # 不再只保留代理端口。
         output='\n'.join([
             'tcp LISTEN 0 4096 127.0.0.1:8080 0.0.0.0:* users:(("xray",pid=1,fd=3))',
             'tcp LISTEN 0 511 0.0.0.0:443 0.0.0.0:* users:(("nginx",pid=2,fd=5))',
             'tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=3,fd=3))',
             'tcp LISTEN 0 4096 [::]:8443 [::]:* users:(("sing-box",pid=4,fd=3))',
         ])+'\n'
-        self.assertEqual(self._ports(output), ([8443], 'proxy'))
+        self.assertEqual(self._ports(output), ([443, 8443], 'proxy'))
+    def test_nat_vps_vless_hy2_and_filesite(self):
+        # 用户真实场景：vless TCP 40000 + hy2 UDP 40001 + 文件传输网站 TCP 8080，
+        # 三个端口都要被检测到（以前 40001 和 8080 会漏掉）。
+        output='\n'.join([
+            'tcp LISTEN 0 4096 *:40000 *:* users:(("xray",pid=1,fd=3))',
+            'udp UNCONN 0 0 *:40001 *:* users:(("hysteria",pid=2,fd=4))',
+            'tcp LISTEN 0 511 *:8080 *:* users:(("python3",pid=3,fd=5))',
+            'tcp LISTEN 0 128 *:22 *:* users:(("sshd",pid=4,fd=3))',
+        ])+'\n'
+        self.assertEqual(self._ports(output), ([8080, 40000, 40001], 'proxy'))
+    def test_filesite_without_proxy_uses_service_mode(self):
+        output='\n'.join([
+            'tcp LISTEN 0 511 *:8080 *:* users:(("python3",pid=3,fd=5))',
+            'tcp LISTEN 0 128 *:22 *:* users:(("sshd",pid=4,fd=3))',
+        ])+'\n'
+        self.assertEqual(self._ports(output), ([8080], 'service'))
+    def test_socket_listing_covers_udp(self):
+        # 回归测试：read_socket_table 必须同时列出 TCP 和 UDP，
+        # 否则纯 UDP 代理（如 hy2）的端口永远检测不到。
+        seen = []
+        def fake(args, **kwargs):
+            seen.append(' '.join(args))
+            class Result:
+                stdout = ''
+            return Result()
+        with patch.object(m.shutil, 'which', return_value='/bin/ss'), patch.object(m, 'run', side_effect=fake):
+            m.read_socket_table()
+        self.assertTrue(any('-lntup' in cmd for cmd in seen), seen)
+        self.assertTrue(any('-lnup' in cmd and '-lntup' not in cmd for cmd in seen), seen)
     def test_only_loopback_proxy_falls_through_to_frontend(self):
         output='\n'.join([
             'tcp LISTEN 0 4096 127.0.0.1:8080 0.0.0.0:* users:(("xray",pid=1,fd=3))',
