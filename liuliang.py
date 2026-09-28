@@ -7,21 +7,29 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
+import socket
 import sqlite3
+import struct
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.12'
+VERSION = '1.0.13'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
 PROGRAM = Path('/usr/local/lib/liuliang/liuliang.py')
 INTERVAL = 120
+POLL = 2
+LOCK = Path('/run/liuliang.lock')
+# 某次 ss/conntrack 读空时，已断开的流还留这么久，避免基线丢失后把累计字节再加一遍。
+FLOW_KEEP = 120
 # nft set 元素超时秒数，必须与 rules() 里 `timeout 8d` 保持一致。
 # 每次有包命中，内核会把该元素的 expires 重置为该值，因此可以用它
 # 反推出"最后一个包"的时间（约 1 秒精度），而不用采样时刻代替。
@@ -153,6 +161,8 @@ def open_db(path=None):
         CREATE INDEX IF NOT EXISTS traffic_ts ON traffic(ts);
         CREATE TABLE IF NOT EXISTS counters(name TEXT, ip TEXT, bytes INTEGER NOT NULL, PRIMARY KEY(name,ip));
         CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS flows(key TEXT PRIMARY KEY, up INTEGER NOT NULL, down INTEGER NOT NULL, seen REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS pending(ip TEXT PRIMARY KEY, bytes INTEGER NOT NULL, last_seen REAL NOT NULL);
     ''')
     cols = [row[1] for row in c.execute('PRAGMA table_info(clients)')]
     if 'isp' not in cols:
@@ -222,7 +232,12 @@ def isp_display(raw):
 
 
 def collect(config):
-    with open('/run/liuliang.lock', 'w') as lock:
+    if config.get('backend') == 'diag':
+        diag_tick(config, True)
+        if config.get('geo', True):
+            geo_resolve()
+        return
+    with open(LOCK, 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         recreated = ensure_table()
         doc = json.loads(run(['nft','-j','list','table','inet',TABLE], capture_output=True).stdout)
@@ -487,28 +502,448 @@ def stop_service(init):
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def check_nft_or_die(nft_text):
-    """装之前先确认这台机器真能用 nftables，不行就直接报错退出。
+def normalize_ip(value):
+    """ss / conntrack 里的地址转成可入库的 IP。IPv4 映射地址先拆成 IPv4。"""
+    text = str(value or '').strip().strip('[]')
+    if not text:
+        return None
+    try:
+        ip = ipaddress.ip_address(text.split('%', 1)[0])
+    except ValueError:
+        return None
+    mapped = getattr(ip, 'ipv4_mapped', None)
+    if mapped is not None:
+        ip = mapped
+    return acceptable_ip(ip)
 
-    有些容器型 VPS（LXC/OpenVZ 这类 NAT 小鸡）没给 NET_ADMIN 权限，
-    nft 连 netlink 都打不开（Operation not permitted），后面建表、采
-    样全都会失败。与其装到一半崩掉，不如在动任何东西之前就说清楚。
-    """
+
+def nft_works(nft_text):
+    """nft -c 会连内核。容器没给 NET_ADMIN 时这里就是 Operation not permitted。"""
     import tempfile
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.nft') as handle:
-        handle.write(nft_text)
-        handle.flush()
-        try:
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.nft') as handle:
+            handle.write(nft_text)
+            handle.flush()
             run(['nft', '-c', '-f', handle.name], capture_output=True)
-        except subprocess.CalledProcessError as exc:
-            detail = exc.stderr.strip().splitlines()[-1] if exc.stderr else ''
-            raise RuntimeError(
-                '这台机器用不了 nftables'
-                + ('（' + detail + '）' if detail else '')
-                + '，多半是容器型 VPS 没给网络管理权限。'
-                  'liuliang 靠 nftables 统计每个 IP 的流量，这台机器装不了。'
-                  '办法：换一台 KVM 架构的 VPS 重装，或问服务商能不能开 nftables 权限。'
-            )
+        return True, ''
+    except (OSError, subprocess.CalledProcessError) as exc:
+        stderr = getattr(exc, 'stderr', None) or ''
+        lines = stderr.strip().splitlines()
+        return False, (lines[-1] if lines else '')
+
+
+def read_ss():
+    """先试 -H。老版 iproute2 不认识 -H 时退回带表头的输出，解析时会跳过表头。"""
+    for cmd in (['ss', '-H', '-tin'], ['ss', '-tin']):
+        try:
+            return run(cmd, capture_output=True).stdout
+        except (OSError, subprocess.CalledProcessError):
+            continue
+    return None
+
+
+def ss_works():
+    if not shutil.which('ss'):
+        return False
+    return read_ss() is not None
+
+
+def conntrack_text():
+    for path in ('/proc/net/nf_conntrack', '/proc/net/ip_conntrack'):
+        try:
+            with open(path, 'r', errors='replace') as handle:
+                return handle.read()
+        except OSError:
+            continue
+    return None
+
+
+def capture_devices():
+    """抓包只用默认路由那块网卡，避免同一包在两块网卡上各数一次。"""
+    try:
+        names = [name for _idx, name in socket.if_nameindex() if name != 'lo']
+    except OSError:
+        return []
+    try:
+        lines = Path('/proc/net/route').read_text().splitlines()[1:]
+    except OSError:
+        lines = []
+    for line in lines:
+        cols = line.split()
+        if len(cols) >= 2 and cols[1] == '00000000' and cols[0] in names:
+            return [cols[0]]
+    return names[:1]
+
+
+def raw_possible():
+    if not hasattr(socket, 'AF_PACKET'):
+        return False
+    names = capture_devices()
+    if not names:
+        return False
+    try:
+        sock = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.ntohs(0x0003))
+    except OSError:
+        return False
+    try:
+        sock.bind((names[0], 0))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def detect_diag_sources():
+    """nft 不可用时还能怎么数字节。TCP 优先 ss（不要 NET_ADMIN），UDP 再看 conntrack / 抓包。"""
+    tcp = 'ss' if ss_works() else None
+    udp = None
+    if conntrack_text() is not None:
+        udp = 'conntrack'
+        if tcp is None:
+            tcp = 'conntrack'
+    if (tcp is None or udp is None) and raw_possible():
+        if tcp is None:
+            tcp = 'raw'
+        if udp is None:
+            udp = 'raw'
+    return {'tcp': tcp, 'udp': udp}
+
+
+def probe_backend(nft_text):
+    ok, detail = nft_works(nft_text)
+    if ok:
+        return 'nft', {}, ''
+    sources = detect_diag_sources()
+    if sources.get('tcp') or sources.get('udp'):
+        return 'diag', sources, detail
+    raise RuntimeError(
+        '这台机器用不了 nftables'
+        + ('（' + detail + '）' if detail else '')
+        + '，连接采样也起不来（ss、conntrack、抓包都不可用）。'
+          'liuliang 需要其中一种来按 IP 统计流量。'
+    )
+
+
+def explain_diag(detail, sources):
+    why = ('（' + detail + '）') if detail else ''
+    tcp_how = {
+        'ss': 'TCP 读取每个连接的收发字节',
+        'conntrack': 'TCP 读取 conntrack',
+        'raw': 'TCP 按网卡计数',
+    }.get(sources.get('tcp'), 'TCP 统计不到')
+    udp_how = {
+        'conntrack': 'UDP 读取 conntrack',
+        'raw': 'UDP 按网卡计数',
+    }.get(sources.get('udp'), 'UDP 统计不到（纯 UDP 代理如 hy2 这次没有字节数）')
+    print('nftables 不可用' + why + '。改用连接采样，安装继续：' + tcp_how + '；' + udp_how + '。')
+
+
+def parse_ss(text, selected):
+    """ss -tin：本机端口上的 TCP 连接。bytes_received 是客户端上行，bytes_sent 是下行。"""
+    flows = {}
+    selected = set(selected)
+    lines = text.splitlines()
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if not line.strip() or line[:1].isspace():
+            i += 1
+            continue
+        endpoints = []
+        for word in line.split():
+            host, port = split_host_port(word)
+            if host is None or not 1 <= port <= 65535:
+                continue
+            endpoints.append((host, port))
+        info = []
+        i += 1
+        while i < n and lines[i][:1].isspace():
+            info.append(lines[i])
+            i += 1
+        if len(endpoints) < 2:
+            continue
+        local_host, local_port = endpoints[0]
+        peer_host, peer_port = endpoints[1]
+        if local_port not in selected:
+            continue
+        blob = line + ' ' + ' '.join(info)
+        sent = re.search(r'\bbytes_sent:(\d+)', blob) or re.search(r'\bbytes_acked:(\d+)', blob)
+        recv = re.search(r'\bbytes_received:(\d+)', blob)
+        if not sent and not recv:
+            continue
+        ip = normalize_ip(peer_host)
+        if ip is None:
+            continue
+        up = int(recv.group(1)) if recv else 0
+        down = int(sent.group(1)) if sent else 0
+        key = 'tcp|%s|%s|%s|%s' % (local_host, local_port, peer_host, peer_port)
+        flows[key] = (str(ip), up, down)
+    return flows
+
+
+CT_FLOW = re.compile(
+    r'\bsrc=(\S+)\s+dst=(\S+)\s+sport=(\d+)\s+dport=(\d+)(?:\s+\S+=\S+)*?\s+bytes=(\d+)'
+)
+
+
+def parse_conntrack(text, selected, tcp=False, udp=False):
+    flows = {}
+    if not text or (not tcp and not udp):
+        return flows
+    selected = set(selected)
+    for line in text.splitlines():
+        head = line.split()
+        if len(head) < 3 or head[2] not in ('tcp', 'udp'):
+            continue
+        proto = head[2]
+        if (proto == 'tcp' and not tcp) or (proto == 'udp' and not udp):
+            continue
+        found = CT_FLOW.search(line)
+        if not found:
+            continue
+        src, dst, sport, dport, nbytes = found.groups()
+        sport, dport, up = int(sport), int(dport), int(nbytes)
+        if dport not in selected:
+            continue
+        ip = normalize_ip(src)
+        if ip is None:
+            continue
+        down = 0
+        reply = CT_FLOW.search(line[found.end():])
+        if reply:
+            down = int(reply.group(5))
+        prefix = 'ctcp' if proto == 'tcp' else 'udp'
+        key = '%s|%s|%s|%s|%s' % (prefix, src, sport, dst, dport)
+        flows[key] = (str(ip), up, down)
+    return flows
+
+
+def parse_ip_packet(pkt):
+    if len(pkt) < 20:
+        return None
+    version = pkt[0] >> 4
+    if version == 4:
+        ihl = (pkt[0] & 0x0f) * 4
+        if ihl < 20 or len(pkt) < ihl + 4:
+            return None
+        if int.from_bytes(pkt[6:8], 'big') & 0x1fff:
+            return None
+        total = int.from_bytes(pkt[2:4], 'big') or len(pkt)
+        return pkt[9], str(ipaddress.IPv4Address(pkt[12:16])), str(ipaddress.IPv4Address(pkt[16:20])), pkt[ihl:], total
+    if version != 6 or len(pkt) < 40:
+        return None
+    total = 40 + int.from_bytes(pkt[4:6], 'big')
+    nxt = pkt[6]
+    src = str(ipaddress.IPv6Address(pkt[8:24]))
+    dst = str(ipaddress.IPv6Address(pkt[24:40]))
+    off = 40
+    seen = 0
+    while nxt in (0, 43, 60) and seen < 8 and off + 2 <= len(pkt):
+        nxt_next = pkt[off]
+        ext_len = (pkt[off + 1] + 1) * 8
+        if ext_len < 8 or off + ext_len > len(pkt):
+            return None
+        off += ext_len
+        nxt = nxt_next
+        seen += 1
+    if nxt in (44, 51) or off > len(pkt):
+        return None
+    return nxt, src, dst, pkt[off:], total
+
+
+def account_packet(pkt, ports, count_tcp, count_udp):
+    parsed = parse_ip_packet(pkt)
+    if not parsed:
+        return None, 0
+    proto, src, dst, l4, total = parsed
+    if proto == 6 and not count_tcp:
+        return None, 0
+    if proto == 17 and not count_udp:
+        return None, 0
+    if proto not in (6, 17) or len(l4) < 4:
+        return None, 0
+    sport, dport = struct.unpack('!HH', l4[:4])
+    if dport in ports:
+        ip = normalize_ip(src)
+    elif sport in ports:
+        ip = normalize_ip(dst)
+    else:
+        return None, 0
+    if ip is None or total <= 0:
+        return None, 0
+    return str(ip), total
+
+
+class PacketPump:
+    """没权限改防火墙时，用 AF_PACKET 数选中端口的 IP 包长。只累计字节，不保存内容。"""
+
+    def __init__(self, ports, count_tcp, count_udp):
+        self.ports = set(ports)
+        self.count_tcp = count_tcp
+        self.count_udp = count_udp
+        self.lock = threading.Lock()
+        self.pending = {}
+
+    def start(self):
+        if not hasattr(socket, 'AF_PACKET'):
+            return False
+        socks = []
+        for name in capture_devices():
+            try:
+                sock = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.ntohs(0x0003))
+                sock.bind((name, 0))
+                sock.setblocking(False)
+                socks.append(sock)
+            except OSError:
+                continue
+        if not socks:
+            return False
+        threading.Thread(target=self._run, args=(socks,), daemon=True).start()
+        return True
+
+    def _run(self, socks):
+        while True:
+            readable, _, _ = select.select(socks, [], [], POLL)
+            for sock in readable:
+                try:
+                    pkt = sock.recv(65535)
+                except OSError:
+                    continue
+                ip, n = account_packet(pkt, self.ports, self.count_tcp, self.count_udp)
+                if ip and n > 0:
+                    with self.lock:
+                        self.pending[ip] = self.pending.get(ip, 0) + n
+
+    def drain(self):
+        with self.lock:
+            data = self.pending
+            self.pending = {}
+            return data
+
+
+def account_flows(previous, current, now):
+    """previous: key -> (up, down, seen)。current: key -> (ip, up, down)。"""
+    activity = {}
+    for key, (ip, up, down) in current.items():
+        old = previous.get(key)
+        old_up, old_down = (old[0], old[1]) if old else (0, 0)
+        du = up - old_up if up >= old_up else up
+        dd = down - old_down if down >= old_down else down
+        total = du + dd
+        if total > 0 and ip:
+            activity[ip] = activity.get(ip, 0) + total
+    if not current and previous:
+        return previous, activity
+    baselines = {key: (up, down, now) for key, (_ip, up, down) in current.items()}
+    for key, old in previous.items():
+        if key not in baselines and now - old[2] <= FLOW_KEEP:
+            baselines[key] = old
+    return baselines, activity
+
+
+def load_flows(c):
+    return {key: (up, down, seen) for key, up, down, seen in c.execute('SELECT key,up,down,seen FROM flows')}
+
+
+def save_flows(c, baselines):
+    c.execute('DELETE FROM flows')
+    if baselines:
+        c.executemany(
+            'INSERT INTO flows(key,up,down,seen) VALUES(?,?,?,?)',
+            [(key, up, down, seen) for key, (up, down, seen) in baselines.items()],
+        )
+
+
+def add_pending(c, activity, now):
+    for ip, n in activity.items():
+        if n <= 0:
+            continue
+        c.execute(
+            'INSERT INTO pending(ip,bytes,last_seen) VALUES(?,?,?) '
+            'ON CONFLICT(ip) DO UPDATE SET bytes=pending.bytes+excluded.bytes, '
+            'last_seen=max(pending.last_seen, excluded.last_seen)',
+            (ip, int(n), now),
+        )
+
+
+def take_pending(c, now):
+    rows = list(c.execute('SELECT ip,bytes,last_seen FROM pending WHERE bytes>0'))
+    for ip, n, seen in rows:
+        c.execute('INSERT INTO traffic VALUES(?,?,?)', (now, ip, int(n)))
+        c.execute(
+            'INSERT INTO clients(ip,last_seen) VALUES(?,?) '
+            'ON CONFLICT(ip) DO UPDATE SET last_seen=max(clients.last_seen, excluded.last_seen)',
+            (ip, seen),
+        )
+    c.execute('DELETE FROM pending')
+    c.execute('DELETE FROM traffic WHERE ts<?', (now - 8 * 86400,))
+    c.execute('DELETE FROM clients WHERE last_seen<?', (now - 8 * 86400,))
+
+
+def read_flow_snapshot(ports, sources):
+    flows = {}
+    if sources.get('tcp') == 'ss':
+        flows.update(parse_ss(read_ss() or '', ports))
+    want_tcp = sources.get('tcp') == 'conntrack'
+    want_udp = sources.get('udp') == 'conntrack'
+    if want_tcp or want_udp:
+        flows.update(parse_conntrack(conntrack_text() or '', ports, tcp=want_tcp, udp=want_udp))
+    return flows
+
+
+def diag_tick(config, flush, pump=None):
+    ports = config['ports']
+    sources = config.get('diag') or {}
+    now = time.time()
+    with open(LOCK, 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current = read_flow_snapshot(ports, sources)
+        c = open_db()
+        try:
+            prev = load_flows(c)
+            baselines, activity = account_flows(prev, current, now)
+            if pump is not None:
+                for ip, n in pump.drain().items():
+                    if n > 0:
+                        activity[ip] = activity.get(ip, 0) + n
+            # 从已经有流量记录的 nft 安装切过来时，套接字上的历史字节不要再加一遍。
+            if not prev and c.execute('SELECT 1 FROM traffic LIMIT 1').fetchone():
+                activity = {}
+            save_flows(c, baselines)
+            add_pending(c, activity, now)
+            if flush:
+                take_pending(c, now)
+            c.commit()
+        finally:
+            c.close()
+
+
+def diag_daemon(config):
+    sources = config.get('diag') or {}
+    pump = None
+    if sources.get('tcp') == 'raw' or sources.get('udp') == 'raw':
+        pump = PacketPump(config['ports'], sources.get('tcp') == 'raw', sources.get('udp') == 'raw')
+        try:
+            if not pump.start():
+                print('liuliang: 抓包没有权限，原始计数未启动', file=sys.stderr, flush=True)
+                pump = None
+        except OSError as exc:
+            print('liuliang: ' + str(exc), file=sys.stderr, flush=True)
+            pump = None
+    last = 0
+    while True:
+        try:
+            now = time.time()
+            flush = now - last >= INTERVAL
+            diag_tick(config, flush, pump)
+            if flush:
+                last = now
+                if config.get('geo', True):
+                    geo_resolve()
+        except Exception as exc:
+            print('liuliang:', str(exc), file=sys.stderr, flush=True)
+        time.sleep(POLL)
 
 
 def apply_nft(text):
@@ -553,10 +988,11 @@ def install(args):
             detected = detected[:64]
     selected, geo, updating = resolve_install(existing, args, detected)
     listed = ','.join(map(str, selected))
-    # nftables 是统计流量的命根子：先确认这台机器真能用，不行直接说清楚原因，
-    # 别等到停了服务、写了配置才报错。容器型 VPS 没给权限时这里就会拦下来。
+    # 先探测、再停服务。nft 没权限时改走连接采样，两种都不行才退出。
     nft_text = rules(selected)
-    check_nft_or_die(nft_text)
+    backend, sources, nft_detail = probe_backend(nft_text)
+    if backend == 'diag':
+        explain_diag(nft_detail, sources)
     if updating and not args.ports:
         added = sorted(set(selected) - set(existing['ports']))
         if added:
@@ -589,13 +1025,16 @@ def install(args):
             collect({'ports': selected, 'geo': False})
         except Exception as exc:
             print('更新前没能记下最后一次采样，继续更新：' + str(exc), file=sys.stderr)
-    config = {'version':VERSION, 'ports':selected, 'geo':geo}
+    config = {'version':VERSION, 'ports':selected, 'geo':geo, 'backend':backend}
+    if backend == 'diag':
+        config['diag'] = sources
     for folder in [CONFIG.parent, PROGRAM.parent, DATA]:
         folder.mkdir(parents=True, exist_ok=True)
     DATA.chmod(0o700)
     CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n')
     CONFIG.chmod(0o600)
-    apply_nft(nft_text)
+    if backend == 'nft':
+        apply_nft(nft_text)
     PROGRAM.write_bytes(Path(__file__).read_bytes()); PROGRAM.chmod(0o755)
     wrapper = Path('/usr/local/bin/liuliang')
     wrapper.write_text('#!/bin/sh\nexec /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py "$@"\n'); wrapper.chmod(0o755)
@@ -638,7 +1077,8 @@ start_pre() { /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py --once; }
         run(['rc-service','liuliang','status'])
     collect(config)
     done = '更新完成' if updating else '安装完成'
-    print('\n'+done+'。以后输入：liuliang\n端口：'+','.join(map(str,selected))+'；城市查询：'+('已启用' if geo else '关闭'))
+    how = 'nftables' if backend == 'nft' else '连接采样'
+    print('\n'+done+'。以后输入：liuliang\n端口：'+','.join(map(str,selected))+'；城市查询：'+('已启用' if geo else '关闭')+'；统计：'+how)
 
 
 def main():
@@ -656,6 +1096,9 @@ def main():
     if args.once:
         collect(config)
     elif args.daemon:
+        if config.get('backend') == 'diag':
+            diag_daemon(config)
+            return
         while True:
             try:
                 collect(config)

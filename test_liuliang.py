@@ -4,7 +4,9 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import socket
 import sqlite3
+import struct
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -262,23 +264,144 @@ class TrafficTests(unittest.TestCase):
             text=out.getvalue()
             self.assertNotIn('1.1.1.1',text)
             self.assertIn('2.2.2.2',text)
-    def test_nft_check_fails_fast_with_friendly_error(self):
-        # 容器型 VPS 没给 nftables 权限时，安装应在动任何东西之前就报错，
-        # 而不是装到一半崩掉。
+    def test_nft_denied_falls_back_to_connection_sampling(self):
         def fake(args, **kwargs):
-            raise m.subprocess.CalledProcessError(
-                1, args,
-                stderr='netlink: Error: cache initialization failed: Operation not permitted')
-        with patch.object(m, 'run', side_effect=fake):
+            if args[0] == 'nft':
+                raise m.subprocess.CalledProcessError(
+                    1, args,
+                    stderr='netlink: Error: cache initialization failed: Operation not permitted\n')
+            return m.subprocess.CompletedProcess(args, 0, stdout='', stderr='')
+        with patch.object(m, 'run', side_effect=fake), \
+             patch.object(m, 'conntrack_text', return_value=''), \
+             patch.object(m, 'raw_possible', return_value=False), \
+             patch.object(m.shutil, 'which', return_value='/sbin/ss'):
+            backend, sources, detail = m.probe_backend('table inet liuliang_v1 { }')
+        self.assertEqual(backend, 'diag')
+        self.assertEqual(sources['tcp'], 'ss')
+        self.assertEqual(sources['udp'], 'conntrack')
+        self.assertIn('Operation not permitted', detail)
+    def test_sampling_unavailable_still_raises(self):
+        def fake(args, **kwargs):
+            raise m.subprocess.CalledProcessError(1, args, stderr='Operation not permitted\n')
+        with patch.object(m, 'run', side_effect=fake), \
+             patch.object(m, 'conntrack_text', return_value=None), \
+             patch.object(m, 'raw_possible', return_value=False), \
+             patch.object(m.shutil, 'which', return_value=None):
             with self.assertRaises(RuntimeError) as ctx:
-                m.check_nft_or_die('table inet liuliang_v1 { }')
-        message = str(ctx.exception)
-        self.assertIn('nftables', message)
-        self.assertIn('KVM', message)
-    def test_nft_check_passes_when_usable(self):
+                m.probe_backend('table inet liuliang_v1 { }')
+        self.assertIn('nftables', str(ctx.exception))
+    def test_nft_backend_when_usable(self):
         with patch.object(m, 'run') as run:
             run.return_value.stdout = ''
-            m.check_nft_or_die('table inet liuliang_v1 { }')  # 不抛异常就算过
+            backend, sources, detail = m.probe_backend('table inet liuliang_v1 { }')
+        self.assertEqual((backend, sources, detail), ('nft', {}, ''))
+    def test_ss_falls_back_when_H_is_unsupported(self):
+        def fake(args, **kwargs):
+            if args[:2] == ['ss', '-H']:
+                raise m.subprocess.CalledProcessError(1, args, stderr='unrecognized')
+            self.assertEqual(args, ['ss', '-tin'])
+            return m.subprocess.CompletedProcess(args, 0, stdout='ESTAB 0 0 10.0.0.1:443 8.8.8.8:9\n\t bytes_sent:3 bytes_received:4\n', stderr='')
+        with patch.object(m, 'run', side_effect=fake):
+            flows = m.parse_ss(m.read_ss(), [443])
+        self.assertEqual(flows['tcp|10.0.0.1|443|8.8.8.8|9'], ('8.8.8.8', 4, 3))
+    def test_parse_ss_counts_tcp_payload_and_skips_ssh_private(self):
+        text = '\n'.join([
+            '0 0 10.0.0.8:443 8.8.8.8:40000',
+            '\t cubic bytes_sent:1000 bytes_received:2000',
+            '0 0 10.0.0.8:22 1.1.1.1:40001',
+            '\t cubic bytes_sent:9 bytes_received:9',
+            '0 0 10.0.0.8:443 192.168.1.9:40002',
+            '\t cubic bytes_sent:50 bytes_received:50',
+            '0 0 [2001:db8::1]:443 [2606:4700:4700::1111]:50000',
+            '\t bytes_acked:10 bytes_received:20',
+            '0 0 10.0.0.8:443 [::ffff:8.8.4.4]:50001',
+            '\t bytes_sent:7 bytes_received:8',
+            'LISTEN 0 128 0.0.0.0:443 0.0.0.0:*',
+        ])
+        flows = m.parse_ss(text, [443])
+        self.assertEqual(flows['tcp|10.0.0.8|443|8.8.8.8|40000'], ('8.8.8.8', 2000, 1000))
+        self.assertEqual(flows['tcp|2001:db8::1|443|2606:4700:4700::1111|50000'], ('2606:4700:4700::1111', 20, 10))
+        self.assertEqual(flows['tcp|10.0.0.8|443|::ffff:8.8.4.4|50001'], ('8.8.4.4', 8, 7))
+        self.assertEqual(len(flows), 3)
+    def test_parse_conntrack_udp_only_when_tcp_disabled(self):
+        text = '\n'.join([
+            'ipv4 2 udp 17 20 src=8.8.8.8 dst=10.0.0.8 sport=1111 dport=443 packets=2 bytes=300 src=10.0.0.8 dst=8.8.8.8 sport=443 dport=1111 packets=1 bytes=100 mark=0 use=1',
+            'ipv4 2 tcp 6 100 ESTABLISHED src=1.1.1.1 dst=10.0.0.8 sport=2222 dport=443 packets=2 bytes=99999 src=10.0.0.8 dst=1.1.1.1 sport=443 dport=2222 packets=1 bytes=1 mark=0 use=1',
+            'ipv4 2 udp 17 20 src=10.0.0.9 dst=10.0.0.8 sport=1111 dport=443 packets=1 bytes=10 src=10.0.0.8 dst=10.0.0.9 sport=443 dport=1111 packets=1 bytes=10 mark=0 use=1',
+        ])
+        flows = m.parse_conntrack(text, [443], tcp=False, udp=True)
+        self.assertEqual(list(flows.values()), [('8.8.8.8', 300, 100)])
+    def test_account_flows_delta_reuse_and_linger(self):
+        prev = {'tcp|a': (100, 50, 0)}
+        baselines, activity = m.account_flows(prev, {'tcp|a': ('8.8.8.8', 140, 80), 'tcp|b': ('1.1.1.1', 5, 7)}, 10)
+        self.assertEqual(activity['8.8.8.8'], 70)
+        self.assertEqual(activity['1.1.1.1'], 12)
+        self.assertIn('tcp|a', baselines)
+        _, replay = m.account_flows(baselines, {'tcp|a': ('8.8.8.8', 10, 4)}, 20)
+        self.assertEqual(replay['8.8.8.8'], 14)
+        kept, idle = m.account_flows(prev, {}, 50)
+        self.assertEqual(kept, prev)
+        self.assertEqual(idle, {})
+        dropped, _ = m.account_flows(prev, {'tcp|b': ('1.1.1.1', 1, 1)}, prev['tcp|a'][2] + m.FLOW_KEEP + 1)
+        self.assertNotIn('tcp|a', dropped)
+    def test_account_packet_udp_directions(self):
+        def packet(src, dst, sport, dport):
+            payload = b'abc'
+            udp = struct.pack('!HHHH', sport, dport, 8 + len(payload), 0) + payload
+            total = 20 + len(udp)
+            ip = struct.pack('!BBHHHBBH4s4s', 0x45, 0, total, 0, 0, 64, 17, 0, socket.inet_aton(src), socket.inet_aton(dst))
+            return ip + udp
+        up_ip, up_n = m.account_packet(packet('8.8.8.8', '10.0.0.8', 1111, 443), {443}, False, True)
+        down_ip, down_n = m.account_packet(packet('10.0.0.8', '8.8.8.8', 443, 1111), {443}, False, True)
+        ignored, ignored_n = m.account_packet(packet('8.8.8.8', '10.0.0.8', 1111, 443), {443}, False, False)
+        self.assertEqual((up_ip, up_n), ('8.8.8.8', 31))
+        self.assertEqual((down_ip, down_n), ('8.8.8.8', 31))
+        self.assertEqual((ignored, ignored_n), (None, 0))
+    def test_diag_tick_flushes_deltas_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp)
+            lock = data / 'lock'
+            flows = {'tcp|a': ('8.8.8.8', 1000, 500)}
+            cfg = {'ports': [443], 'diag': {'tcp': 'ss', 'udp': None}}
+            with patch.object(m, 'DATA', data), patch.object(m, 'LOCK', lock), \
+                 patch.object(m, 'read_flow_snapshot', return_value=flows):
+                m.diag_tick(cfg, True)
+            db = m.open_db(data / 'history-v1.db')
+            self.assertEqual(db.execute('select coalesce(sum(bytes),0) from traffic').fetchone()[0], 1500)
+            db.close()
+            with patch.object(m, 'DATA', data), patch.object(m, 'LOCK', lock), \
+                 patch.object(m, 'read_flow_snapshot', return_value=flows):
+                m.diag_tick(cfg, True)
+            db = m.open_db(data / 'history-v1.db')
+            self.assertEqual(db.execute('select coalesce(sum(bytes),0) from traffic').fetchone()[0], 1500)
+            db.close()
+            grown = {'tcp|a': ('8.8.8.8', 1100, 550)}
+            with patch.object(m, 'DATA', data), patch.object(m, 'LOCK', lock), \
+                 patch.object(m, 'read_flow_snapshot', return_value=grown):
+                m.diag_tick(cfg, True)
+            db = m.open_db(data / 'history-v1.db')
+            self.assertEqual(db.execute('select coalesce(sum(bytes),0) from traffic').fetchone()[0], 1650)
+            db.close()
+    def test_diag_switch_does_not_replay_old_totals(self):
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp)
+            lock = data / 'lock'
+            db = m.open_db(data / 'history-v1.db')
+            m.save_sample(db, {('up4', '8.8.8.8'): (5000, None)}, m.time.time())
+            db.close()
+            cfg = {'ports': [443], 'diag': {'tcp': 'ss', 'udp': None}}
+            with patch.object(m, 'DATA', data), patch.object(m, 'LOCK', lock), \
+                 patch.object(m, 'read_flow_snapshot', return_value={'tcp|a': ('8.8.8.8', 9000, 1000)}):
+                m.diag_tick(cfg, True)
+            db = m.open_db(data / 'history-v1.db')
+            self.assertEqual(db.execute('select coalesce(sum(bytes),0) from traffic').fetchone()[0], 5000)
+            db.close()
+            with patch.object(m, 'DATA', data), patch.object(m, 'LOCK', lock), \
+                 patch.object(m, 'read_flow_snapshot', return_value={'tcp|a': ('8.8.8.8', 9400, 1200)}):
+                m.diag_tick(cfg, True)
+            db = m.open_db(data / 'history-v1.db')
+            self.assertEqual(db.execute('select coalesce(sum(bytes),0) from traffic').fetchone()[0], 5600)
+            db.close()
     def test_payload_is_self_contained(self):
         s=Path(__file__).with_name('install.sh').read_text()
         payload=s.split("<<'LIULIANG_PYTHON'\n",1)[1].split('\nLIULIANG_PYTHON\n',1)[0]+'\n'
