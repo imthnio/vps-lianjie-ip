@@ -84,7 +84,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.13'
+VERSION = '1.0.14'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -101,6 +101,14 @@ SET_TIMEOUT = 8 * 86400
 # 展示过滤阈值：近7天总流量低于该值的 IP 不在表格中显示（也不计入合计）。
 # 用户要求：低于 800KB 的流量不用统计。
 MIN_TRAFFIC_BYTES = 800 * 1024
+# 网站（文件分享网盘等非代理的对外 TCP 服务）访客的显示门槛。打开一次分享页
+# 只有几 KB，扫描器打一枪也是几 KB；上传/下载一个文件就会超过这个值。
+# 800KB 门槛只管节点流量，网站访客按这里单独判断。
+WEB_MIN_BYTES = 20 * 1024
+# 后台每隔这么久重新看一次本机监听端口：装好 liuliang 之后才装的网站/节点
+# （或者换了端口）会自动并入统计，不用再重跑安装。连续两次都看到才并入，
+# 避免临时起来又关掉的端口混进来。
+RESCAN = 60
 
 
 def run(args, **kwargs):
@@ -117,18 +125,25 @@ def ports(value):
     return result
 
 
-def rules(selected):
+def rules(selected, web=()):
+    """up/down 四个集合按 IP 数全部端口的字节；web4/web6 只数网站端口（两个方向合计）。"""
     selected = ports(','.join(map(str, selected)))
     portset = '{ ' + ', '.join(map(str, selected)) + ' }'
+    web = sorted(set(web) & set(selected))
+    webset = '{ ' + ', '.join(map(str, web)) + ' }'
     lines = ['table inet ' + TABLE + ' {']
-    for direction in ('up', 'down'):
-        for version in (4, 6):
-            lines.append(f' set {direction}{version} {{ type ipv{version}_addr; flags dynamic,timeout; timeout 8d; size 16384; }}')
+    names = [(d, v) for d in ('up', 'down') for v in (4, 6)]
+    if web:
+        names += [('web', 4), ('web', 6)]
+    for direction, version in names:
+        lines.append(f' set {direction}{version} {{ type ipv{version}_addr; flags dynamic,timeout; timeout 8d; size 16384; }}')
     for chain, direction, field, address in [('input','up','dport','saddr'), ('output','down','sport','daddr')]:
         lines.append(f' chain {chain} {{ type filter hook {chain} priority 11; policy accept;')
         for version, family in [(4, 'ip'), (6, 'ip6')]:
             for protocol in ('tcp', 'udp'):
                 lines.append(f'  meta nfproto ipv{version} {protocol} {field} {portset} update @{direction}{version} {{ {family} {address} counter }}')
+            if web:
+                lines.append(f'  meta nfproto ipv{version} tcp {field} {webset} update @web{version} {{ {family} {address} counter }}')
         lines.append(' }')
     return '\n'.join(lines + ['}', ''])
 
@@ -210,7 +225,7 @@ def parse_counters(document):
                 walk(child, setname)
     for entry in document.get('nftables', []):
         obj = entry.get('set', {})
-        if obj.get('name') in ('up4','down4','up6','down6'):
+        if obj.get('name') in ('up4','down4','up6','down6','web4','web6'):
             walk(obj.get('elem', []), obj['name'])
     return result
 
@@ -228,6 +243,11 @@ def open_db(path=None):
         CREATE TABLE IF NOT EXISTS flows(key TEXT PRIMARY KEY, up INTEGER NOT NULL, down INTEGER NOT NULL, seen REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS pending(ip TEXT PRIMARY KEY, bytes INTEGER NOT NULL, last_seen REAL NOT NULL);
     ''')
+    # web：这一笔字节里走网站端口的部分（不另算，web <= bytes）。老库自动加列。
+    for table in ('traffic', 'pending'):
+        if 'web' not in [row[1] for row in c.execute(f'PRAGMA table_info({table})')]:
+            c.execute(f'ALTER TABLE {table} ADD COLUMN web INTEGER NOT NULL DEFAULT 0')
+            c.commit()
     cols = [row[1] for row in c.execute('PRAGMA table_info(clients)')]
     if 'isp' not in cols:
         c.execute("ALTER TABLE clients ADD COLUMN isp TEXT DEFAULT ''")
@@ -242,11 +262,15 @@ def save_sample(c, current, now, reset=False):
         c.execute('DELETE FROM counters')
     previous = {(name, ip): n for name, ip, n in c.execute('SELECT name,ip,bytes FROM counters')}
     activity = {}
+    web = {}
     last_seen = {}
     for (name, ip), (n, expires) in current.items():
         old = previous.get((name, ip), 0)
         delta = n - old if n >= old else n
-        if delta > 0:
+        if delta > 0 and name.startswith('web'):
+            # 网站端口的字节已经算在 up/down 里，这里只记其中多少是网站的。
+            web[ip] = web.get(ip, 0) + delta
+        elif delta > 0:
             activity[ip] = activity.get(ip, 0) + delta
             if expires is not None:
                 # 该 set 元素在本轮采样内被包命中过：用 expires 反推最后
@@ -258,7 +282,7 @@ def save_sample(c, current, now, reset=False):
     for name, ip in previous.keys() - current.keys():
         c.execute('DELETE FROM counters WHERE name=? AND ip=?', (name, ip))
     for ip, n in activity.items():
-        c.execute('INSERT INTO traffic VALUES(?,?,?)', (now, ip, n))
+        c.execute('INSERT INTO traffic(ts,ip,bytes,web) VALUES(?,?,?,?)', (now, ip, n, min(web.get(ip, 0), n)))
         # 取四个方向里最晚的那个包的时间；没有 expires 时回退到采样时刻；
         # max() 保证 last_seen 只增不减，避免时钟抖动造成时间倒退。
         c.execute('INSERT INTO clients(ip,last_seen) VALUES(?,?) ON CONFLICT(ip) DO UPDATE SET last_seen=max(clients.last_seen, excluded.last_seen)', (ip, last_seen.get(ip, now)))
@@ -457,7 +481,12 @@ def server_ports(group, bounds):
 
 
 def detect_ports(proxy_only=True):
-    """返回 (端口列表, 来源)。来源是 proxy / frontend / loopback / service / fallback / none。
+    """返回 (端口列表, 来源)。来源是 proxy / frontend / loopback / service / fallback / none。"""
+    return scan_ports(proxy_only)[:2]
+
+
+def scan_ports(proxy_only=True):
+    """返回 (端口列表, 来源, 网站端口)。网站端口 = 非代理进程的对外 TCP 端口。
 
     除了代理端口（TCP+UDP），还会带上其他对外服务的 TCP 端口
     （比如文件传输网站），SSH 22 除外，这样哪台机器上的网站被谁访问了也能看到。
@@ -484,23 +513,24 @@ def detect_ports(proxy_only=True):
         if item['proto'] == 'tcp' and item['port'] != 22 and item['scope'] != 'loop'
         and not item['name'].startswith('sshd') and not PROXY_PROCESS.search(item['line'])
     }
+    web = sorted(service)
     if proxy_only:
         if public:
-            return sorted(public | service), 'proxy'
+            return sorted(public | service), 'proxy', web
         if loopback:
             if service:
-                return sorted(service), 'frontend'
-            return sorted(loopback), 'loopback'
+                return sorted(service), 'frontend', web
+            return sorted(loopback), 'loopback', web
         if service:
-            return sorted(service), 'service'
-        return [], 'none'
+            return sorted(service), 'service', web
+        return [], 'none', web
     fallback = set()
     for item in sockets:
         if item['port'] == 22 or item['scope'] == 'loop':
             continue
         if item['proto'] == 'tcp' or not in_ephemeral(item['port'], bounds):
             fallback.add(item['port'])
-    return sorted(fallback), ('fallback' if fallback else 'none')
+    return sorted(fallback), ('fallback' if fallback else 'none'), web
 
 
 def listening_ports(proxy_only=True):
@@ -842,12 +872,14 @@ def account_packet(pkt, ports, count_tcp, count_udp):
 class PacketPump:
     """没权限改防火墙时，用 AF_PACKET 数选中端口的 IP 包长。只累计字节，不保存内容。"""
 
-    def __init__(self, ports, count_tcp, count_udp):
+    def __init__(self, ports, count_tcp, count_udp, web=()):
         self.ports = set(ports)
+        self.web = set(web)
         self.count_tcp = count_tcp
         self.count_udp = count_udp
         self.lock = threading.Lock()
         self.pending = {}
+        self.pending_web = {}
 
     def start(self):
         if not hasattr(socket, 'AF_PACKET'):
@@ -876,14 +908,98 @@ class PacketPump:
                     continue
                 ip, n = account_packet(pkt, self.ports, self.count_tcp, self.count_udp)
                 if ip and n > 0:
+                    wip, wn = account_packet(pkt, self.web, self.count_tcp, False) if self.web else (None, 0)
                     with self.lock:
                         self.pending[ip] = self.pending.get(ip, 0) + n
+                        if wip and wn > 0:
+                            self.pending_web[wip] = self.pending_web.get(wip, 0) + wn
+
+    def drain(self):
+        return self.drain_all()[0]
+
+    def drain_all(self):
+        with self.lock:
+            data, web = self.pending, self.pending_web
+            self.pending, self.pending_web = {}, {}
+            return data, web
+
+
+class ClosedWatcher:
+    """`ss -E` 订阅内核的「TCP 连接关闭」事件，拿到每条连接关闭那一刻的收发字节。
+
+    连接采样每 2 秒看一次 ss：网盘上传/下载、打开网页这种几百毫秒就结束的
+    短连接，两次采样之间就断开了，以前一个字节都记不到。这里把关闭时的
+    最终字节补进下一次采样。ss -E 用不了时（老内核/没权限）就只靠轮询。
+    """
+
+    def __init__(self, ports):
+        self.ports = set(ports)
+        self.lock = threading.Lock()
+        self.closed = {}
+
+    def start(self):
+        if not shutil.which('ss'):
+            return False
+        threading.Thread(target=self._run, daemon=True).start()
+        return True
+
+    def _run(self):
+        commands = [['ss', '-E', '-H', '-tin'], ['ss', '-E', '-tin']]
+        while True:
+            for cmd in commands:
+                started = time.time()
+                try:
+                    self._follow(cmd)
+                except OSError:
+                    pass
+                if time.time() - started > 5:
+                    break  # 跑过一阵才退出：不是参数不认识，按原命令重连
+            time.sleep(30)
+
+    def _follow(self, cmd):
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors='replace')
+        header = None
+        try:
+            for line in proc.stdout:
+                if not line.strip():
+                    continue
+                if not line[:1].isspace():
+                    header = line.rstrip('\n')
+                    continue
+                if header is None:
+                    continue
+                flows = parse_ss(header + '\n' + line, self.ports)
+                header = None
+                if flows:
+                    with self.lock:
+                        self.closed.update(flows)
+        finally:
+            proc.kill()
+            proc.wait()
 
     def drain(self):
         with self.lock:
-            data = self.pending
-            self.pending = {}
+            data = self.closed
+            self.closed = {}
             return data
+
+
+def flow_port(key):
+    """流的 key 里取本机服务端口：tcp|本机|端口|对端|端口，ctcp/udp|源|端口|目的|端口。"""
+    parts = str(key).split('|')
+    try:
+        return int(parts[2] if parts[0] == 'tcp' else parts[4])
+    except (IndexError, ValueError):
+        return None
+
+
+def web_activity(previous, current, web, now):
+    """只看网站端口上的流，算出每个 IP 的网站字节（已包含在总字节里）。"""
+    if not web:
+        return {}
+    web = set(web)
+    pick = lambda d: {k: v for k, v in d.items() if flow_port(k) in web}
+    return account_flows(pick(previous), pick(current), now)[1]
 
 
 def account_flows(previous, current, now):
@@ -919,22 +1035,24 @@ def save_flows(c, baselines):
         )
 
 
-def add_pending(c, activity, now):
+def add_pending(c, activity, now, web=None):
+    web = web or {}
     for ip, n in activity.items():
         if n <= 0:
             continue
         c.execute(
-            'INSERT INTO pending(ip,bytes,last_seen) VALUES(?,?,?) '
+            'INSERT INTO pending(ip,bytes,last_seen,web) VALUES(?,?,?,?) '
             'ON CONFLICT(ip) DO UPDATE SET bytes=pending.bytes+excluded.bytes, '
+            'web=pending.web+excluded.web, '
             'last_seen=max(pending.last_seen, excluded.last_seen)',
-            (ip, int(n), now),
+            (ip, int(n), now, int(min(max(web.get(ip, 0), 0), n))),
         )
 
 
 def take_pending(c, now):
-    rows = list(c.execute('SELECT ip,bytes,last_seen FROM pending WHERE bytes>0'))
-    for ip, n, seen in rows:
-        c.execute('INSERT INTO traffic VALUES(?,?,?)', (now, ip, int(n)))
+    rows = list(c.execute('SELECT ip,bytes,last_seen,web FROM pending WHERE bytes>0'))
+    for ip, n, seen, web in rows:
+        c.execute('INSERT INTO traffic(ts,ip,bytes,web) VALUES(?,?,?,?)', (now, ip, int(n), int(min(web or 0, n))))
         c.execute(
             'INSERT INTO clients(ip,last_seen) VALUES(?,?) '
             'ON CONFLICT(ip) DO UPDATE SET last_seen=max(clients.last_seen, excluded.last_seen)',
@@ -956,26 +1074,34 @@ def read_flow_snapshot(ports, sources):
     return flows
 
 
-def diag_tick(config, flush, pump=None):
+def diag_tick(config, flush, pump=None, watcher=None):
     ports = config['ports']
     sources = config.get('diag') or {}
     now = time.time()
     with open(LOCK, 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         current = read_flow_snapshot(ports, sources)
+        if watcher is not None:
+            # 两次采样之间已经关掉的连接：用关闭时的最终字节，跟基线相减只补差额。
+            current.update(watcher.drain())
         c = open_db()
         try:
             prev = load_flows(c)
             baselines, activity = account_flows(prev, current, now)
+            web = web_activity(prev, current, config.get('web'), now)
             if pump is not None:
-                for ip, n in pump.drain().items():
+                raw, raw_web = pump.drain_all()
+                for ip, n in raw.items():
                     if n > 0:
                         activity[ip] = activity.get(ip, 0) + n
+                for ip, n in raw_web.items():
+                    if n > 0:
+                        web[ip] = web.get(ip, 0) + n
             # 从已经有流量记录的 nft 安装切过来时，套接字上的历史字节不要再加一遍。
             if not prev and c.execute('SELECT 1 FROM traffic LIMIT 1').fetchone():
                 activity = {}
             save_flows(c, baselines)
-            add_pending(c, activity, now)
+            add_pending(c, activity, now, web)
             if flush:
                 take_pending(c, now)
             c.commit()
@@ -983,11 +1109,53 @@ def diag_tick(config, flush, pump=None):
             c.close()
 
 
+def follow_ports(config, seen):
+    """后台重新检测监听端口。连续两次都在、但还没统计的端口并入配置。
+
+    seen 是上一次检测到的端口集合（调用方保存）。返回 (这次的集合, 是否有新端口)。
+    手动 --ports 安装的（auto=False）不自动加。已有端口一个不删。
+    """
+    if not config.get('auto', True):
+        return seen, False
+    try:
+        detected, _mode, service = scan_ports(True)
+    except Exception:
+        return seen, False
+    now = set(detected)
+    fresh = sorted((now & seen) - set(config['ports']))
+    web_fresh = sorted((set(service) & seen & (set(config['ports']) | set(fresh))) - set(config.get('web') or []))
+    room = 64 - len(config['ports'])
+    fresh = fresh[:max(room, 0)]
+    if not fresh and not web_fresh:
+        return now, False
+    config['ports'] = sorted(set(config['ports']) | set(fresh))
+    config['web'] = sorted((set(config.get('web') or []) | set(web_fresh)) & set(config['ports']))
+    CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n')
+    CONFIG.chmod(0o600)
+    print('liuliang: 新检测到端口 ' + ','.join(map(str, fresh or web_fresh)) + '，已并入统计', file=sys.stderr, flush=True)
+    return now, True
+
+
+def reload_nft(config):
+    """端口变了：先把旧表里的计数落盘，再换表，并清掉基线（新表从 0 数起）。"""
+    text = rules(config['ports'], config.get('web') or [])
+    collect(dict(config, geo=False))
+    with open(LOCK, 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if apply_nft(text):
+            clear_counters()
+
+
 def diag_daemon(config):
     sources = config.get('diag') or {}
     pump = None
+    watcher = None
+    if sources.get('tcp') == 'ss':
+        watcher = ClosedWatcher(config['ports'])
+        if not watcher.start():
+            watcher = None
     if sources.get('tcp') == 'raw' or sources.get('udp') == 'raw':
-        pump = PacketPump(config['ports'], sources.get('tcp') == 'raw', sources.get('udp') == 'raw')
+        pump = PacketPump(config['ports'], sources.get('tcp') == 'raw', sources.get('udp') == 'raw', config.get('web') or [])
         try:
             if not pump.start():
                 print('liuliang: 抓包没有权限，原始计数未启动', file=sys.stderr, flush=True)
@@ -996,11 +1164,20 @@ def diag_daemon(config):
             print('liuliang: ' + str(exc), file=sys.stderr, flush=True)
             pump = None
     last = 0
+    scanned, seen = 0, set()
     while True:
         try:
             now = time.time()
+            if now - scanned >= RESCAN:
+                scanned = now
+                seen, changed = follow_ports(config, seen)
+                if changed:
+                    if watcher is not None:
+                        watcher.ports = set(config['ports'])
+                    if pump is not None:
+                        pump.ports, pump.web = set(config['ports']), set(config.get('web') or [])
             flush = now - last >= INTERVAL
-            diag_tick(config, flush, pump)
+            diag_tick(config, flush, pump, watcher)
             if flush:
                 last = now
                 if config.get('geo', True):
@@ -1011,7 +1188,7 @@ def diag_daemon(config):
 
 
 def apply_nft(text):
-    """写入规则文件。内容和正在用的表一致时不动内核计数器，变了才换表。"""
+    """写入规则文件。内容和正在用的表一致时不动内核计数器，变了才换表（返回 True）。"""
     import tempfile
     with tempfile.NamedTemporaryFile(mode='w', suffix='.nft') as handle:
         handle.write(text)
@@ -1021,10 +1198,21 @@ def apply_nft(text):
     previous = path.read_text() if path.exists() else None
     path.write_text(text)
     if previous == text and table_loaded():
-        return
+        return False
     if table_loaded():
         run(['nft', 'delete', 'table', 'inet', TABLE])
     run(['nft', '-f', str(path)], capture_output=True)
+    return True
+
+
+def clear_counters():
+    """换了新表，内核计数从 0 开始：旧基线作废，否则新计数会被少算。旧表的数已经先落盘。"""
+    c = open_db()
+    try:
+        c.execute('DELETE FROM counters')
+        c.commit()
+    finally:
+        c.close()
 
 
 def install(args):
@@ -1038,6 +1226,7 @@ def install(args):
         raise RuntimeError('需要正在使用 systemd 或 OpenRC 的 Linux VPS')
     existing = saved_config()
     detected, mode = [], None
+    service = scan_ports(True)[2]
     if not args.ports:
         # 全自动：代理端口（TCP+UDP，hy2 的纯 UDP 端口也能认出来）+ 其他对外
         # 服务的 TCP 端口（比如文件传输网站）。UDP 临时端口不算；代理若只绑在
@@ -1052,8 +1241,10 @@ def install(args):
             detected = detected[:64]
     selected, geo, updating = resolve_install(existing, args, detected)
     listed = ','.join(map(str, selected))
+    # 网站端口（文件分享网盘等非代理服务）：访客门槛更低，表格里标「网站」。
+    web = sorted((set(service) | set((existing or {}).get('web') or [])) & set(selected))
     # 先探测、再停服务。nft 没权限时改走连接采样，两种都不行才退出。
-    nft_text = rules(selected)
+    nft_text = rules(selected, web)
     backend, sources, nft_detail = probe_backend(nft_text)
     if backend == 'diag':
         explain_diag(nft_detail, sources)
@@ -1077,6 +1268,8 @@ def install(args):
         print('未识别出代理进程，已自动选用本机对外服务端口：' + listed + '（不含 SSH 22）')
     else:
         print('未识别出代理进程，已自动选用本机对外监听端口：' + listed + '（不含 SSH 22）')
+    if web:
+        print('网站端口：' + ','.join(map(str, web)) + '（文件分享等网站，上传/下载达到 ' + sz(WEB_MIN_BYTES) + ' 就显示访客 IP）')
     if not updating or args.geo is not None:
         if geo:
             print('城市查询：已开启（向 ipwho.is 发送客户端 IP；归属地是估计值，仅供参考）')
@@ -1089,7 +1282,9 @@ def install(args):
             collect({'ports': selected, 'geo': False})
         except Exception as exc:
             print('更新前没能记下最后一次采样，继续更新：' + str(exc), file=sys.stderr)
-    config = {'version':VERSION, 'ports':selected, 'geo':geo, 'backend':backend}
+    # auto：以后新装的网站/节点端口由后台自动并入；手动 --ports 的不自动加。
+    auto = not args.ports if not updating or args.ports else bool(existing.get('auto', True))
+    config = {'version':VERSION, 'ports':selected, 'geo':geo, 'backend':backend, 'web':web, 'auto':auto}
     if backend == 'diag':
         config['diag'] = sources
     for folder in [CONFIG.parent, PROGRAM.parent, DATA]:
@@ -1097,8 +1292,8 @@ def install(args):
     DATA.chmod(0o700)
     CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n')
     CONFIG.chmod(0o600)
-    if backend == 'nft':
-        apply_nft(nft_text)
+    if backend == 'nft' and apply_nft(nft_text):
+        clear_counters()
     PROGRAM.write_bytes(Path(__file__).read_bytes()); PROGRAM.chmod(0o755)
     wrapper = Path('/usr/local/bin/liuliang')
     wrapper.write_text('#!/bin/sh\nexec /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py "$@"\n'); wrapper.chmod(0o755)
@@ -1163,12 +1358,21 @@ def main():
         if config.get('backend') == 'diag':
             diag_daemon(config)
             return
+        seen, scanned = set(), 0
         while True:
             try:
                 collect(config)
             except Exception as exc:
                 print('liuliang:', str(exc), file=sys.stderr, flush=True)
-            time.sleep(INTERVAL)
+            # 两分钟采一次，端口每分钟看一次：新端口最多约 2 分钟后开始统计。
+            for _ in range(INTERVAL // RESCAN):
+                try:
+                    seen, changed = follow_ports(config, seen)
+                    if changed:
+                        reload_nft(config)
+                except Exception as exc:
+                    print('liuliang:', str(exc), file=sys.stderr, flush=True)
+                time.sleep(RESCAN)
     else:
         report(config)
 
@@ -1184,8 +1388,8 @@ def sz(n):
  return f'{v:.0f} {q}' if q=='B' or v>=10 else f'{v:.1f} {q}'
 def ww(s): return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in 'WFA' else 1 for c in str(s))
 def cell(s,n): return str(s)+' '*(n-ww(s))
-def diff(c,ip,a,b):
- return c.execute('select coalesce(sum(bytes),0) from traffic where ip=? and ts>? and ts<=?',(ip,a,b)).fetchone()[0]
+def diff(c,ip,a,b,col='bytes'):
+ return c.execute(f'select coalesce(sum({col}),0) from traffic where ip=? and ts>? and ts<=?',(ip,a,b)).fetchone()[0]
 def report(config):
  DB=str(DATA / "history-v1.db")
  now=time.time();print(col('端口 '+','.join(map(str,config['ports']))+' · 近7天连接',B,C))
@@ -1195,21 +1399,26 @@ def report(config):
   print('(暂无流量数据库记录)');return
  c=sqlite3.connect(DB, timeout=30); rows=[]
  try:
+  hasweb='web' in [r[1] for r in c.execute('PRAGMA table_info(traffic)')]
   cols=[r[1] for r in c.execute('PRAGMA table_info(clients)')]
   sel='ip,country,city,isp,last_seen' if 'isp' in cols else 'ip,country,city,last_seen'
   for rec in c.execute(f'select {sel} from clients where last_seen>=? order by last_seen desc',(now-604800,)):
    ip,co,ci=rec[0],rec[1],rec[2]; isp,ls=(rec[3],rec[4]) if len(rec)==5 else ('',rec[3])
-   d=diff(c,ip,now-86400,now);w=diff(c,ip,now-604800,now)
-   if w<MIN_TRAFFIC_BYTES: continue
-   age=max(0,now-float(ls));place=' '.join(x for x in(co,ci) if x) or '未解析';rows.append((ip,isp_display(isp),place,d,w,ls,age))
+   d=diff(c,ip,now-86400,now);w=diff(c,ip,now-604800,now);wb=diff(c,ip,now-604800,now,'web') if hasweb else 0
+   # 节点流量 800KB 起显示；网站（文件分享）访客上传/下载 20KB 起就显示。
+   if w<MIN_TRAFFIC_BYTES and wb<WEB_MIN_BYTES: continue
+   kind='+'.join(k for k,ok in (('节点',w-wb>=WEB_MIN_BYTES),('网站',wb>=WEB_MIN_BYTES)) if ok) or '节点'
+   age=max(0,now-float(ls));place=' '.join(x for x in(co,ci) if x) or '未解析';rows.append((ip,isp_display(isp),place,d,w,ls,age,kind))
   if not rows:
-   print('(近7天无达到 800KB 的流量记录)');return
-  h=['IP','运营商','城市','近24小时','近7天','最近连接'];N=[15,10,8,10,10,19]
-  for ip,net,pl,d,w,ls,age in rows:N=[max(N[i],ww(x)) for i,x in enumerate([ip,net,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')])]
+   print('(近7天无达到 800KB 的流量记录'+('，也没有网站访客' if config.get('web') else '')+')');return
+  showkind=any(r[7]!='节点' for r in rows)
+  h=['IP','运营商','城市','近24小时','近7天','最近连接']+(['访问'] if showkind else []);N=[15,10,8,10,10,19]+([4] if showkind else [])
+  vals=lambda ip,net,pl,d,w,ls,kind:[ip,net,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')]+([kind] if showkind else [])
+  for ip,net,pl,d,w,ls,age,kind in rows:N=[max(N[i],ww(x)) for i,x in enumerate(vals(ip,net,pl,d,w,ls,kind))]
   def line(a,m,b):return a+m.join('─'*(n+2) for n in N)+b
   print(line('┌','┬','┐'));print(col('│ '+' │ '.join(cell(x,N[i]) for i,x in enumerate(h))+' │',B,C));print(line('├','┼','┤'))
-  for ip,net,pl,d,w,ls,age in rows:
-   v=[ip,net,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')];out=[]
+  for ip,net,pl,d,w,ls,age,kind in rows:
+   v=vals(ip,net,pl,d,w,ls,kind);out=[]
    for i,x in enumerate(v):
     st=[D,X] if d<=0 and w<=0 else ([B,G] if i==0 and d>0 else [])
     if i==3 and d>=100*1024**2 or i==4 and w>=1024**3:st=[B,Y]

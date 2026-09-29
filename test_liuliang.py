@@ -402,6 +402,125 @@ class TrafficTests(unittest.TestCase):
             db = m.open_db(data / 'history-v1.db')
             self.assertEqual(db.execute('select coalesce(sum(bytes),0) from traffic').fetchone()[0], 5600)
             db.close()
+    # ---- 网站（文件分享网盘）访客 ----
+    def test_rules_web_sets_only_when_web_ports(self):
+        self.assertNotIn('web4', m.rules([443]))
+        s = m.rules([443, 18080], [18080, 9999])
+        self.assertIn('set web4', s); self.assertIn('set web6', s)
+        self.assertIn('tcp dport { 18080 } update @web4 { ip saddr counter }', s)
+        self.assertIn('tcp sport { 18080 } update @web6 { ip6 daddr counter }', s)
+        self.assertNotIn('9999', s)
+    def test_parse_counters_reads_web_sets(self):
+        doc = {'nftables': [{'set': {'name': 'web4', 'elem': [{'elem': {'val': '8.8.8.8', 'counter': {'bytes': 42}}}]}}]}
+        self.assertEqual(m.parse_counters(doc), {('web4', '8.8.8.8'): (42, None)})
+    def test_save_sample_records_web_share(self):
+        m.save_sample(self.c, {('up4', IP): (1000, None), ('down4', IP): (3000, None), ('web4', IP): (2500, None)}, 100)
+        self.assertEqual(list(self.c.execute('select bytes, web from traffic')), [(4000, 2500)])
+        m.save_sample(self.c, {('up4', IP): (1100, None), ('down4', IP): (3000, None), ('web4', IP): (2500, None)}, 200)
+        self.assertEqual(list(self.c.execute('select bytes, web from traffic order by ts')), [(4000, 2500), (100, 0)])
+    def test_old_database_gains_web_column(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'h.db'
+            old = sqlite3.connect(str(path))
+            old.executescript("CREATE TABLE traffic(ts REAL NOT NULL, ip TEXT NOT NULL, bytes INTEGER NOT NULL);"
+                              "CREATE TABLE pending(ip TEXT PRIMARY KEY, bytes INTEGER NOT NULL, last_seen REAL NOT NULL);"
+                              "INSERT INTO traffic VALUES(1, '8.8.8.8', 5);")
+            old.commit(); old.close()
+            db = m.open_db(path)
+            self.assertEqual(list(db.execute('select bytes, web from traffic')), [(5, 0)])
+            m.add_pending(db, {IP: 10}, 2, {IP: 4}); m.take_pending(db, 3)
+            self.assertEqual(list(db.execute('select bytes, web from traffic where ts=3')), [(10, 4)])
+            db.close()
+    def _report(self, samples, config=None):
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db')
+            for sample in samples:
+                m.save_sample(db, sample, m.time.time())
+            db.close()
+            out = io.StringIO()
+            with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                m.report(config or {'ports': [443, 18080], 'geo': True, 'web': [18080]})
+            return out.getvalue()
+    def test_report_shows_small_web_visitors_and_hides_scanners(self):
+        text = self._report([{('up4', '1.1.1.1'): (10 * 1024, None), ('down4', '1.1.1.1'): (30 * 1024, None),
+                              ('web4', '1.1.1.1'): (40 * 1024, None),
+                              ('up4', '2.2.2.2'): (1024, None), ('down4', '2.2.2.2'): (3 * 1024, None),
+                              ('web4', '2.2.2.2'): (4 * 1024, None),
+                              ('up4', '3.3.3.3'): (900 * 1024, None)}])
+        self.assertIn('1.1.1.1', text); self.assertNotIn('2.2.2.2', text); self.assertIn('3.3.3.3', text)
+        self.assertIn('访问', text); self.assertIn('网站', text); self.assertIn('节点', text)
+    def test_report_without_web_keeps_old_columns(self):
+        text = self._report([{('up4', '3.3.3.3'): (900 * 1024, None)}], {'ports': [443], 'geo': True})
+        self.assertIn('3.3.3.3', text); self.assertNotIn('访问', text)
+    def test_follow_ports_needs_two_scans_and_respects_manual(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg_path = Path(temp) / 'config.json'
+            cfg = {'ports': [443], 'web': [], 'auto': True}
+            with patch.object(m, 'CONFIG', cfg_path), \
+                 patch.object(m, 'scan_ports', return_value=([443, 18080], 'proxy', [18080])):
+                seen, changed = m.follow_ports(cfg, set())
+                self.assertFalse(changed); self.assertEqual(cfg['ports'], [443])
+                seen, changed = m.follow_ports(cfg, seen)
+                self.assertTrue(changed)
+                self.assertEqual((cfg['ports'], cfg['web']), ([443, 18080], [18080]))
+                self.assertEqual(json.loads(cfg_path.read_text())['ports'], [443, 18080])
+                self.assertFalse(m.follow_ports(cfg, seen)[1])
+                manual = {'ports': [443], 'web': [], 'auto': False}
+                self.assertFalse(m.follow_ports(manual, {443, 18080})[1])
+                self.assertEqual(manual['ports'], [443])
+    def test_follow_ports_never_drops_ports(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = {'ports': [443, 8443], 'web': [8443], 'auto': True}
+            with patch.object(m, 'CONFIG', Path(temp) / 'c.json'), \
+                 patch.object(m, 'scan_ports', return_value=([], 'none', [])):
+                self.assertFalse(m.follow_ports(cfg, {443})[1])
+            self.assertEqual(cfg['ports'], [443, 8443])
+    def test_closed_watcher_parses_ss_events(self):
+        lines = [
+            'UNCONN 1      0      45.76.1.1:18080 8.8.8.8:60484\n',
+            '\t wscale:7,7 rto:204 cwnd:158 bytes_sent:205070 bytes_acked:205071 bytes_received:134 segs_out:176\n',
+            'UNCONN 0      1      127.0.0.1:38020 127.0.0.1:9223\n',
+            '\t rto:1000 mss:524 cwnd:10 segs_out:1\n',
+            'UNCONN 1      0      45.76.1.1:22 8.8.8.8:5000\n',
+            '\t bytes_sent:9 bytes_received:9\n',
+        ]
+        class Proc:
+            stdout = iter(lines)
+            def kill(self): pass
+            def wait(self): pass
+        w = m.ClosedWatcher([18080])
+        with patch.object(m.subprocess, 'Popen', return_value=Proc()):
+            w._follow(['ss', '-E', '-H', '-tin'])
+        self.assertEqual(w.drain(), {'tcp|45.76.1.1|18080|8.8.8.8|60484': ('8.8.8.8', 134, 205070)})
+        self.assertEqual(w.drain(), {})
+    def test_diag_tick_counts_short_connections_once(self):
+        # 2 秒采样之间就结束的连接只能从 ss -E 拿到；采样见过的连接关闭时只补差额。
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp); lock = data / 'lock'
+            cfg = {'ports': [18080], 'web': [18080], 'diag': {'tcp': 'ss', 'udp': None}}
+            class W:
+                def __init__(self, d): self.d = d
+                def drain(self):
+                    d, self.d = self.d, {}
+                    return d
+            short = 'tcp|45.76.1.1|18080|8.8.8.8|1000'
+            long = 'tcp|45.76.1.1|18080|8.8.8.8|2000'
+            def tick(snapshot, closed):
+                with patch.object(m, 'DATA', data), patch.object(m, 'LOCK', lock), \
+                     patch.object(m, 'read_flow_snapshot', return_value=snapshot):
+                    m.diag_tick(cfg, True, None, W(closed))
+            tick({}, {short: ('8.8.8.8', 300, 700)})
+            tick({long: ('8.8.8.8', 100, 1000)}, {})
+            tick({}, {long: ('8.8.8.8', 150, 5000)})
+            tick({}, {})
+            db = m.open_db(data / 'history-v1.db')
+            self.assertEqual(db.execute('select sum(bytes), sum(web) from traffic').fetchone(), (1000 + 1100 + 4050, 1000 + 1100 + 4050))
+            db.close()
+    def test_web_activity_only_web_ports(self):
+        cur = {'tcp|h|18080|8.8.8.8|1': ('8.8.8.8', 10, 20), 'tcp|h|443|8.8.8.8|2': ('8.8.8.8', 100, 200),
+               'ctcp|8.8.4.4|5|h|18080': ('8.8.4.4', 1, 2)}
+        self.assertEqual(m.web_activity({}, cur, [18080], 0), {'8.8.8.8': 30, '8.8.4.4': 3})
+        self.assertEqual(m.web_activity({}, cur, None, 0), {})
     def test_payload_is_self_contained(self):
         s=Path(__file__).with_name('install.sh').read_text()
         payload=s.split("<<'LIULIANG_PYTHON'\n",1)[1].split('\nLIULIANG_PYTHON\n',1)[0]+'\n'
