@@ -521,6 +521,118 @@ class TrafficTests(unittest.TestCase):
                'ctcp|8.8.4.4|5|h|18080': ('8.8.4.4', 1, 2)}
         self.assertEqual(m.web_activity({}, cur, [18080], 0), {'8.8.8.8': 30, '8.8.4.4': 3})
         self.assertEqual(m.web_activity({}, cur, None, 0), {})
+    # ---- Cloudflare 后面的网站：从本机反代转发的请求头认真实访客 ----
+    @staticmethod
+    def _lo_packet(src_port, dst_port, payload=b'', flags=0x18, v6=False):
+        tcp = struct.pack('!HHIIBBHHH', src_port, dst_port, 0, 0, 5 << 4, flags, 65535, 0, 0) + payload
+        if v6:
+            return struct.pack('!IHBB', 6 << 28, len(tcp), 6, 64) + socket.inet_pton(socket.AF_INET6, '::1') * 2 + tcp
+        return struct.pack('!BBHHHBBH4s4s', 0x45, 0, 20 + len(tcp), 0, 0, 64, 6, 0,
+                           socket.inet_aton('127.0.0.1'), socket.inet_aton('127.0.0.1')) + tcp
+    def test_is_cloudflare(self):
+        for ip in ('172.70.1.1', '162.158.9.9', '104.16.0.1', '2606:4700::1', '::ffff:172.70.1.1'):
+            self.assertTrue(m.is_cloudflare(ip), ip)
+        for ip in ('8.8.8.8', '1.0.0.1', '2001:4860::8888', 'x', ''):
+            self.assertFalse(m.is_cloudflare(ip), ip)
+    def test_header_ip_rules(self):
+        h = lambda *lines: ('GET / HTTP/1.1\r\nHost: a\r\n' + ''.join(l + '\r\n' for l in lines) + '\r\n').encode()
+        # 橙色云 + 本机 Caddy：XFF 最后一跳是 Cloudflare
+        self.assertEqual(m.header_ip(h('CF-Connecting-IP: 9.9.9.9', 'X-Forwarded-For: 9.9.9.9, 172.70.1.1')), '9.9.9.9')
+        # Cloudflare Tunnel：cloudflared 原样转发，XFF 就是访客
+        self.assertEqual(m.header_ip(h('Cf-Connecting-Ip: 2001:4860::8888', 'X-Forwarded-For: 2001:4860::8888')), '2001:4860::8888')
+        # 没有 XFF 的本机反代
+        self.assertEqual(m.header_ip(h('cf-connecting-ip: 9.9.9.9')), '9.9.9.9')
+        # 访客直连 Caddy、自己伪造 CF 头：最后一跳是他自己，不采信
+        self.assertIsNone(m.header_ip(h('CF-Connecting-IP: 9.9.9.9', 'X-Forwarded-For: 8.8.8.8')))
+        # 没有 CF 头 / 内网地址 / 乱写的值
+        self.assertIsNone(m.header_ip(h('X-Forwarded-For: 172.70.1.1')))
+        self.assertIsNone(m.header_ip(h('CF-Connecting-IP: 10.0.0.1')))
+        self.assertIsNone(m.header_ip(h('CF-Connecting-IP: <script>')))
+        # 请求体里的同名字段不算
+        self.assertIsNone(m.header_ip(b'POST / HTTP/1.1\r\nHost: a\r\n\r\nCF-Connecting-IP: 9.9.9.9\r\n'))
+    def test_sniffer_counts_bytes_for_real_visitor(self):
+        s = m.RealIPSniffer([18080])
+        req = b'GET /s/abc HTTP/1.1\r\nHost: x\r\nCF-Connecting-IP: 9.9.9.9\r\nX-Forwarded-For: 9.9.9.9, 172.70.1.1\r\n\r\n'
+        p1 = self._lo_packet(40000, 18080, req)
+        p2 = self._lo_packet(18080, 40000, b'x' * 1000)
+        s.feed(p1, 10); s.feed(p2, 11)
+        s.feed(self._lo_packet(40001, 9999, req), 12)  # 别的端口不看
+        data, seen, n = s.drain()
+        self.assertEqual(data, {'9.9.9.9': len(p1) + len(p2)})
+        self.assertEqual((seen, n), ({'9.9.9.9': 11}, 1))
+        self.assertEqual(s.drain()[0], {})
+    def test_sniffer_keepalive_switches_visitor_and_split_headers(self):
+        s = m.RealIPSniffer([18080])
+        a = b'GET / HTTP/1.1\r\nCF-Connecting-IP: 9.9.9.9\r\n\r\n'
+        s.feed(self._lo_packet(40000, 18080, a, v6=True), 1)
+        s.feed(self._lo_packet(18080, 40000, b'y' * 100, v6=True), 2)
+        # 同一条长连接，下一个请求是别的访客，请求头还分成了两个包
+        s.feed(self._lo_packet(40000, 18080, b'POST /up HTTP/1.1\r\nHost: x\r\nCF-Conn', v6=True), 3)
+        s.feed(self._lo_packet(40000, 18080, b'ecting-IP: 8.8.4.4\r\n\r\nbody', v6=True), 4)
+        s.feed(self._lo_packet(40000, 18080, b'z' * 500, v6=True), 5)
+        # 再下一个请求没有 CF 头（直连访客，公网端口已经数过）：不再记给上一个人
+        s.feed(self._lo_packet(40000, 18080, b'GET / HTTP/1.1\r\nHost: x\r\n\r\n', v6=True), 6)
+        s.feed(self._lo_packet(18080, 40000, b'w' * 300, v6=True), 7)
+        data, _seen, n = s.drain()
+        self.assertEqual(set(data), {'9.9.9.9', '8.8.4.4'})
+        self.assertEqual(data['9.9.9.9'], 2 * 40 + 2 * 20 + len(a) + 100)
+        self.assertEqual(data['8.8.4.4'], 3 * 40 + 3 * 20 + len(b'POST /up HTTP/1.1\r\nHost: x\r\nCF-Conn') + len(b'ecting-IP: 8.8.4.4\r\n\r\nbody') + 500)
+        self.assertEqual(n, 2)
+        # FIN 之后流表清掉
+        s.feed(self._lo_packet(18080, 40000, b'', flags=0x11, v6=True), 8)
+        self.assertEqual(s.flows, {})
+    def test_sniffer_gc_drops_idle_flows(self):
+        s = m.RealIPSniffer([18080])
+        s.feed(self._lo_packet(40000, 18080, b'GET / HTTP/1.1\r\nCF-Connecting-IP: 9.9.9.9\r\n\r\n'), 0)
+        s.gc(10); self.assertEqual(len(s.flows), 1)
+        s.gc(1000); self.assertEqual(s.flows, {})
+    def test_save_realip_writes_web_traffic(self):
+        s = m.RealIPSniffer([18080])
+        s.pending, s.seen, s.requests = {'9.9.9.9': 30000}, {'9.9.9.9': 50.0}, 3
+        m.save_realip(self.c, s, 60); m.take_pending(self.c, 60)
+        self.assertEqual(list(self.c.execute('select ip,bytes,web from traffic')), [('9.9.9.9', 30000, 30000)])
+        self.assertEqual(self.c.execute('select last_seen from clients').fetchone()[0], 50.0)
+        self.assertEqual(self.c.execute("select value from metadata where key='realip_last'").fetchone()[0], '60')
+        m.save_realip(self.c, None, 70)  # 没有抓包也不出错
+    def test_backend_ports_include_loopback_web_apps(self):
+        text = '\n'.join([
+            'tcp LISTEN 0 128 127.0.0.1:18080 0.0.0.0:* users:(("python3",pid=1,fd=3))',
+            'tcp LISTEN 0 128 *:443 *:* users:(("caddy",pid=2,fd=3))',
+            'tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=3,fd=3))',
+            'tcp LISTEN 0 128 127.0.0.1:10085 0.0.0.0:* users:(("xray",pid=4,fd=3))',
+        ])
+        self.assertEqual(m.backend_ports(text), [443, 18080])
+    def test_report_hides_cloudflare_and_shows_real_visitor(self):
+        now = m.time.time()
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db')
+            m.save_sample(db, {('up4', '172.70.1.1'): (900 * 1024, None), ('web4', '172.70.1.1'): (900 * 1024, None)}, now)
+            m.add_pending(db, {'9.9.9.9': 25 * 1024}, now, {'9.9.9.9': 25 * 1024}); m.take_pending(db, now)
+            db.commit(); db.close()
+            def run(**kw):
+                out = io.StringIO()
+                with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                    m.report({'ports': [443], 'geo': True, 'web': [443]}, **kw)
+                return out.getvalue()
+            text = run()
+            self.assertIn('9.9.9.9', text); self.assertNotIn('172.70.1.1', text)
+            self.assertIn('已隐藏 1 个 Cloudflare', text); self.assertIn('IP 数 1 ', text)
+            text = run(show_all=True)
+            self.assertIn('172.70.1.1', text); self.assertIn('CF节点', text); self.assertIn('IP 数 1 ', text)
+            text = run(web_only=True)
+            self.assertIn('9.9.9.9', text); self.assertIn('网站访客', text)
+    def test_report_web_only_has_no_threshold(self):
+        text = self._report([{('up4', '8.8.8.8'): (1024, None), ('web4', '8.8.8.8'): (1024, None)},
+                             {('up4', '8.8.8.8'): (2048, None), ('web4', '8.8.8.8'): (2048, None)}])
+        self.assertNotIn('8.8.8.8', text)
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db')
+            m.save_sample(db, {('up4', '8.8.8.8'): (0, None), ('web4', '8.8.8.8'): (0, None)}, m.time.time())
+            m.save_sample(db, {('up4', '8.8.8.8'): (2048, None), ('web4', '8.8.8.8'): (2048, None)}, m.time.time())
+            db.close(); out = io.StringIO()
+            with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                m.report({'ports': [443], 'web': [443]}, web_only=True)
+            self.assertIn('8.8.8.8', out.getvalue())
     def test_payload_is_self_contained(self):
         s=Path(__file__).with_name('install.sh').read_text()
         payload=s.split("<<'LIULIANG_PYTHON'\n",1)[1].split('\nLIULIANG_PYTHON\n',1)[0]+'\n'

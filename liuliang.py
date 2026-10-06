@@ -20,7 +20,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.14'
+VERSION = '1.0.15'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -255,9 +255,9 @@ def isp_display(raw):
     return s[:18]
 
 
-def collect(config):
+def collect(config, sniffer=None):
     if config.get('backend') == 'diag':
-        diag_tick(config, True)
+        diag_tick(config, True, sniffer=sniffer)
         if config.get('geo', True):
             geo_resolve()
         return
@@ -272,7 +272,10 @@ def collect(config):
             boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
             last_boot = c.execute("SELECT value FROM metadata WHERE key='boot'").fetchone()
             save_sample(c, current, now, recreated or not last_boot or last_boot[0] != boot)
+            save_realip(c, sniffer, now)
+            take_pending(c, now)
             c.execute("INSERT OR REPLACE INTO metadata VALUES('boot',?)", (boot,))
+            c.execute("INSERT OR REPLACE INTO metadata VALUES('sample',?)", (str(now),))
             c.commit()
         finally:
             c.close()
@@ -920,6 +923,214 @@ class ClosedWatcher:
             return data
 
 
+# Cloudflare 公布的网段。橙色云 / Tunnel 时连到本机的是这些地址，不是访客。
+CLOUDFLARE = tuple(ipaddress.ip_network(n) for n in (
+    '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
+    '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20',
+    '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
+    '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
+    '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32',
+    '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32',
+))
+
+
+def is_cloudflare(value):
+    try:
+        ip = ipaddress.ip_address(str(value).strip())
+    except ValueError:
+        return False
+    mapped = getattr(ip, 'ipv4_mapped', None)
+    if mapped is not None:
+        ip = mapped
+    return any(ip.version == net.version and ip in net for net in CLOUDFLARE)
+
+
+HTTP_METHODS = (b'GET ', b'POST ', b'PUT ', b'HEAD ', b'DELETE ', b'PATCH ', b'OPTIONS ')
+HEADER_LIMIT = 16384
+
+
+def header_ip(head):
+    """反代转给网站的请求头里，经 Cloudflare 来的访客真实 IP。
+
+    只认 CF-Connecting-IP，并用反代写的 X-Forwarded-For 最后一跳把关：
+    - 最后一跳是 Cloudflare（橙色云 + 本机 Caddy/nginx）：采信；
+    - 最后一跳就是 CF-Connecting-IP（Cloudflare Tunnel，cloudflared 原样转发）：采信；
+    - 没有 X-Forwarded-For（cloudflared / 不加转发头的反代）：采信；
+    - 最后一跳是别的地址：访客直连反代、头是自己带的。这时公网端口已经
+      按真实 IP 记过一次，这里不再算，伪造的头也不会生效。
+    """
+    cf = xff = None
+    for line in head.split(b'\r\n')[1:]:
+        if not line:
+            break
+        name, _, value = line.partition(b':')
+        name = name.strip().lower()
+        if name == b'cf-connecting-ip':
+            cf = value.decode('latin-1').split(',')[0].strip()
+        elif name == b'x-forwarded-for':
+            xff = value.decode('latin-1')
+    ip = normalize_ip(cf) if cf else None
+    if ip is None:
+        return None
+    if xff is not None:
+        hop = xff.split(',')[-1].strip()
+        if hop and not is_cloudflare(hop) and normalize_ip(hop) != ip:
+            return None
+    return str(ip)
+
+
+class RealIPSniffer:
+    """网站开了 Cloudflare 代理（橙色云）或 Cloudflare Tunnel 时，连到公网端口的
+    全是 Cloudflare 的地址，真实访客 IP 只在 HTTP 请求头里。HTTPS 在公网上是
+    加密的看不到，但本机反代（Caddy/nginx/cloudflared）转给网站程序这一段走
+    回环口、是明文：这里只看回环口上指定端口的 TCP 包，从请求头取访客 IP，
+    然后把这条连接后续的字节都记到这个 IP 上。只读请求头，不保存任何内容。
+    同一条长连接上反代会轮流转发不同访客的请求，所以每个新请求重新认一次 IP。
+    """
+
+    IDLE = 300
+    MAX_FLOWS = 4096
+
+    def __init__(self, ports):
+        self.ports = set(ports)
+        self.lock = threading.Lock()
+        self.flows = {}
+        self.pending = {}
+        self.seen = {}
+        self.requests = 0
+
+    def start(self):
+        if not hasattr(socket, 'AF_PACKET'):
+            return False
+        try:
+            sock = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.ntohs(0x0003))
+            sock.bind(('lo', 0))
+        except OSError:
+            return False
+        threading.Thread(target=self._run, args=(sock,), daemon=True).start()
+        return True
+
+    def _run(self, sock):
+        outgoing = getattr(socket, 'PACKET_OUTGOING', 4)
+        last_gc = time.time()
+        while True:
+            try:
+                pkt, addr = sock.recvfrom(65535)
+            except OSError:
+                time.sleep(1)
+                continue
+            # 回环口上每个包会出现两次（发出 + 收到），只数收到的那次。
+            if len(addr) > 2 and addr[2] == outgoing:
+                continue
+            now = time.time()
+            try:
+                self.feed(pkt, now)
+            except Exception:
+                pass
+            if now - last_gc > 60:
+                last_gc = now
+                self.gc(now)
+
+    def feed(self, pkt, now):
+        parsed = parse_ip_packet(pkt)
+        if not parsed or parsed[0] != 6 or len(parsed[3]) < 20:
+            return
+        _proto, src, dst, l4, total = parsed
+        sport, dport = struct.unpack('!HH', l4[:4])
+        ports = self.ports
+        if dport in ports:
+            key, to_server = (src, sport, dport), True
+        elif sport in ports:
+            key, to_server = (dst, dport, sport), False
+        else:
+            return
+        payload = l4[(l4[12] >> 4) * 4:]
+        flags = l4[13]
+        flow = self.flows.get(key)
+        if to_server and payload:
+            if flow is not None and flow[2] is not None:
+                flow[2] += payload
+                flow[3] += total
+                total = self._finish_header(flow, total)
+            elif payload.startswith(HTTP_METHODS):
+                if flow is None:
+                    if len(self.flows) >= self.MAX_FLOWS:
+                        self.gc(now, force=True)
+                    flow = self.flows[key] = [None, now, None, 0]
+                flow[0], flow[2], flow[3] = None, bytearray(payload), total
+                total = self._finish_header(flow, total)
+        if flow is None:
+            return
+        flow[1] = now
+        ip = flow[0]
+        if ip and total > 0:
+            with self.lock:
+                self.pending[ip] = self.pending.get(ip, 0) + total
+                self.seen[ip] = now
+        if flags & 0x05:  # FIN / RST
+            self.flows.pop(key, None)
+
+    def _finish_header(self, flow, total):
+        """请求头收齐了就认 IP，返回这个包要记的字节（含之前攒着的请求头包）。"""
+        buf = flow[2]
+        end = buf.find(b'\r\n\r\n')
+        if end < 0 and len(buf) < HEADER_LIMIT:
+            return 0
+        flow[0] = header_ip(bytes(buf[:end if end >= 0 else HEADER_LIMIT]))
+        flow[2], total, flow[3] = None, flow[3], 0
+        if flow[0]:
+            with self.lock:
+                self.requests += 1
+        return total
+
+    def gc(self, now, force=False):
+        idle = self.IDLE // 10 if force else self.IDLE
+        for key in [k for k, v in self.flows.items() if now - v[1] > idle]:
+            self.flows.pop(key, None)
+
+    def drain(self):
+        """返回 ({ip: 字节}, {ip: 最后一个包的时间}, 认出的请求数)。"""
+        with self.lock:
+            data, seen, n = self.pending, self.seen, self.requests
+            self.pending, self.seen, self.requests = {}, {}, 0
+            return data, seen, n
+
+
+def backend_ports(text=None):
+    """本机非代理、非 SSH 进程的 TCP 监听端口（含只绑 127.0.0.1 的）。反代
+    就是把请求转给这些端口，在回环口上看这些端口就能读到转发头。"""
+    sockets = iter_sockets(read_socket_table() if text is None else text)
+    return sorted({
+        item['port'] for item in sockets
+        if item['proto'] == 'tcp' and item['port'] != 22
+        and not item['name'].startswith('sshd') and not PROXY_PROCESS.search(item['line'])
+    })
+
+
+def start_sniffer(config):
+    if not config.get('realip', True):
+        return None
+    try:
+        sniffer = RealIPSniffer(backend_ports())
+    except Exception:
+        return None
+    if not sniffer.start():
+        print('liuliang: 回环口抓包不可用，Cloudflare 后面的网站访客只能看到 Cloudflare 的 IP', file=sys.stderr, flush=True)
+        return None
+    return sniffer
+
+
+def save_realip(c, sniffer, now):
+    """把回环口认出的访客字节写进 pending（全部算网站流量）。"""
+    if sniffer is None:
+        return
+    data, seen, requests = sniffer.drain()
+    for ip, n in data.items():
+        add_pending(c, {ip: n}, seen.get(ip, now), {ip: n})
+    if requests or data:
+        c.execute("INSERT OR REPLACE INTO metadata VALUES('realip_last',?)", (str(now),))
+
+
 def flow_port(key):
     """流的 key 里取本机服务端口：tcp|本机|端口|对端|端口，ctcp/udp|源|端口|目的|端口。"""
     parts = str(key).split('|')
@@ -972,6 +1183,7 @@ def save_flows(c, baselines):
 
 
 def add_pending(c, activity, now, web=None):
+    """now 是这批流量的最后时间（last_seen）。"""
     web = web or {}
     for ip, n in activity.items():
         if n <= 0:
@@ -1010,7 +1222,7 @@ def read_flow_snapshot(ports, sources):
     return flows
 
 
-def diag_tick(config, flush, pump=None, watcher=None):
+def diag_tick(config, flush, pump=None, watcher=None, sniffer=None):
     ports = config['ports']
     sources = config.get('diag') or {}
     now = time.time()
@@ -1038,8 +1250,10 @@ def diag_tick(config, flush, pump=None, watcher=None):
                 activity = {}
             save_flows(c, baselines)
             add_pending(c, activity, now, web)
+            save_realip(c, sniffer, now)
             if flush:
                 take_pending(c, now)
+                c.execute("INSERT OR REPLACE INTO metadata VALUES('sample',?)", (str(now),))
             c.commit()
         finally:
             c.close()
@@ -1099,6 +1313,7 @@ def diag_daemon(config):
         except OSError as exc:
             print('liuliang: ' + str(exc), file=sys.stderr, flush=True)
             pump = None
+    sniffer = start_sniffer(config)
     last = 0
     scanned, seen = 0, set()
     while True:
@@ -1106,6 +1321,7 @@ def diag_daemon(config):
             now = time.time()
             if now - scanned >= RESCAN:
                 scanned = now
+                refresh_sniffer(sniffer)
                 seen, changed = follow_ports(config, seen)
                 if changed:
                     if watcher is not None:
@@ -1113,7 +1329,7 @@ def diag_daemon(config):
                     if pump is not None:
                         pump.ports, pump.web = set(config['ports']), set(config.get('web') or [])
             flush = now - last >= INTERVAL
-            diag_tick(config, flush, pump, watcher)
+            diag_tick(config, flush, pump, watcher, sniffer)
             if flush:
                 last = now
                 if config.get('geo', True):
@@ -1121,6 +1337,16 @@ def diag_daemon(config):
         except Exception as exc:
             print('liuliang:', str(exc), file=sys.stderr, flush=True)
         time.sleep(POLL)
+
+
+def refresh_sniffer(sniffer):
+    """网站换了端口 / 后装的网站：回环口要看的端口跟着变。"""
+    if sniffer is None:
+        return
+    try:
+        sniffer.ports = set(backend_ports())
+    except Exception:
+        pass
 
 
 def apply_nft(text):
@@ -1206,6 +1432,8 @@ def install(args):
         print('未识别出代理进程，已自动选用本机对外监听端口：' + listed + '（不含 SSH 22）')
     if web:
         print('网站端口：' + ','.join(map(str, web)) + '（文件分享等网站，上传/下载达到 ' + sz(WEB_MIN_BYTES) + ' 就显示访客 IP）')
+    if cloudflared_running():
+        print('检测到 Cloudflare Tunnel（cloudflared）：网站访客不经过公网端口，改从本机转发的请求头认真实 IP。')
     if not updating or args.geo is not None:
         if geo:
             print('城市查询：已开启（向 ipwho.is 发送客户端 IP；归属地是估计值，仅供参考）')
@@ -1220,7 +1448,12 @@ def install(args):
             print('更新前没能记下最后一次采样，继续更新：' + str(exc), file=sys.stderr)
     # auto：以后新装的网站/节点端口由后台自动并入；手动 --ports 的不自动加。
     auto = not args.ports if not updating or args.ports else bool(existing.get('auto', True))
-    config = {'version':VERSION, 'ports':selected, 'geo':geo, 'backend':backend, 'web':web, 'auto':auto}
+    # realip：网站在 Cloudflare 后面时，从本机反代转发的请求头里认真实访客 IP。
+    if getattr(args, 'realip', None) is not None:
+        realip = args.realip != 'no'
+    else:
+        realip = bool((existing or {}).get('realip', True))
+    config = {'version':VERSION, 'ports':selected, 'geo':geo, 'backend':backend, 'web':web, 'auto':auto, 'realip':realip}
     if backend == 'diag':
         config['diag'] = sources
     for folder in [CONFIG.parent, PROGRAM.parent, DATA]:
@@ -1273,7 +1506,87 @@ start_pre() { /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py --once; }
     collect(config)
     done = '更新完成' if updating else '安装完成'
     how = 'nftables' if backend == 'nft' else '连接采样'
-    print('\n'+done+'。以后输入：liuliang\n端口：'+','.join(map(str,selected))+'；城市查询：'+('已启用' if geo else '关闭')+'；统计：'+how)
+    print('\n'+done+'。以后输入：liuliang\n端口：'+','.join(map(str,selected))+'；城市查询：'+('已启用' if geo else '关闭')+'；统计：'+how
+          +'；Cloudflare 后的真实访客 IP：'+('已开启' if config['realip'] else '关闭'))
+    print('只看网站访客：liuliang --web    排查问题：liuliang --doctor')
+
+
+def cloudflared_running():
+    for comm in Path('/proc').glob('[0-9]*/comm'):
+        try:
+            if comm.read_text().strip().startswith('cloudflared'):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def service_state():
+    if Path('/run/systemd/system').is_dir():
+        cmd = ['systemctl', 'is-active', 'liuliang']
+    else:
+        cmd = ['rc-service', 'liuliang', 'status']
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError:
+        return '未知'
+    text = (out.stdout or out.stderr).strip().splitlines()
+    return (text[-1] if text else '') + ('' if out.returncode == 0 else '（没在运行）')
+
+
+def doctor():
+    """把“为什么看不到网站访客 IP”最常见的几种原因逐条查一遍。"""
+    ok = lambda b: col('✔', G) if b else col('✘', Y)
+    print(col('liuliang ' + VERSION + ' 自检', B, C))
+    config = saved_config()
+    if not config:
+        print(ok(False) + ' 没有安装（/etc/liuliang/config.json 不存在），先运行一键安装'); return
+    print(ok(True) + ' 统计方式：' + ('nftables' if config.get('backend') != 'diag' else '连接采样 ' + json.dumps(config.get('diag') or {})))
+    state = service_state()
+    print(ok('没在运行' not in state) + ' 后台服务：' + state)
+    print('  统计端口：' + ','.join(map(str, config['ports'])))
+    print('  网站端口：' + (','.join(map(str, config.get('web') or [])) or '无'))
+    try:
+        backends = backend_ports()
+    except Exception:
+        backends = []
+    listening = set()
+    try:
+        listening = {i['port'] for i in iter_sockets(read_socket_table()) if i['proto'] == 'tcp'}
+    except Exception:
+        pass
+    missing = sorted(p for p in listening - set(config['ports']) - {22} if p in backends and p not in (config.get('web') or []))
+    if missing:
+        print('  本机还有这些 TCP 端口在监听但没统计：' + ','.join(map(str, missing)) + '（只绑 127.0.0.1 的是正常的，由反代转过去）')
+    tunnel = cloudflared_running()
+    realip = config.get('realip', True)
+    print(ok(realip) + ' Cloudflare 后的真实访客 IP 识别：' + ('开启' if realip else '关闭（重装时加 --realip yes 打开）'))
+    print('  回环口要看的网站后端端口：' + (','.join(map(str, backends)) or '无'))
+    if tunnel:
+        print('  检测到 cloudflared（Cloudflare Tunnel）：访客 IP 只能从请求头取，需要上面这项开启')
+    db = DATA / 'history-v1.db'
+    if not db.exists():
+        print(ok(False) + ' 还没有流量数据库：服务刚装好的话等两分钟'); return
+    c = sqlite3.connect(str(db), timeout=30)
+    try:
+        meta = dict(c.execute('SELECT key,value FROM metadata'))
+        now = time.time()
+        sample = float(meta.get('sample') or 0)
+        if sample:
+            print(ok(now - sample < 600) + ' 最近一次落盘：%d 秒前' % (now - sample))
+        ips = [ip for ip, in c.execute('SELECT ip FROM clients WHERE last_seen>=?', (now - 604800,))]
+        cf = [ip for ip in ips if is_cloudflare(ip)]
+        print('  近7天记录到 IP %d 个，其中 Cloudflare 节点 %d 个' % (len(ips), len(cf)))
+        last = float(meta.get('realip_last') or 0)
+        if last:
+            print(ok(True) + ' 最近一次从请求头认出真实访客：' + datetime.fromtimestamp(last, Z).strftime('%Y-%m-%d %H:%M:%S'))
+        elif cf or tunnel:
+            print(ok(False) + ' 还没从请求头认出过真实访客。用浏览器打开一次网站、等两分钟再看；'
+                  '仍然没有的话，确认网站程序是本机反代（Caddy/nginx/cloudflared）用 http 转过去的')
+        if cf and not last:
+            print('  说明：网站开了 Cloudflare 代理（橙色云），公网端口上只能看到 Cloudflare 的 IP。')
+    finally:
+        c.close()
 
 
 def main():
@@ -1281,12 +1594,18 @@ def main():
     parser.add_argument('--install', action='store_true')
     parser.add_argument('--ports', help='高级：手动指定统计端口，如 443,8443（默认自动检测）')
     parser.add_argument('--geo', choices=['yes','no'], help='高级：--geo no 关闭城市查询（默认开启）')
+    parser.add_argument('--realip', choices=['yes','no'], help='高级：--realip no 关闭 Cloudflare 后真实访客 IP 识别（默认开启）')
+    parser.add_argument('--web', action='store_true', help='只看网站访客（有网站流量就显示，不设门槛）')
+    parser.add_argument('--all', action='store_true', help='显示全部 IP：包括未达门槛的和 Cloudflare 节点 IP')
+    parser.add_argument('--doctor', action='store_true', help='检查安装状态，排查“看不到访客 IP”')
     parser.add_argument('--daemon', action='store_true')
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--version', action='version', version=VERSION)
     args = parser.parse_args()
     if args.install:
         install(args); return
+    if args.doctor:
+        doctor(); return
     config = json.loads(CONFIG.read_text())
     if args.once:
         collect(config)
@@ -1294,15 +1613,17 @@ def main():
         if config.get('backend') == 'diag':
             diag_daemon(config)
             return
-        seen, scanned = set(), 0
+        seen = set()
+        sniffer = start_sniffer(config)
         while True:
             try:
-                collect(config)
+                collect(config, sniffer)
             except Exception as exc:
                 print('liuliang:', str(exc), file=sys.stderr, flush=True)
             # 两分钟采一次，端口每分钟看一次：新端口最多约 2 分钟后开始统计。
             for _ in range(INTERVAL // RESCAN):
                 try:
+                    refresh_sniffer(sniffer)
                     seen, changed = follow_ports(config, seen)
                     if changed:
                         reload_nft(config)
@@ -1310,7 +1631,7 @@ def main():
                     print('liuliang:', str(exc), file=sys.stderr, flush=True)
                 time.sleep(RESCAN)
     else:
-        report(config)
+        report(config, web_only=args.web, show_all=args.all)
 
 
 from datetime import datetime,timedelta,timezone
@@ -1326,14 +1647,14 @@ def ww(s): return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_a
 def cell(s,n): return str(s)+' '*(n-ww(s))
 def diff(c,ip,a,b,col='bytes'):
  return c.execute(f'select coalesce(sum({col}),0) from traffic where ip=? and ts>? and ts<=?',(ip,a,b)).fetchone()[0]
-def report(config):
+def report(config, web_only=False, show_all=False):
  DB=str(DATA / "history-v1.db")
- now=time.time();print(col('端口 '+','.join(map(str,config['ports']))+' · 近7天连接',B,C))
+ now=time.time();print(col('端口 '+','.join(map(str,config['ports']))+' · 近7天'+('网站访客' if web_only else '连接'),B,C))
  if not os.path.exists(DB):
   if DATA.exists() and not os.access(str(DATA), os.R_OK | os.X_OK):
    print('无法读取流量数据，请使用 root 运行：liuliang');return
   print('(暂无流量数据库记录)');return
- c=sqlite3.connect(DB, timeout=30); rows=[]
+ c=sqlite3.connect(DB, timeout=30); rows=[]; cfhidden=0
  try:
   hasweb='web' in [r[1] for r in c.execute('PRAGMA table_info(traffic)')]
   cols=[r[1] for r in c.execute('PRAGMA table_info(clients)')]
@@ -1341,13 +1662,27 @@ def report(config):
   for rec in c.execute(f'select {sel} from clients where last_seen>=? order by last_seen desc',(now-604800,)):
    ip,co,ci=rec[0],rec[1],rec[2]; isp,ls=(rec[3],rec[4]) if len(rec)==5 else ('',rec[3])
    d=diff(c,ip,now-86400,now);w=diff(c,ip,now-604800,now);wb=diff(c,ip,now-604800,now,'web') if hasweb else 0
+   # Cloudflare 回源节点不是访客：真实访客已经从请求头单独记了，默认不显示。
+   # 只认「几乎全是网站流量」的：用 WARP 连节点的人出口也在 Cloudflare 网段，照常显示。
+   cf=is_cloudflare(ip) and wb>0 and w-wb<WEB_MIN_BYTES
+   if cf and not show_all:
+    if w>0: cfhidden+=1
+    continue
+   if web_only:
+    if wb<=0: continue
+    d=diff(c,ip,now-86400,now,'web') if hasweb else 0;w=wb
    # 节点流量 800KB 起显示；网站（文件分享）访客上传/下载 20KB 起就显示。
-   if w<MIN_TRAFFIC_BYTES and wb<WEB_MIN_BYTES: continue
-   kind='+'.join(k for k,ok in (('节点',w-wb>=WEB_MIN_BYTES),('网站',wb>=WEB_MIN_BYTES)) if ok) or '节点'
-   age=max(0,now-float(ls));place=' '.join(x for x in(co,ci) if x) or '未解析';rows.append((ip,isp_display(isp),place,d,w,ls,age,kind))
+   elif not show_all and w<MIN_TRAFFIC_BYTES and wb<WEB_MIN_BYTES: continue
+   kind='CF节点' if cf else '+'.join(k for k,ok in (('节点',w-wb>=WEB_MIN_BYTES),('网站',wb>=WEB_MIN_BYTES or web_only and wb>0)) if ok) or ('网站' if wb>0 and wb>=w-wb else '节点')
+   age=max(0,now-float(ls));place=' '.join(x for x in(co,ci) if x) or ('Cloudflare' if cf else '未解析');rows.append((ip,isp_display(isp),place,d,w,ls,age,kind))
+  note=('已隐藏 %d 个 Cloudflare 节点 IP（网站开了橙色云 / Tunnel，真实访客已单独列出；liuliang --all 显示）'%cfhidden) if cfhidden else ''
   if not rows:
-   print('(近7天无达到 800KB 的流量记录'+('，也没有网站访客' if config.get('web') else '')+')');return
-  showkind=any(r[7]!='节点' for r in rows)
+   print('(近7天没有网站访客)' if web_only else '(近7天无达到 800KB 的流量记录'+('，也没有网站访客' if config.get('web') else '')+')')
+   if note:print(col(note,D))
+   if cfhidden and not c.execute("select 1 from metadata where key='realip_last'").fetchone():
+    print('只看到 Cloudflare 的 IP、没有真实访客：运行 liuliang --doctor 排查')
+   return
+  showkind=web_only is False and any(r[7]!='节点' for r in rows)
   h=['IP','运营商','城市','近24小时','近7天','最近连接']+(['访问'] if showkind else []);N=[15,10,8,10,10,19]+([4] if showkind else [])
   vals=lambda ip,net,pl,d,w,ls,kind:[ip,net,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')]+([kind] if showkind else [])
   for ip,net,pl,d,w,ls,age,kind in rows:N=[max(N[i],ww(x)) for i,x in enumerate(vals(ip,net,pl,d,w,ls,kind))]
@@ -1356,12 +1691,14 @@ def report(config):
   for ip,net,pl,d,w,ls,age,kind in rows:
    v=vals(ip,net,pl,d,w,ls,kind);out=[]
    for i,x in enumerate(v):
-    st=[D,X] if d<=0 and w<=0 else ([B,G] if i==0 and d>0 else [])
+    st=[D,X] if d<=0 and w<=0 or kind=='CF节点' else ([B,G] if i==0 and d>0 else [])
     if i==3 and d>=100*1024**2 or i==4 and w>=1024**3:st=[B,Y]
     if i==5:st=[B,G] if age<=3600 else ([D,X] if age>259200 else [])
     out.append(col(cell(x,N[i]),*st))
    print('│ '+' │ '.join(out)+' │')
-  print(line('└','┴','┘'));a=sum(1 for r in rows if r[3]>0 or r[4]>0);print('合计：IP 数 %d · 有流量 IP 数 %d · 近24小时总流量 %s · 近7天总流量 %s'%(len(rows),a,sz(sum(r[3] for r in rows)),sz(sum(r[4] for r in rows))))
+  real=[r for r in rows if r[7]!='CF节点']
+  print(line('└','┴','┘'));a=sum(1 for r in real if r[3]>0 or r[4]>0);print('合计：IP 数 %d · 有流量 IP 数 %d · 近24小时总流量 %s · 近7天总流量 %s'%(len(real),a,sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))))
+  if note:print(col(note,D))
  finally:
   c.close()
 
