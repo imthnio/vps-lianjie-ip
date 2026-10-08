@@ -20,7 +20,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.17'
+VERSION = '1.0.18'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -1957,7 +1957,7 @@ class SiteTracker:
         self.conns = {}    # (ip, 客户端端口) -> [域名, 认到的时间, ss 里还在]；域名 None = 多个网站共用（mux）
         self.base = {}     # 流 key -> [已记字节, 时间]
         self.closed = {}   # 已关闭、日志还没对上的流：key -> (ip, up, down, 关闭时间)
-        self.usage = {}    # (ip, 域名) -> [字节, 次数, 最近访问]
+        self.usage = {}    # (ip, 域名) -> [字节, 次数, 最近一次打开的时间]
         self.status = None  # 还没找过日志时不写状态，免得报表误说「读不到」
 
     def start(self):
@@ -2061,9 +2061,9 @@ class SiteTracker:
         delta = total - before if total >= before else total
         self.base[key] = [total, now]
         if entry[0] and delta > 0:
-            use = self.usage.setdefault((ip, entry[0]), [0, 0, now])
+            # 只加流量，不改最近访问时间：那个时间只在打开网站/App（日志里新的一次访问）时更新。
+            use = self.usage.setdefault((ip, entry[0]), [0, 0, 0])
             use[0] += delta
-            use[2] = max(use[2], now)
 
     def drain(self):
         with self.lock:
@@ -2456,6 +2456,10 @@ def report(config, web_only=False, show_all=False):
   hasweb='web' in [r[1] for r in c.execute('PRAGMA table_info(traffic)')]
   cols=[r[1] for r in c.execute('PRAGMA table_info(clients)')]
   sel='ip,country,city,isp,last_seen' if 'isp' in cols else 'ip,country,city,last_seen'
+  # 最后上网 = 这个 IP 最后一次打开网站/App 的时间（代理访问日志里最后一次访问）。
+  # 读不到访问日志的 IP 退回到最后一个数据包的时间，标 *（手机后台心跳也算，会偏晚）。
+  hassites='sites' in {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
+  opened=dict(c.execute('select ip,max(last) from sites where ts>? and hits>0 group by ip',(now-604800,))) if hassites and not web_only else {}
   for rec in c.execute(f'select {sel} from clients where last_seen>=? order by last_seen desc',(now-604800,)):
    ip,co,ci=rec[0],rec[1],rec[2]; isp,ls=(rec[3],rec[4]) if len(rec)==5 else ('',rec[3])
    d=diff(c,ip,now-86400,now);w=diff(c,ip,now-604800,now);wb=diff(c,ip,now-604800,now,'web') if hasweb else 0
@@ -2471,7 +2475,9 @@ def report(config, web_only=False, show_all=False):
    # 节点流量 800KB 起显示；网站（文件分享）访客上传/下载 20KB 起就显示。
    elif not show_all and w<MIN_TRAFFIC_BYTES and wb<WEB_MIN_BYTES: continue
    kind='CF节点' if cf else '+'.join(k for k,ok in (('节点',w-wb>=WEB_MIN_BYTES),('网站',wb>=WEB_MIN_BYTES or web_only and wb>0)) if ok) or ('网站' if wb>0 and wb>=w-wb else '节点')
-   age=max(0,now-float(ls));place=' '.join(x for x in(co,ci) if x) or ('Cloudflare' if cf else '未解析');rows.append((ip,isp_display(isp),place,d,w,ls,age,kind))
+   mark='' if web_only or opened.get(ip) else '*';ls=opened.get(ip) or ls
+   age=max(0,now-float(ls));place=' '.join(x for x in(co,ci) if x) or ('Cloudflare' if cf else '未解析');rows.append((ip,isp_display(isp),place,d,w,ls,age,kind,mark))
+  rows.sort(key=lambda r:-float(r[5]))
   note=('已隐藏 %d 个 Cloudflare 节点 IP（网站开了橙色云 / Tunnel，真实访客已单独列出；liuliang --all 显示）'%cfhidden) if cfhidden else ''
   if not rows:
    print('(近7天没有网站访客)' if web_only else '(近7天无达到 800KB 的流量记录'+('，也没有网站访客' if config.get('web') else '')+')')
@@ -2480,13 +2486,13 @@ def report(config, web_only=False, show_all=False):
     print('只看到 Cloudflare 的 IP、没有真实访客：运行 liuliang --doctor 排查')
    return
   showkind=web_only is False and any(r[7]!='节点' for r in rows)
-  h=['#','IP','运营商','城市','近24小时','近7天','最近连接']+(['访问'] if showkind else []);N=[2,15,10,8,10,10,19]+([4] if showkind else [])
-  vals=lambda n,ip,net,pl,d,w,ls,kind:[n,ip,net,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')]+([kind] if showkind else [])
-  for n,(ip,net,pl,d,w,ls,age,kind) in enumerate(rows,1):N=[max(N[i],ww(x)) for i,x in enumerate(vals(n,ip,net,pl,d,w,ls,kind))]
+  h=['#','IP','运营商','城市','近24小时','近7天','最后上网' if not web_only else '最近访问']+(['访问'] if showkind else []);N=[2,15,10,8,10,10,19]+([4] if showkind else [])
+  vals=lambda n,ip,net,pl,d,w,ls,kind,mark:[n,ip,net,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')+mark]+([kind] if showkind else [])
+  for n,r in enumerate(rows,1):N=[max(N[i],ww(x)) for i,x in enumerate(vals(n,*r[:6],r[7],r[8]))]
   def line(a,m,b):return a+m.join('─'*(n+2) for n in N)+b
   print(line('┌','┬','┐'));print(col('│ '+' │ '.join(cell(x,N[i]) for i,x in enumerate(h))+' │',B,C));print(line('├','┼','┤'))
-  for n,(ip,net,pl,d,w,ls,age,kind) in enumerate(rows,1):
-   v=vals(n,ip,net,pl,d,w,ls,kind);out=[]
+  for n,(ip,net,pl,d,w,ls,age,kind,mark) in enumerate(rows,1):
+   v=vals(n,ip,net,pl,d,w,ls,kind,mark);out=[]
    for i,x in enumerate(v):
     st=[D,X] if d<=0 and w<=0 or kind=='CF节点' else ([B,G] if i==1 and d>0 else [])
     if i==4 and d>=100*1024**2 or i==5 and w>=1024**3:st=[B,Y]
@@ -2495,6 +2501,8 @@ def report(config, web_only=False, show_all=False):
    print('│ '+' │ '.join(out)+' │')
   real=[r for r in rows if r[7]!='CF节点']
   print(line('└','┴','┘'));a=sum(1 for r in real if r[3]>0 or r[4]>0);print('合计：IP 数 %d · 有流量 IP 数 %d · 近24小时总流量 %s · 近7天总流量 %s'%(len(real),a,sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))))
+  if any(r[8] for r in rows):print(col('最后上网：这个 IP 最后一次打开网站/App 的时间。带 * 的读不到它打开网站的记录（代理没开日志，或是网站访客），'
+   '显示的是最后有数据来往的时间，手机放着不用、后台也会有数据，所以可能比实际晚',D))
   if note:print(col(note,D))
   picks=[r[0] for r in rows]
  finally:
@@ -2575,7 +2583,7 @@ def site_report(ip, config=None, show_all=False):
         lst = sorted(lst, key=lambda x: (-x[0], -x[1], x[2]))
         top = lst[0][2] if len(lst[0][2]) <= 36 else lst[0][2][:33] + '...'
         return top + (' 等%d个' % len(lst) if len(lst) > 1 else '')
-    table = [[str(n), name, hosts(g[3]), sz(g[0]) if g[0] else '-', str(g[1]), datetime.fromtimestamp(g[2], Z).strftime('%Y-%m-%d %H:%M:%S')]
+    table = [[str(n), name, hosts(g[3]), sz(g[0]) if g[0] else '-', str(g[1]), datetime.fromtimestamp(g[2], Z).strftime('%Y-%m-%d %H:%M:%S') if g[2] else '-']
              for n, (name, g) in enumerate(shown, 1)]
     counted = sum(g[0] for _name, g in items)
     if rest:

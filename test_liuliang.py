@@ -744,6 +744,25 @@ class SiteTests(unittest.TestCase):
                 m.report({'ports': [443], 'geo': True})
         self.assertRegex(out.getvalue(), r'│ #  │ IP')
         self.assertRegex(out.getvalue(), r'│ 1  │ 8\.8\.8\.8')
+    def test_last_online_is_last_site_opened(self):
+        # 最后上网 = 最后一次打开网站/App 的时间；之后只有数据来往（心跳）不算
+        t = m.SiteTracker([443]); now = m.time.time()
+        t.tick(now - 7200, [self.XRAY], m.parse_ss(self.ss(50001, 1000, 0), [443]), {})
+        t.tick(now - 60, [], m.parse_ss(self.ss(50001, 900 * 1024, 0), [443]), {})
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db')
+            m.save_sample(db, {('up4', '8.8.8.8'): (900 * 1024, None), ('up4', '1.1.1.1'): (900 * 1024, None)}, now)
+            m.save_sites(db, t, now); db.commit(); db.close()
+            out = io.StringIO()
+            with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                m.report({'ports': [443], 'geo': True})
+            text = out.getvalue()
+            opened = m.datetime.fromtimestamp(now - 7200, m.Z).strftime('%Y-%m-%d %H:%M:%S')
+            self.assertIn('最后上网', text)
+            self.assertRegex(text, r'8\.8\.8\.8 .*' + opened + r' +│')      # 打开网站的时间，不是最后一个包
+            self.assertRegex(text, r'1\.1\.1\.1 .*\* │')                 # 没有网站记录：退回并标 *
+            self.assertLess(text.index('1.1.1.1'), text.index('8.8.8.8'))  # 按最后上网时间排序
+            self.assertIn(opened, self._site_report(temp))
     def test_site_sources_reads_proxy_configs(self):
         with tempfile.TemporaryDirectory() as temp:
             def conf(name, log):
