@@ -638,4 +638,150 @@ class TrafficTests(unittest.TestCase):
         payload=s.split("<<'LIULIANG_PYTHON'\n",1)[1].split('\nLIULIANG_PYTHON\n',1)[0]+'\n'
         self.assertEqual(payload,Path(__file__).with_name('liuliang.py').read_text())
 
+class SiteTests(unittest.TestCase):
+    """每个 IP 访问了哪些应用/网站、各用了多少流量。"""
+    XRAY = '2026/10/08 12:00:00.123456 from 8.8.8.8:50001 accepted tcp:www.youtube.com:443 [vless-in -> direct] email: a'
+    def ss(self, port, sent, received, peer='8.8.8.8'):
+        return ('ESTAB 0 0 [::ffff:10.0.0.2]:443 [::ffff:%s]:%d\n\t cubic bytes_sent:%d bytes_received:%d\n'
+                % (peer, port, sent, received))
+    def test_parse_xray_and_singbox_logs(self):
+        p = m.AccessParser()
+        self.assertEqual(p.feed(self.XRAY), ('8.8.8.8', 50001, 'www.youtube.com'))
+        self.assertEqual(p.feed('2026/10/08 12:00:00 1.1.1.1:6000 accepted tcp:149.154.167.51:443 [in >> out]'),
+                         ('1.1.1.1', 6000, '149.154.167.51'))
+        self.assertEqual(p.feed('2026/10/08 12:00:00 from tcp:[2606:4700::1]:7000 accepted udp:Chat.OpenAI.com.:443'),
+                         ('2606:4700::1', 7000, 'chat.openai.com'))
+        self.assertIsNone(p.feed('2026/10/08 12:00:00 from 8.8.8.8:1 accepted udp:1.1.1.1:53 [in -> dns]'))
+        self.assertIsNone(p.feed('2026/10/08 12:00:00 from 127.0.0.1:1 accepted tcp:google.com:443'))
+        self.assertIsNone(p.feed('2026/10/08 12:00:00 [Info] app/dispatcher: sniffed domain: google.com'))
+        self.assertIsNone(p.feed('\x1b[36mINFO\x1b[0m [123 0ms] inbound/vless[in]: inbound connection from 9.9.9.9:4000'))
+        self.assertEqual(p.feed('+0800 2026-10-08 12:00:00 INFO [123 5ms] inbound/vless[in]: inbound connection to www.netflix.com:443'),
+                         ('9.9.9.9', 4000, 'www.netflix.com'))
+        self.assertIsNone(p.feed('INFO [124 0ms] inbound/hysteria2[hy]: inbound packet connection to x.com:443'))
+    def test_site_label(self):
+        self.assertEqual(m.site_label('rr3---sn-a5m.googlevideo.com'), 'YouTube')
+        self.assertEqual(m.site_label('youtubei.googleapis.com'), 'YouTube')
+        self.assertEqual(m.site_label('www.googleapis.com'), 'Google')
+        self.assertEqual(m.site_label('gemini.google.com'), 'Gemini')
+        self.assertEqual(m.site_label('149.154.167.51'), 'Telegram')
+        self.assertEqual(m.site_label('1.2.3.4'), '1.2.3.4')
+        self.assertEqual(m.site_label('cdn.static.example.com'), 'example.com')
+        self.assertEqual(m.site_label('news.bbc.co.uk'), 'bbc.co.uk')
+    def test_tracker_counts_bytes_per_site(self):
+        t = m.SiteTracker([443])
+        t.tick(100, [self.XRAY], m.parse_ss(self.ss(50001, 1000, 200), [443]), {})
+        t.tick(102, [], m.parse_ss(self.ss(50001, 5000, 300), [443]), {})
+        # 另一条连接还没有日志：不算
+        t.tick(104, [], m.parse_ss(self.ss(50001, 5000, 300) + self.ss(50002, 999, 1), [443]), {})
+        data, _ = t.drain()
+        self.assertEqual(data[('8.8.8.8', 'www.youtube.com')][:2], [5300, 1])
+        self.assertNotIn(('8.8.8.8', None), data)
+    def test_tracker_short_connection_closed_before_log(self):
+        t = m.SiteTracker([443])
+        closed = m.parse_ss(self.ss(50001, 7000, 100), [443])
+        t.tick(100, [], {}, closed)
+        t.tick(101, [self.XRAY], {}, {})
+        data, _ = t.drain()
+        self.assertEqual(data[('8.8.8.8', 'www.youtube.com')][:2], [7100, 1])
+    def test_tracker_mux_only_counts_hits(self):
+        t = m.SiteTracker([443])
+        two = [self.XRAY, self.XRAY.replace('www.youtube.com', 'www.netflix.com')]
+        t.tick(100, two, m.parse_ss(self.ss(50001, 9000, 0), [443]), {})
+        data, _ = t.drain()
+        self.assertEqual(data[('8.8.8.8', 'www.youtube.com')][:2], [0, 1])
+        self.assertEqual(data[('8.8.8.8', 'www.netflix.com')][:2], [0, 1])
+    def test_tracker_port_reuse_after_close(self):
+        t = m.SiteTracker([443])
+        t.tick(100, [self.XRAY], m.parse_ss(self.ss(50001, 100, 0), [443]), {})
+        t.tick(102, [], {}, {})
+        t.tick(200, [self.XRAY.replace('www.youtube.com', 'github.com')], m.parse_ss(self.ss(50001, 50, 0), [443]), {})
+        data, _ = t.drain()
+        self.assertEqual(data[('8.8.8.8', 'www.youtube.com')][0], 100)
+        self.assertEqual(data[('8.8.8.8', 'github.com')][0], 50)
+    def _db(self, temp, tracker=None, traffic=0):
+        db = m.open_db(Path(temp) / 'history-v1.db')
+        now = m.time.time()
+        if traffic:
+            m.save_sample(db, {('up4', '8.8.8.8'): (traffic, None)}, now)
+        if tracker is not None:
+            m.save_sites(db, tracker, now)
+        db.commit(); db.close()
+    def _site_report(self, temp, ip='8.8.8.8', **kw):
+        out = io.StringIO()
+        with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+            m.site_report(ip, {'ports': [443]}, **kw)
+        return out.getvalue()
+    def test_site_report_table(self):
+        t = m.SiteTracker([443])
+        t.status = {'sources': ['file:/var/log/xray/access.log'], 'notes': []}
+        lines = [self.XRAY,
+                 self.XRAY.replace('50001', '50002').replace('www.youtube.com', 'rr1.googlevideo.com'),
+                 self.XRAY.replace('50001', '50003').replace('www.youtube.com', 'github.com')]
+        flows = m.parse_ss(self.ss(50001, 1024 * 1024, 0) + self.ss(50002, 3 * 1024 * 1024, 0) + self.ss(50003, 2048, 0), [443])
+        t.tick(100, lines, flows, {})
+        with tempfile.TemporaryDirectory() as temp:
+            self._db(temp, t, traffic=5 * 1024 * 1024)
+            text = self._site_report(temp)
+        self.assertIn('应用/网站', text); self.assertIn('YouTube', text); self.assertIn('4.0 MB', text)
+        self.assertIn('rr1.googlevideo.com 等2个', text); self.assertIn('GitHub', text)
+        self.assertIn('其他（无法细分）', text)
+        self.assertLess(text.index('YouTube'), text.index('GitHub'))
+    def test_site_report_explains_missing_logs(self):
+        t = m.SiteTracker([443])
+        t.status = {'sources': [], 'notes': ['Xray 关闭了访问日志（log.access 为 none），看不到访问的网站']}
+        with tempfile.TemporaryDirectory() as temp:
+            self._db(temp, t, traffic=900 * 1024)
+            text = self._site_report(temp)
+        self.assertIn('log.access 为 none', text); self.assertIn('"access"', text)
+        with tempfile.TemporaryDirectory() as temp:
+            self._db(temp, None, traffic=900 * 1024)
+            self.assertIn('还没有记录', self._site_report(temp))
+    def test_report_numbers_rows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self._db(temp, None, traffic=900 * 1024)
+            out = io.StringIO()
+            with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                m.report({'ports': [443], 'geo': True})
+        self.assertRegex(out.getvalue(), r'│ #  │ IP')
+        self.assertRegex(out.getvalue(), r'│ 1  │ 8\.8\.8\.8')
+    def test_site_sources_reads_proxy_configs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            def conf(name, log):
+                path = Path(temp) / name
+                path.write_text('// comment\n' + json.dumps({'log': log, 'inbounds': []}))
+                return str(path)
+            procs = [('1', 'xray', ['/usr/local/bin/xray', 'run', '-c', conf('a.json', {'access': 'access.log'})]),
+                     ('2', 'xray', ['xray', '-config=' + conf('b.json', {'access': 'none'})]),
+                     ('3', 'sing-box', ['sing-box', 'run', '-c', conf('c.json', {'level': 'warn'})]),
+                     ('4', 'sing-box', ['sing-box', 'run', '-c', conf('d.json', {})])]
+            with patch.object(m, 'proxy_processes', return_value=procs), \
+                 patch.object(m.os, 'readlink', return_value='/opt/x'), \
+                 patch.object(m, 'service_unit', return_value='sing-box.service'), \
+                 patch.object(m.shutil, 'which', return_value='/bin/journalctl'):
+                sources, notes = m.site_sources(['/extra.log'])
+        self.assertEqual(sources, [('file', '/extra.log'), ('file', '/opt/x/access.log'), ('journal', 'sing-box.service')])
+        self.assertEqual(len(notes), 2)
+        self.assertIn('none', notes[0]); self.assertIn('warn', notes[1])
+    def test_file_follower_handles_rotation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'access.log'
+            path.write_text('old line\n')
+            f = m.FileFollower(str(path))
+            with open(path, 'a') as h: h.write('new 1\npart')
+            self.assertEqual(f.lines(), ['new 1'])
+            with open(path, 'a') as h: h.write('ial\n')
+            self.assertEqual(f.lines(), ['partial'])
+            path.rename(Path(temp) / 'access.log.1'); path.write_text('after rotate\n')
+            self.assertEqual(f.lines(), ['after rotate'])
+            f.close()
+    def test_sites_are_kept_eight_days(self):
+        db = m.open_db(':memory:')
+        t = m.SiteTracker([443]); t.tick(100, [self.XRAY], {}, {})
+        m.save_sites(db, t, 1000)
+        t.tick(100, [self.XRAY], {}, {})
+        m.save_sites(db, t, 1000 + 8 * 86400 + 1)
+        self.assertEqual(db.execute('select count(*) from sites').fetchone()[0], 1)
+        db.close()
+
+
 if __name__=='__main__':unittest.main(verbosity=2)

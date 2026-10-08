@@ -20,7 +20,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.15'
+VERSION = '1.0.16'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -178,6 +178,9 @@ def open_db(path=None):
         CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS flows(key TEXT PRIMARY KEY, up INTEGER NOT NULL, down INTEGER NOT NULL, seen REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS pending(ip TEXT PRIMARY KEY, bytes INTEGER NOT NULL, last_seen REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS sites(ts REAL NOT NULL, ip TEXT NOT NULL, host TEXT NOT NULL, bytes INTEGER NOT NULL, hits INTEGER NOT NULL, last REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS sites_ip_ts ON sites(ip,ts);
+        CREATE INDEX IF NOT EXISTS sites_ts ON sites(ts);
     ''')
     # web：这一笔字节里走网站端口的部分（不另算，web <= bytes）。老库自动加列。
     for table in ('traffic', 'pending'):
@@ -255,9 +258,9 @@ def isp_display(raw):
     return s[:18]
 
 
-def collect(config, sniffer=None):
+def collect(config, sniffer=None, sites=None):
     if config.get('backend') == 'diag':
-        diag_tick(config, True, sniffer=sniffer)
+        diag_tick(config, True, sniffer=sniffer, sites=sites)
         if config.get('geo', True):
             geo_resolve()
         return
@@ -274,6 +277,7 @@ def collect(config, sniffer=None):
             save_sample(c, current, now, recreated or not last_boot or last_boot[0] != boot)
             save_realip(c, sniffer, now)
             take_pending(c, now)
+            save_sites(c, sites, now)
             c.execute("INSERT OR REPLACE INTO metadata VALUES('boot',?)", (boot,))
             c.execute("INSERT OR REPLACE INTO metadata VALUES('sample',?)", (str(now),))
             c.commit()
@@ -1222,7 +1226,7 @@ def read_flow_snapshot(ports, sources):
     return flows
 
 
-def diag_tick(config, flush, pump=None, watcher=None, sniffer=None):
+def diag_tick(config, flush, pump=None, watcher=None, sniffer=None, sites=None):
     ports = config['ports']
     sources = config.get('diag') or {}
     now = time.time()
@@ -1253,6 +1257,7 @@ def diag_tick(config, flush, pump=None, watcher=None, sniffer=None):
             save_realip(c, sniffer, now)
             if flush:
                 take_pending(c, now)
+                save_sites(c, sites, now)
                 c.execute("INSERT OR REPLACE INTO metadata VALUES('sample',?)", (str(now),))
             c.commit()
         finally:
@@ -1314,6 +1319,7 @@ def diag_daemon(config):
             print('liuliang: ' + str(exc), file=sys.stderr, flush=True)
             pump = None
     sniffer = start_sniffer(config)
+    sites = start_sites(config)
     last = 0
     scanned, seen = 0, set()
     while True:
@@ -1328,8 +1334,10 @@ def diag_daemon(config):
                         watcher.ports = set(config['ports'])
                     if pump is not None:
                         pump.ports, pump.web = set(config['ports']), set(config.get('web') or [])
+                    if sites is not None:
+                        sites.set_ports(config['ports'])
             flush = now - last >= INTERVAL
-            diag_tick(config, flush, pump, watcher, sniffer)
+            diag_tick(config, flush, pump, watcher, sniffer, sites)
             if flush:
                 last = now
                 if config.get('geo', True):
@@ -1347,6 +1355,514 @@ def refresh_sniffer(sniffer):
         sniffer.ports = set(backend_ports())
     except Exception:
         pass
+
+
+# ---- 每个 IP 访问了哪些应用/网站 ----
+# 代理程序（Xray / V2Ray / sing-box）的访问日志里写着「哪个客户端 IP:端口 要连哪个
+# 域名」。同一条 TCP 连接在 ss 里能看到收发字节，按「客户端 IP:端口」对上，就知道
+# 每个域名用了多少流量。hy2/tuic 这类 UDP 协议、开了 mux 的连接是多个网站共用一条
+# 连接，只能记下访问次数，流量在报表里算进「其他」。只记域名，不记网址和内容。
+SITE_KEEP = 600      # 日志里认到、但 ss 里一直没看到的连接，对应关系留这么久
+SITE_GRACE = 15      # 连接关了、日志还没读到时，关闭时的字节先等这么久
+SITE_RESCAN = 300    # 每隔这么久重新找一次代理的访问日志（代理重启、换了配置）
+SITE_PROCESS = re.compile(r'(xray|v2ray|sing-box)', re.I)
+SITE_HELP = ('打开访问日志：Xray/V2Ray 配置里写 "log": {"access": "/var/log/xray/access.log"}（不能是 none），'
+             'sing-box 配置里 "log": {"level": "info"}；改完重启代理，几分钟后 liuliang 自动开始记录。')
+
+# 常见应用的域名后缀。没列出的网站按主域名（如 example.com）归类。
+APPS = (
+    ('YouTube', 'youtube.com youtu.be googlevideo.com ytimg.com youtube-nocookie.com youtubei.googleapis.com youtubekids.com yt3.ggpht.com'),
+    ('Netflix', 'netflix.com netflix.net nflxvideo.net nflximg.net nflximg.com nflxext.com nflxso.net'),
+    ('TikTok', 'tiktok.com tiktokv.com tiktokv.us tiktokcdn.com tiktokcdn-us.com byteoversea.com ibytedtos.com ibyteimg.com muscdn.com musical.ly'),
+    ('Instagram', 'instagram.com cdninstagram.com'),
+    ('Threads', 'threads.net threads.com'),
+    ('Facebook', 'facebook.com facebook.net fbcdn.net fb.com fbsbx.com messenger.com'),
+    ('WhatsApp', 'whatsapp.com whatsapp.net wa.me'),
+    ('Telegram', 'telegram.org telegram.me t.me telesco.pe cdn-telegram.org tdesktop.com'),
+    ('X (Twitter)', 'twitter.com x.com twimg.com t.co'),
+    ('ChatGPT', 'openai.com chatgpt.com oaistatic.com oaiusercontent.com'),
+    ('Claude', 'claude.ai claude.com anthropic.com'),
+    ('Gemini', 'gemini.google.com bard.google.com'),
+    ('Google', 'google.com google.com.hk googleapis.com gstatic.com googleusercontent.com ggpht.com gvt1.com gvt2.com '
+               'googlesyndication.com doubleclick.net googletagmanager.com google-analytics.com app-measurement.com'),
+    ('GitHub', 'github.com githubusercontent.com githubassets.com github.io'),
+    ('Discord', 'discord.com discord.gg discordapp.com discordapp.net discord.media'),
+    ('Reddit', 'reddit.com redd.it redditmedia.com redditstatic.com'),
+    ('Wikipedia', 'wikipedia.org wikimedia.org'),
+    ('Spotify', 'spotify.com scdn.co spotifycdn.com spotifycdn.net'),
+    ('Twitch', 'twitch.tv ttvnw.net jtvnw.net'),
+    ('Disney+', 'disneyplus.com disney-plus.net dssott.com bamgrid.com'),
+    ('HBO Max', 'max.com hbomax.com'),
+    ('Prime Video', 'primevideo.com aiv-cdn.net aiv-delivery.net amazonvideo.com'),
+    ('Amazon', 'amazon.com amazonaws.com media-amazon.com ssl-images-amazon.com'),
+    ('Apple', 'apple.com icloud.com icloud-content.com mzstatic.com apple-cloudkit.com cdn-apple.com aaplimg.com'),
+    ('Microsoft', 'microsoft.com live.com office.com office.net outlook.com bing.com msn.com skype.com windowsupdate.com msftconnecttest.com'),
+    ('Steam', 'steampowered.com steamcommunity.com steamstatic.com steamcontent.com steamserver.net'),
+    ('PlayStation', 'playstation.com playstation.net sonyentertainmentnetwork.com'),
+    ('LINE', 'line.me line-scdn.net line-apps.com'),
+    ('Signal', 'signal.org whispersystems.org'),
+    ('Zoom', 'zoom.us zoom.com'),
+    ('Pixiv', 'pixiv.net pximg.net'),
+    ('Pinterest', 'pinterest.com pinimg.com'),
+    ('LinkedIn', 'linkedin.com licdn.com'),
+    ('Snapchat', 'snapchat.com sc-cdn.net snapkit.com'),
+    ('Bilibili', 'bilibili.com bilivideo.com hdslb.com biliapi.net'),
+    ('Speedtest', 'speedtest.net ookla.com'),
+    ('Cloudflare', 'cloudflare.com cloudflare-dns.com'),
+)
+APP_SUFFIX = {suffix: name for name, suffixes in APPS for suffix in suffixes.split()}
+# Telegram 客户端多数直接连 IP，日志里没有域名。
+TELEGRAM_NETS = tuple(ipaddress.ip_network(n) for n in (
+    '91.105.192.0/23', '91.108.4.0/22', '91.108.8.0/22', '91.108.12.0/22', '91.108.16.0/22',
+    '91.108.20.0/22', '91.108.56.0/22', '95.161.64.0/20', '149.154.160.0/20', '185.76.151.0/24',
+    '2001:67c:4e8::/48', '2001:b28:f23c::/47', '2001:b28:f23f::/48', '2a0a:f280::/32',
+))
+
+
+def base_domain(host):
+    """主域名：www.example.com -> example.com，a.b.example.co.uk -> example.co.uk。"""
+    parts = host.split('.')
+    if len(parts) <= 2:
+        return host
+    if len(parts[-1]) == 2 and parts[-2] in ('co', 'com', 'net', 'org', 'gov', 'edu', 'ac', 'ne', 'or', 'go'):
+        return '.'.join(parts[-3:])
+    return '.'.join(parts[-2:])
+
+
+def site_label(host):
+    """域名/IP 归到哪个应用或网站。"""
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None:
+        return 'Telegram' if any(ip.version == n.version and ip in n for n in TELEGRAM_NETS) else host
+    parts = host.split('.')
+    for i in range(len(parts) - 1):
+        name = APP_SUFFIX.get('.'.join(parts[i:]))
+        if name:
+            return name
+    return base_domain(host)
+
+
+def clean_host(text):
+    """日志里的目标地址只留可打印字符，防止终端控制字符混进报表。"""
+    host = ''.join(ch for ch in str(text or '') if ch.isprintable() and not ch.isspace())
+    return host.strip('[]').rstrip('.').lower()[:253]
+
+
+def split_target(token):
+    return split_host_port(re.sub(r'^(?:tcp|udp):', '', token))
+
+
+ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+XRAY_ACCEPT = re.compile(r'(\S+)\s+accepted\s+(\S+)')
+SINGBOX_CONN = re.compile(r'\[(\d+)[^\]]*\]\s+inbound/[^:]*:\s+inbound (?:packet )?connection (from|to) (\S+)')
+
+
+class AccessParser:
+    """读 Xray/V2Ray 和 sing-box 的访问日志，认出 (客户端 IP, 客户端端口, 目标域名)。
+
+    Xray：2024/05/01 12:00:00 from 1.2.3.4:5678 accepted tcp:www.youtube.com:443 [in -> out]
+    sing-box 分两行，用连接编号对上：
+      [3856612376 0ms] inbound/vless[in]: inbound connection from 1.2.3.4:5678
+      [3856612376 0ms] inbound/vless[in]: inbound connection to www.youtube.com:443
+    """
+
+    def __init__(self):
+        self.pending = {}
+
+    def feed(self, line):
+        line = ANSI.sub('', line)
+        found = XRAY_ACCEPT.search(line)
+        if found:
+            return self._event(found.group(1), found.group(2))
+        found = SINGBOX_CONN.search(line)
+        if not found:
+            return None
+        cid, way, addr = found.groups()
+        if way == 'from':
+            if len(self.pending) >= 4096:
+                self.pending.pop(next(iter(self.pending)))
+            self.pending[cid] = addr
+            return None
+        src = self.pending.pop(cid, None)
+        return self._event(src, addr) if src else None
+
+    def _event(self, src, dst):
+        src_host, src_port = split_target(src)
+        dst_host, dst_port = split_target(dst)
+        # 53 端口是 DNS 查询，不算访问网站。
+        if src_host is None or dst_host is None or dst_port == 53:
+            return None
+        ip = normalize_ip(src_host)
+        host = clean_host(dst_host)
+        if ip is None or not host:
+            return None
+        return str(ip), src_port, host
+
+
+def load_json(path):
+    """读代理配置。Xray 允许 // 注释，读不出来时去掉注释行再试一次。"""
+    try:
+        text = Path(path).read_text(errors='replace')
+    except OSError:
+        return None
+    for attempt in (text, re.sub(r'^\s*//.*$', '', text, flags=re.M)):
+        try:
+            data = json.loads(attempt)
+        except ValueError:
+            continue
+        return data if isinstance(data, dict) else None
+    return None
+
+
+def proxy_processes():
+    """正在运行的 Xray/V2Ray/sing-box：[(pid, 种类, 命令行)]。"""
+    found = []
+    for d in Path('/proc').glob('[0-9]*'):
+        try:
+            argv = [a.decode(errors='replace') for a in (d / 'cmdline').read_bytes().split(b'\0') if a]
+        except OSError:
+            continue
+        hit = SITE_PROCESS.search(os.path.basename(argv[0])) if argv else None
+        if hit:
+            found.append((d.name, hit.group(1).lower(), argv))
+    return found
+
+
+def proxy_configs(kind, argv, cwd):
+    """命令行里的配置文件（-c / -config / -confdir / -C），没写时用默认位置。返回 (文件, 工作目录)。"""
+    files = []
+    args = argv[1:]
+    for i, arg in enumerate(args):
+        if arg in ('-D', '--directory') and i + 1 < len(args):
+            cwd = os.path.join(cwd, args[i + 1])
+    i = 0
+    while i < len(args):
+        key, eq, value = args[i].partition('=')
+        if key in ('-c', '-config', '--config', '-C', '-confdir', '--confdir', '--config-directory'):
+            if not eq:
+                i += 1
+                value = args[i] if i < len(args) else ''
+            path = Path(cwd, value)
+            if key in ('-C', '-confdir', '--confdir', '--config-directory'):
+                files += sorted(path.glob('*.json')) if path.is_dir() else []
+            elif value:
+                files.append(path)
+        i += 1
+    if not files:
+        defaults = {
+            'xray': ['/usr/local/etc/xray/config.json', '/etc/xray/config.json'],
+            'v2ray': ['/usr/local/etc/v2ray/config.json', '/etc/v2ray/config.json'],
+            'sing-box': [os.path.join(cwd, 'config.json'), '/etc/sing-box/config.json'],
+        }[kind]
+        files = [Path(p) for p in defaults if Path(p).is_file()][:1]
+    return files, cwd
+
+
+def service_unit(pid):
+    """进程属于哪个 systemd 服务；它的终端输出在 journald 里。"""
+    try:
+        text = Path('/proc/%s/cgroup' % pid).read_text()
+    except OSError:
+        return None
+    found = re.findall(r'/([^/\s]+\.service)', text)
+    return found[-1] if found else None
+
+
+def site_sources(extra=()):
+    """找代理的访问日志。返回 (来源, 说明)：来源是 ('file', 路径) 或 ('journal', 服务名)。"""
+    sources = [('file', str(p)) for p in extra]
+    notes = []
+    for pid, kind, argv in proxy_processes():
+        try:
+            cwd = os.readlink('/proc/%s/cwd' % pid)
+        except OSError:
+            cwd = '/'
+        files, cwd = proxy_configs(kind, argv, cwd)
+        log = {}
+        for path in files:
+            data = load_json(path)
+            if data and isinstance(data.get('log'), dict):
+                log.update(data['log'])
+        name = {'xray': 'Xray', 'v2ray': 'V2Ray', 'sing-box': 'sing-box'}[kind]
+        if kind == 'sing-box':
+            level = str(log.get('level') or 'info').lower()
+            if log.get('disabled'):
+                notes.append('sing-box 关闭了日志（log.disabled），看不到访问的网站')
+                continue
+            if level in ('warn', 'warning', 'error', 'fatal', 'panic'):
+                notes.append('sing-box 日志级别是 ' + level + '，看不到访问的网站（要 info 或 debug）')
+                continue
+            target = str(log.get('output') or '')
+        else:
+            target = str(log.get('access') or '')
+            if target.lower() == 'none':
+                notes.append(name + ' 关闭了访问日志（log.access 为 none），看不到访问的网站')
+                continue
+        if target:
+            sources.append(('file', os.path.join(cwd, target)))
+            continue
+        unit = service_unit(pid)
+        if unit and shutil.which('journalctl'):
+            sources.append(('journal', unit))
+        else:
+            notes.append(name + ' 的访问日志没写进文件，也不在 systemd 日志里，读不到')
+    seen = set()
+    sources = [s for s in sources if not (s in seen or seen.add(s))]
+    return sources, notes
+
+
+class FileFollower:
+    """像 tail -F 一样跟着读日志文件，日志轮转（换文件 / 清空）后从新文件开头读。"""
+
+    def __init__(self, path):
+        self.path = path
+        self.handle = None
+        self.ident = None
+        self.buf = ''
+        self._open(seek_end=True)
+
+    def _open(self, seek_end):
+        try:
+            handle = open(self.path, 'r', errors='replace')
+        except OSError:
+            return
+        st = os.fstat(handle.fileno())
+        if seek_end:
+            handle.seek(0, 2)
+        self.handle, self.ident, self.buf = handle, (st.st_dev, st.st_ino), ''
+
+    def _read(self):
+        if self.handle is None:
+            return []
+        data = self.handle.read(4 << 20)
+        if not data:
+            return []
+        lines = (self.buf + data).split('\n')
+        self.buf = lines.pop()
+        if len(self.buf) > 65536:
+            self.buf = ''
+        return lines
+
+    def lines(self):
+        if self.handle is None:
+            self._open(seek_end=False)
+            return self._read()
+        out = self._read()
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return out
+        if (st.st_dev, st.st_ino) != self.ident or st.st_size < self.handle.tell():
+            self.handle.close()
+            self.handle = None
+            self._open(seek_end=False)
+            out += self._read()
+        return out
+
+    def close(self):
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+
+class JournalFollower:
+    """journalctl -f 跟着读代理服务输出到 systemd 日志里的访问记录。"""
+
+    def __init__(self, units):
+        self.units = list(units)
+        self.lock = threading.Lock()
+        self.buf = []
+        self.proc = None
+        self.alive = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        cmd = ['journalctl', '-f', '-n', '0', '-q', '-o', 'cat'] + [x for u in self.units for x in ('-u', u)]
+        while self.alive:
+            try:
+                self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors='replace')
+                for line in self.proc.stdout:
+                    with self.lock:
+                        if len(self.buf) < 100000:
+                            self.buf.append(line.rstrip('\n'))
+                self.proc.wait()
+            except OSError:
+                pass
+            if self.alive:
+                time.sleep(10)
+
+    def lines(self):
+        with self.lock:
+            data, self.buf = self.buf, []
+            return data
+
+    def close(self):
+        self.alive = False
+        if self.proc is not None:
+            self.proc.kill()
+
+
+def peer_port(key):
+    """ss 流的 key：tcp|本机|端口|对端|端口，取对端（客户端）端口。"""
+    try:
+        return int(str(key).split('|')[4])
+    except (IndexError, ValueError):
+        return None
+
+
+class SiteTracker:
+    """后台跟着读访问日志，每 2 秒看一次 ss，把每条连接的字节记到它访问的域名上。"""
+
+    def __init__(self, ports, extra=()):
+        self.ports = set(ports)
+        self.extra = list(extra)
+        self.lock = threading.Lock()
+        self.parser = AccessParser()
+        self.followers = {}
+        self.journal = None
+        self.watcher = None
+        self.conns = {}    # (ip, 客户端端口) -> [域名, 认到的时间, ss 里还在]；域名 None = 多个网站共用（mux）
+        self.base = {}     # 流 key -> [已记字节, 时间]
+        self.closed = {}   # 已关闭、日志还没对上的流：key -> (ip, up, down, 关闭时间)
+        self.usage = {}    # (ip, 域名) -> [字节, 次数, 最近访问]
+        self.status = {'sources': [], 'notes': []}
+
+    def start(self):
+        self.watcher = ClosedWatcher(self.ports)
+        if not self.watcher.start():
+            self.watcher = None
+        threading.Thread(target=self._run, daemon=True).start()
+        return True
+
+    def set_ports(self, ports):
+        self.ports = set(ports)
+        if self.watcher is not None:
+            self.watcher.ports = set(ports)
+
+    def refresh(self):
+        sources, notes = site_sources(self.extra)
+        files = [p for kind, p in sources if kind == 'file']
+        units = sorted(u for kind, u in sources if kind == 'journal')
+        for path in list(self.followers):
+            if path not in files:
+                self.followers.pop(path).close()
+        for path in files:
+            if path not in self.followers:
+                self.followers[path] = FileFollower(path)
+        if (self.journal.units if self.journal else []) != units:
+            if self.journal is not None:
+                self.journal.close()
+            self.journal = JournalFollower(units) if units else None
+        with self.lock:
+            self.status = {'sources': [kind + ':' + p for kind, p in sources], 'notes': notes}
+
+    def _run(self):
+        scanned = 0
+        while True:
+            try:
+                now = time.time()
+                if now - scanned >= SITE_RESCAN:
+                    scanned = now
+                    self.refresh()
+                lines = []
+                for follower in self.followers.values():
+                    lines += follower.lines()
+                if self.journal is not None:
+                    lines += self.journal.lines()
+                self.tick(now, lines)
+            except Exception as exc:
+                print('liuliang: 网站记录 ' + str(exc), file=sys.stderr, flush=True)
+            time.sleep(POLL)
+
+    def tick(self, now, lines, flows=None, closed=None):
+        with self.lock:
+            for line in lines:
+                event = self.parser.feed(line)
+                if event:
+                    self._map(now, *event)
+            if closed is None:
+                closed = self.watcher.drain() if self.watcher is not None else {}
+            for key, (ip, up, down) in closed.items():
+                self.closed[key] = (ip, up, down, now)
+            if not self.conns:
+                for k in [k for k, v in self.closed.items() if now - v[3] > SITE_GRACE]:
+                    del self.closed[k]
+                return
+            if flows is None:
+                flows = parse_ss(read_ss() or '', self.ports)
+            for entry in self.conns.values():
+                entry[2] = False
+            for key, (ip, up, down) in flows.items():
+                entry = self.conns.get((ip, peer_port(key)))
+                if entry is not None:
+                    entry[2] = True
+                    self._account(key, ip, entry, up + down, now)
+            for key, (ip, up, down, t) in list(self.closed.items()):
+                entry = self.conns.get((ip, peer_port(key)))
+                if entry is not None:
+                    self._account(key, ip, entry, up + down, now)
+                    entry[2] = False
+                    del self.closed[key]
+                    self.base.pop(key, None)
+                elif now - t > SITE_GRACE:
+                    del self.closed[key]
+            for k in [k for k, e in self.conns.items() if not e[2] and now - e[1] > SITE_KEEP]:
+                del self.conns[k]
+            for k in [k for k, b in self.base.items() if now - b[1] > FLOW_KEEP]:
+                del self.base[k]
+
+    def _map(self, now, ip, port, host):
+        use = self.usage.setdefault((ip, host), [0, 0, now])
+        use[1] += 1
+        use[2] = now
+        old = self.conns.get((ip, port))
+        # 同一条连接还开着（或刚认到）又来了别的网站：mux，字节分不开。
+        if old is not None and old[0] != host and (old[2] or now - old[1] < 5):
+            old[0], old[1] = None, now
+        else:
+            self.conns[(ip, port)] = [host, now, False]
+
+    def _account(self, key, ip, entry, total, now):
+        old = self.base.get(key)
+        before = old[0] if old else 0
+        delta = total - before if total >= before else total
+        self.base[key] = [total, now]
+        if entry[0] and delta > 0:
+            use = self.usage.setdefault((ip, entry[0]), [0, 0, now])
+            use[0] += delta
+            use[2] = max(use[2], now)
+
+    def drain(self):
+        with self.lock:
+            data, self.usage = self.usage, {}
+            return data, dict(self.status)
+
+
+def start_sites(config):
+    if not config.get('sites', True):
+        return None
+    tracker = SiteTracker(config['ports'], config.get('access_logs') or [])
+    try:
+        tracker.start()
+    except Exception as exc:
+        print('liuliang: 网站记录没能启动：' + str(exc), file=sys.stderr, flush=True)
+        return None
+    return tracker
+
+
+def save_sites(c, tracker, now):
+    """把这一轮每个 IP 访问的域名、字节、次数写进 sites 表，只留 8 天。"""
+    if tracker is None:
+        return
+    data, status = tracker.drain()
+    rows = [(now, ip, host, int(b), int(h), last) for (ip, host), (b, h, last) in data.items() if b > 0 or h > 0]
+    if rows:
+        c.executemany('INSERT INTO sites(ts,ip,host,bytes,hits,last) VALUES(?,?,?,?,?,?)', rows)
+    c.execute("INSERT OR REPLACE INTO metadata VALUES('sites',?)", (json.dumps(dict(status, at=now), ensure_ascii=False),))
+    c.execute('DELETE FROM sites WHERE ts<?', (now - 8 * 86400,))
 
 
 def apply_nft(text):
@@ -1453,7 +1969,17 @@ def install(args):
         realip = args.realip != 'no'
     else:
         realip = bool((existing or {}).get('realip', True))
-    config = {'version':VERSION, 'ports':selected, 'geo':geo, 'backend':backend, 'web':web, 'auto':auto, 'realip':realip}
+    # sites：读代理访问日志，记下每个 IP 访问了哪些应用/网站、各用了多少流量。
+    if getattr(args, 'sites', None) is not None:
+        sites = args.sites != 'no'
+    else:
+        sites = bool((existing or {}).get('sites', True))
+    if getattr(args, 'access_log', None):
+        access_logs = [p.strip() for p in args.access_log.split(',') if p.strip()]
+    else:
+        access_logs = list((existing or {}).get('access_logs') or [])
+    config = {'version':VERSION, 'ports':selected, 'geo':geo, 'backend':backend, 'web':web, 'auto':auto, 'realip':realip,
+              'sites':sites, 'access_logs':access_logs}
     if backend == 'diag':
         config['diag'] = sources
     for folder in [CONFIG.parent, PROGRAM.parent, DATA]:
@@ -1508,7 +2034,15 @@ start_pre() { /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py --once; }
     how = 'nftables' if backend == 'nft' else '连接采样'
     print('\n'+done+'。以后输入：liuliang\n端口：'+','.join(map(str,selected))+'；城市查询：'+('已启用' if geo else '关闭')+'；统计：'+how
           +'；Cloudflare 后的真实访客 IP：'+('已开启' if config['realip'] else '关闭'))
+    if sites:
+        sources, notes = site_sources(access_logs)
+        print('访问的应用/网站：已开启（读代理访问日志，只记域名和流量，不记网址和内容；--sites no 关闭）')
+        for note in notes:
+            print('  ' + note)
+        if not sources:
+            print('  没找到代理的访问日志，暂时记不到。' + SITE_HELP)
     print('只看网站访客：liuliang --web    排查问题：liuliang --doctor')
+    print('查看某个 IP 近7天访问的应用/网站：运行 liuliang 后输入序号，或 liuliang --ip IP')
 
 
 def cloudflared_running():
@@ -1564,6 +2098,16 @@ def doctor():
     print('  回环口要看的网站后端端口：' + (','.join(map(str, backends)) or '无'))
     if tunnel:
         print('  检测到 cloudflared（Cloudflare Tunnel）：访客 IP 只能从请求头取，需要上面这项开启')
+    sites = config.get('sites', True)
+    print(ok(sites) + ' 访问的应用/网站记录：' + ('开启' if sites else '关闭（重装时加 --sites yes 打开）'))
+    if sites:
+        sources, notes = site_sources(config.get('access_logs') or [])
+        names = [('日志文件 ' if kind == 'file' else 'systemd 日志 ') + p for kind, p in sources]
+        print(ok(bool(sources)) + ' 代理访问日志：' + ('、'.join(names) or '没找到'))
+        for note in notes:
+            print('  ' + note)
+        if not sources:
+            print('  ' + SITE_HELP)
     db = DATA / 'history-v1.db'
     if not db.exists():
         print(ok(False) + ' 还没有流量数据库：服务刚装好的话等两分钟'); return
@@ -1598,6 +2142,9 @@ def main():
     parser.add_argument('--web', action='store_true', help='只看网站访客（有网站流量就显示，不设门槛）')
     parser.add_argument('--all', action='store_true', help='显示全部 IP：包括未达门槛的和 Cloudflare 节点 IP')
     parser.add_argument('--doctor', action='store_true', help='检查安装状态，排查“看不到访客 IP”')
+    parser.add_argument('--ip', help='查看这个 IP 近7天访问的应用/网站和各自的流量')
+    parser.add_argument('--sites', choices=['yes','no'], help='高级：--sites no 关闭访问的应用/网站记录（默认开启）')
+    parser.add_argument('--access-log', help='高级：代理访问日志路径（自动找不到时用），多个用逗号隔开')
     parser.add_argument('--daemon', action='store_true')
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--version', action='version', version=VERSION)
@@ -1615,9 +2162,10 @@ def main():
             return
         seen = set()
         sniffer = start_sniffer(config)
+        sites = start_sites(config)
         while True:
             try:
-                collect(config, sniffer)
+                collect(config, sniffer, sites)
             except Exception as exc:
                 print('liuliang:', str(exc), file=sys.stderr, flush=True)
             # 两分钟采一次，端口每分钟看一次：新端口最多约 2 分钟后开始统计。
@@ -1627,9 +2175,13 @@ def main():
                     seen, changed = follow_ports(config, seen)
                     if changed:
                         reload_nft(config)
+                        if sites is not None:
+                            sites.set_ports(config['ports'])
                 except Exception as exc:
                     print('liuliang:', str(exc), file=sys.stderr, flush=True)
                 time.sleep(RESCAN)
+    elif args.ip:
+        site_report(args.ip, config, show_all=args.all)
     else:
         report(config, web_only=args.web, show_all=args.all)
 
@@ -1654,7 +2206,7 @@ def report(config, web_only=False, show_all=False):
   if DATA.exists() and not os.access(str(DATA), os.R_OK | os.X_OK):
    print('无法读取流量数据，请使用 root 运行：liuliang');return
   print('(暂无流量数据库记录)');return
- c=sqlite3.connect(DB, timeout=30); rows=[]; cfhidden=0
+ c=sqlite3.connect(DB, timeout=30); rows=[]; cfhidden=0; picks=[]
  try:
   hasweb='web' in [r[1] for r in c.execute('PRAGMA table_info(traffic)')]
   cols=[r[1] for r in c.execute('PRAGMA table_info(clients)')]
@@ -1683,24 +2235,122 @@ def report(config, web_only=False, show_all=False):
     print('只看到 Cloudflare 的 IP、没有真实访客：运行 liuliang --doctor 排查')
    return
   showkind=web_only is False and any(r[7]!='节点' for r in rows)
-  h=['IP','运营商','城市','近24小时','近7天','最近连接']+(['访问'] if showkind else []);N=[15,10,8,10,10,19]+([4] if showkind else [])
-  vals=lambda ip,net,pl,d,w,ls,kind:[ip,net,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')]+([kind] if showkind else [])
-  for ip,net,pl,d,w,ls,age,kind in rows:N=[max(N[i],ww(x)) for i,x in enumerate(vals(ip,net,pl,d,w,ls,kind))]
+  h=['#','IP','运营商','城市','近24小时','近7天','最近连接']+(['访问'] if showkind else []);N=[2,15,10,8,10,10,19]+([4] if showkind else [])
+  vals=lambda n,ip,net,pl,d,w,ls,kind:[n,ip,net,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')]+([kind] if showkind else [])
+  for n,(ip,net,pl,d,w,ls,age,kind) in enumerate(rows,1):N=[max(N[i],ww(x)) for i,x in enumerate(vals(n,ip,net,pl,d,w,ls,kind))]
   def line(a,m,b):return a+m.join('─'*(n+2) for n in N)+b
   print(line('┌','┬','┐'));print(col('│ '+' │ '.join(cell(x,N[i]) for i,x in enumerate(h))+' │',B,C));print(line('├','┼','┤'))
-  for ip,net,pl,d,w,ls,age,kind in rows:
-   v=vals(ip,net,pl,d,w,ls,kind);out=[]
+  for n,(ip,net,pl,d,w,ls,age,kind) in enumerate(rows,1):
+   v=vals(n,ip,net,pl,d,w,ls,kind);out=[]
    for i,x in enumerate(v):
-    st=[D,X] if d<=0 and w<=0 or kind=='CF节点' else ([B,G] if i==0 and d>0 else [])
-    if i==3 and d>=100*1024**2 or i==4 and w>=1024**3:st=[B,Y]
-    if i==5:st=[B,G] if age<=3600 else ([D,X] if age>259200 else [])
+    st=[D,X] if d<=0 and w<=0 or kind=='CF节点' else ([B,G] if i==1 and d>0 else [])
+    if i==4 and d>=100*1024**2 or i==5 and w>=1024**3:st=[B,Y]
+    if i==6:st=[B,G] if age<=3600 else ([D,X] if age>259200 else [])
     out.append(col(cell(x,N[i]),*st))
    print('│ '+' │ '.join(out)+' │')
   real=[r for r in rows if r[7]!='CF节点']
   print(line('└','┴','┘'));a=sum(1 for r in real if r[3]>0 or r[4]>0);print('合计：IP 数 %d · 有流量 IP 数 %d · 近24小时总流量 %s · 近7天总流量 %s'%(len(real),a,sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))))
   if note:print(col(note,D))
+  picks=[r[0] for r in rows]
  finally:
   c.close()
+ # 在终端里看表时，可以接着选一个 IP 看它访问了哪些应用/网站。
+ if picks and sys.stdin.isatty() and sys.stdout.isatty():choose_ip(config,picks,show_all)
+
+
+def choose_ip(config, picks, show_all=False):
+    while True:
+        try:
+            text = input('\n输入序号或 IP，查看它近7天访问的应用/网站（直接回车退出）：').strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not text:
+            return
+        if text.isdigit() and 1 <= int(text) <= len(picks):
+            ip = picks[int(text) - 1]
+        else:
+            ip = normalize_ip(text)
+            if ip is None:
+                print('没有这个序号，也不是有效的公网 IP')
+                continue
+        print()
+        site_report(str(ip), config, show_all)
+
+
+def site_report(ip, config=None, show_all=False):
+    """一个 IP 近7天访问的应用/网站：按应用归类，显示流量、访问次数和最近访问时间。"""
+    DB = str(DATA / 'history-v1.db')
+    found = normalize_ip(ip)
+    ip = str(found) if found is not None else str(ip).strip()
+    now = time.time(); since = now - 604800
+    if not os.path.exists(DB):
+        print('无法读取流量数据，请使用 root 运行：liuliang' if DATA.exists() and not os.access(str(DATA), os.R_OK | os.X_OK) else '(暂无流量数据库记录)')
+        return
+    c = sqlite3.connect(DB, timeout=30)
+    try:
+        tables = {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
+        rows = list(c.execute('select host,sum(bytes),sum(hits),max(last) from sites where ip=? and ts>? group by host', (ip, since))) if 'sites' in tables else []
+        total = diff(c, ip, since, now)
+        info = c.execute('select * from clients where ip=?', (ip,)).fetchone()
+        info = dict(zip([d[0] for d in c.execute('select * from clients limit 0').description], info)) if info else {}
+        status = c.execute("select value from metadata where key='sites'").fetchone()
+    finally:
+        c.close()
+    place = ' '.join(x for x in (isp_display(info.get('isp')) if info.get('isp') else '', info.get('country'), info.get('city')) if x)
+    print(col(ip + (' · ' + place if place else '') + ' · 近7天访问的应用/网站', B, C))
+    groups = {}
+    for host, b, h, last in rows:
+        g = groups.setdefault(site_label(host), [0, 0, 0, []])
+        g[0] += b or 0; g[1] += h or 0; g[2] = max(g[2], last or 0); g[3].append((b or 0, h or 0, host))
+    if not groups:
+        if config is not None and not config.get('sites', True):
+            print('访问的应用/网站记录已关闭（重装时加 --sites yes 打开）')
+            return
+        try:
+            status = json.loads(status[0]) if status else None
+        except ValueError:
+            status = None
+        if status is None:
+            print('还没有记录：后台更新到 ' + VERSION + ' 后，从新产生的连接开始记，等两分钟再看')
+        elif not status.get('sources'):
+            print('没找到代理的访问日志，记不到访问的网站。')
+            for note in status.get('notes') or []:
+                print('  ' + note)
+            print(SITE_HELP)
+        else:
+            print('(近7天这个 IP 没有访问记录' + ('，总流量 ' + sz(total) if total else '') + ')')
+        return
+    items = sorted(groups.items(), key=lambda kv: (-kv[1][0], -kv[1][1], kv[0]))
+    limit = len(items) if show_all else 30
+    shown, rest = items[:limit], items[limit:]
+    def hosts(lst):
+        lst = sorted(lst, key=lambda x: (-x[0], -x[1], x[2]))
+        top = lst[0][2] if len(lst[0][2]) <= 36 else lst[0][2][:33] + '...'
+        return top + (' 等%d个' % len(lst) if len(lst) > 1 else '')
+    table = [[str(n), name, hosts(g[3]), sz(g[0]) if g[0] else '-', str(g[1]), datetime.fromtimestamp(g[2], Z).strftime('%Y-%m-%d %H:%M:%S')]
+             for n, (name, g) in enumerate(shown, 1)]
+    counted = sum(g[0] for _name, g in items)
+    if rest:
+        table.append(['', '其余 %d 个' % len(rest), 'liuliang --ip ' + ip + ' --all', sz(sum(g[0] for _n, g in rest)), str(sum(g[1] for _n, g in rest)), ''])
+    other = total - counted
+    if other > 0:
+        table.append(['', '其他（无法细分）', 'UDP/mux 连接、协议开销', sz(other), '', ''])
+    h = ['#', '应用/网站', '域名', '流量', '次数', '最近访问']
+    N = [max([ww(x) for x in [h[i]] + [r[i] for r in table]]) for i in range(len(h))]
+    line = lambda a, m, b: a + m.join('─' * (n + 2) for n in N) + b
+    print(line('┌', '┬', '┐')); print(col('│ ' + ' │ '.join(cell(x, N[i]) for i, x in enumerate(h)) + ' │', B, C)); print(line('├', '┼', '┤'))
+    for r in table:
+        out = []
+        for i, x in enumerate(r):
+            big = r[0] and groups[r[1]][0] >= 1024 ** 3
+            st = [D, X] if not r[0] else ([B, G] if i == 1 else ([B, Y] if i == 3 and big else []))
+            out.append(col(cell(x, N[i]), *st))
+        print('│ ' + ' │ '.join(out) + ' │')
+    print(line('└', '┴', '┘'))
+    print('合计：应用/网站 %d 个 · 访问 %d 次 · 已按网站细分 %s · 该 IP 近7天总流量 %s' % (len(items), sum(g[1] for _n, g in items), sz(counted), sz(max(total, counted))))
+    if other > 0 or any(not g[0] for _n, g in items):
+        print(col('流量为「-」的网站走的是 UDP（hy2/tuic）或 mux 连接，只能记次数，流量算在「其他」里', D))
 
 
 if __name__ == '__main__':
