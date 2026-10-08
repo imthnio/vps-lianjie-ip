@@ -20,7 +20,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-VERSION = '1.0.16'
+VERSION = '1.0.17'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -1366,8 +1366,10 @@ SITE_KEEP = 600      # 日志里认到、但 ss 里一直没看到的连接，�
 SITE_GRACE = 15      # 连接关了、日志还没读到时，关闭时的字节先等这么久
 SITE_RESCAN = 300    # 每隔这么久重新找一次代理的访问日志（代理重启、换了配置）
 SITE_PROCESS = re.compile(r'(xray|v2ray|sing-box)', re.I)
-SITE_HELP = ('打开访问日志：Xray/V2Ray 配置里写 "log": {"access": "/var/log/xray/access.log"}（不能是 none），'
-             'sing-box 配置里 "log": {"level": "info"}；改完重启代理，几分钟后 liuliang 自动开始记录。')
+SITE_MANUAL = ('Xray/V2Ray 配置里写 "log": {"access": "/var/log/xray/access.log"}（不能是 none），'
+               'sing-box 配置里 "log": {"level": "info"}，改完重启代理。')
+SITE_HELP = ('解决办法：在 VPS 上运行 liuliang --enable-log，自动打开代理的访问记录（会先备份原配置，代理重启几秒），'
+             '过几分钟再来看。想自己改的话：' + SITE_MANUAL)
 
 # 常见应用的域名后缀。没列出的网站按主域名（如 example.com）归类。
 APPS = (
@@ -1571,47 +1573,268 @@ def service_unit(pid):
     return found[-1] if found else None
 
 
+PROXY_NAMES = {'xray': 'Xray', 'v2ray': 'V2Ray', 'sing-box': 'sing-box'}
+PANEL = re.compile(r'(x-ui|3x-ui|s-ui|h-ui|marzban|hiddify|v2board|xrayr|v2bx)', re.I)
+# liuliang --enable-log 打开的访问日志写在这里。文件由 liuliang 读完后定期清空，不会越写越大。
+ACCESS_DIR = Path('/var/log/liuliang-access')
+ACCESS_LOG = ACCESS_DIR / 'access.log'
+ACCESS_MAX = 20 * 1024 * 1024
+
+
+def proc_status(pid):
+    try:
+        text = Path('/proc/%s/status' % pid).read_text()
+    except OSError:
+        return {}
+    return dict(line.split(':', 1) for line in text.splitlines() if ':' in line)
+
+
+def panel_name(pid, argv):
+    """代理是不是由面板（x-ui / 3x-ui / Marzban 等）启动的，是的话返回面板名。"""
+    ppid = proc_status(pid).get('PPid', '').strip()
+    try:
+        parent = Path('/proc/%s/comm' % ppid).read_text().strip() if ppid else ''
+    except OSError:
+        parent = ''
+    for text in (parent, argv[0] if argv else ''):
+        found = PANEL.search(text)
+        if found:
+            return found.group(1)
+    return None
+
+
+def output_target(pid, fd):
+    """进程的标准输出/错误指向哪里：文件路径、/dev/null、pipe:[..]、socket:[..]。"""
+    try:
+        return os.readlink('/proc/%s/fd/%d' % (pid, fd))
+    except OSError:
+        return ''
+
+
+def docker_log(pid):
+    """Docker 容器里的代理：终端输出在 /var/lib/docker/containers/<id>/<id>-json.log。"""
+    try:
+        text = Path('/proc/%s/cgroup' % pid).read_text()
+    except OSError:
+        return None
+    for cid in re.findall(r'[0-9a-f]{64}', text):
+        path = Path('/var/lib/docker/containers', cid, cid + '-json.log')
+        if path.is_file():
+            return str(path)
+    return None
+
+
+def systemd_running():
+    return Path('/run/systemd/system').is_dir()
+
+
+def proxy_log(pid, kind, argv):
+    """一个代理进程的访问日志在哪。返回 (来源或 None, 说明, 配置文件, 工作目录, 日志设置)。
+
+    来源是 ('file', 路径) 或 ('journal', 服务名)。说明用大白话写给不懂配置的人看。
+    """
+    try:
+        cwd = os.readlink('/proc/%s/cwd' % pid)
+    except OSError:
+        cwd = '/'
+    files, cwd = proxy_configs(kind, argv, cwd)
+    log = {}
+    for path in files:
+        data = load_json(path)
+        if data and isinstance(data.get('log'), dict):
+            log.update(data['log'])
+    name = PROXY_NAMES[kind]
+    if kind == 'sing-box':
+        level = str(log.get('level') or 'info').lower()
+        if log.get('disabled'):
+            return None, 'sing-box 把日志关掉了（log.disabled），所以看不到访问了哪些网站', files, cwd, log
+        if level in ('warn', 'warning', 'error', 'fatal', 'panic'):
+            return None, 'sing-box 日志级别是 ' + level + '，这个级别不记访问了哪些网站（要 info）', files, cwd, log
+        target, fd = str(log.get('output') or ''), 2
+    else:
+        target, fd = str(log.get('access') or ''), 1
+        if target.lower() == 'none':
+            panel = panel_name(pid, argv)
+            if panel:
+                return None, (name + ' 由 ' + panel + ' 面板管理，面板里把「访问日志」关掉了（none）。请在面板的 Xray 设置 → 日志 → '
+                              '访问日志里选 ./access.log 并保存重启，liuliang 会自动读取'), files, cwd, log
+            return None, name + ' 把访问记录关掉了（log.access 为 none），所以看不到访问了哪些网站', files, cwd, log
+    if target:
+        return ('file', os.path.join(cwd, target)), '', files, cwd, log
+    # 配置里没写日志文件：访问记录输出到终端。看终端输出最后去了哪里。
+    out = output_target(pid, fd) or output_target(pid, 3 - fd)
+    if out.startswith('/') and not out.startswith('/dev/') and os.path.isfile(out):
+        return ('file', out), '', files, cwd, log
+    if out == '/dev/null':
+        return None, name + ' 的访问记录直接被丢掉了（输出到 /dev/null），没有保存', files, cwd, log
+    docker = docker_log(pid)
+    if docker:
+        return ('file', docker), '', files, cwd, log
+    panel = panel_name(pid, argv)
+    if panel:
+        return None, (name + ' 由 ' + panel + ' 面板启动，访问记录被面板接走了。请在面板的 Xray 设置 → 日志 → '
+                      '访问日志里选 ./access.log 并保存重启，liuliang 会自动读取'), files, cwd, log
+    unit = service_unit(pid)
+    if unit and shutil.which('journalctl') and systemd_running():
+        return ('journal', unit), '', files, cwd, log
+    return None, name + ' 没有把访问记录保存下来（没写进文件，也没有 systemd 日志）', files, cwd, log
+
+
 def site_sources(extra=()):
     """找代理的访问日志。返回 (来源, 说明)：来源是 ('file', 路径) 或 ('journal', 服务名)。"""
     sources = [('file', str(p)) for p in extra]
+    if ACCESS_LOG.exists():
+        sources.append(('file', str(ACCESS_LOG)))
     notes = []
     for pid, kind, argv in proxy_processes():
-        try:
-            cwd = os.readlink('/proc/%s/cwd' % pid)
-        except OSError:
-            cwd = '/'
-        files, cwd = proxy_configs(kind, argv, cwd)
-        log = {}
-        for path in files:
-            data = load_json(path)
-            if data and isinstance(data.get('log'), dict):
-                log.update(data['log'])
-        name = {'xray': 'Xray', 'v2ray': 'V2Ray', 'sing-box': 'sing-box'}[kind]
-        if kind == 'sing-box':
-            level = str(log.get('level') or 'info').lower()
-            if log.get('disabled'):
-                notes.append('sing-box 关闭了日志（log.disabled），看不到访问的网站')
-                continue
-            if level in ('warn', 'warning', 'error', 'fatal', 'panic'):
-                notes.append('sing-box 日志级别是 ' + level + '，看不到访问的网站（要 info 或 debug）')
-                continue
-            target = str(log.get('output') or '')
-        else:
-            target = str(log.get('access') or '')
-            if target.lower() == 'none':
-                notes.append(name + ' 关闭了访问日志（log.access 为 none），看不到访问的网站')
-                continue
-        if target:
-            sources.append(('file', os.path.join(cwd, target)))
-            continue
-        unit = service_unit(pid)
-        if unit and shutil.which('journalctl'):
-            sources.append(('journal', unit))
-        else:
-            notes.append(name + ' 的访问日志没写进文件，也不在 systemd 日志里，读不到')
+        source, note, _files, _cwd, _log = proxy_log(pid, kind, argv)
+        if source:
+            sources.append(source)
+        elif note:
+            notes.append(note)
     seen = set()
     sources = [s for s in sources if not (s in seen or seen.add(s))]
+    notes = [n for n in notes if not (n in seen or seen.add(n))]
     return sources, notes
+
+
+def can_enable(sources, notes):
+    """读不到访问记录、又不是面板管理的（面板要在面板里开），--enable-log 能帮上忙。"""
+    return not sources and (not notes or any('面板' not in n for n in notes))
+
+
+def check_config(kind, exe, argv, cwd):
+    """改完配置先让代理自己检查一遍，不通过就还原，避免代理起不来。"""
+    args = list(argv[1:])
+    if kind == 'sing-box':
+        if 'run' in args:
+            args[args.index('run')] = 'check'
+        else:
+            args.insert(0, 'check')
+    else:
+        args.append('-test')
+    try:
+        out = subprocess.run([exe] + args, cwd=cwd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    text = (out.stdout + out.stderr).strip().splitlines()
+    return out.returncode == 0, (text[-1] if text else '')
+
+
+def restart_proxy(pid, kind):
+    """重启代理让新日志设置生效。返回 None 表示已重启，否则返回要用户自己做的事。"""
+    unit = service_unit(pid)
+    if unit and systemd_running():
+        subprocess.run(['systemctl', 'restart', unit], check=True, capture_output=True, text=True)
+        return None
+    if Path('/etc/init.d', kind).exists() and shutil.which('rc-service'):
+        subprocess.run(['rc-service', kind, 'restart'], check=True, capture_output=True, text=True)
+        return None
+    if docker_log(pid):
+        return '代理在 Docker 容器里，请重启这个容器（docker restart 容器名）'
+    return '没找到 ' + PROXY_NAMES[kind] + ' 的服务，请自己重启一下代理（或者重启 VPS）'
+
+
+def enable_log(assume_yes=False):
+    """给没有访问日志的 Xray / V2Ray / sing-box 打开访问日志：先备份配置，改完自检，再重启代理。"""
+    if os.geteuid() != 0:
+        raise RuntimeError('请使用 root 运行：liuliang --enable-log')
+    procs = proxy_processes()
+    if not procs:
+        print('没找到正在运行的 Xray / V2Ray / sing-box。代理装好并运行后再试。')
+        return
+    todo = []
+    for pid, kind, argv in procs:
+        source, note, files, cwd, _log = proxy_log(pid, kind, argv)
+        name = PROXY_NAMES[kind]
+        if source:
+            print('✔ ' + name + ' 的访问日志已经能读到（' + source[1] + '），不用改。')
+            continue
+        if panel_name(pid, argv):
+            print('✘ ' + note)
+            continue
+        if not files:
+            print('✘ 找不到 ' + name + ' 的配置文件，没法自动打开。请自己改：' + SITE_MANUAL)
+            continue
+        target = next((f for f in files if isinstance((load_json(f) or {}).get('log'), dict)), files[0])
+        if load_json(target) is None:
+            print('✘ ' + name + ' 的配置文件 ' + str(target) + ' 不是 JSON 格式，没法自动改。请自己改：' + SITE_MANUAL)
+            continue
+        todo.append((pid, kind, argv, cwd, Path(target)))
+    if not todo:
+        return
+    for _pid, kind, _argv, _cwd, target in todo:
+        print('将修改 ' + PROXY_NAMES[kind] + ' 的配置 ' + str(target) + '：打开访问日志，写到 ' + str(ACCESS_LOG) + '（会先备份原配置）')
+    print('改完要重启一下代理：正在使用的人会断开几秒钟，然后自动重连。')
+    if not assume_yes and sys.stdin.isatty():
+        try:
+            answer = input('确定要继续吗？输入 y 回车继续：').strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ''
+        if answer not in ('y', 'yes'):
+            print('已取消，什么都没改。')
+            return
+    for pid, kind, argv, cwd, target in todo:
+        name = PROXY_NAMES[kind]
+        uid = int((proc_status(pid).get('Uid', '0').split() or ['0'])[0])
+        ACCESS_DIR.mkdir(parents=True, exist_ok=True)
+        ACCESS_LOG.touch()
+        for path in (ACCESS_DIR, ACCESS_LOG):
+            os.chown(str(path), uid, -1)
+        ACCESS_DIR.chmod(0o700)
+        ACCESS_LOG.chmod(0o600)
+        original = target.read_bytes()
+        st = target.stat()
+        backup = target.with_name(target.name + '.liuliang-bak-' + time.strftime('%Y%m%d%H%M%S'))
+        backup.write_bytes(original)
+        data = load_json(target)
+        log = data.get('log') if isinstance(data.get('log'), dict) else {}
+        if kind == 'sing-box':
+            log.pop('disabled', None)
+            if str(log.get('level') or 'info').lower() in ('warn', 'warning', 'error', 'fatal', 'panic'):
+                log['level'] = 'info'
+            log['output'] = str(ACCESS_LOG)
+            log.setdefault('timestamp', True)
+        else:
+            log['access'] = str(ACCESS_LOG)
+        data['log'] = log
+        target.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+        os.chmod(str(target), st.st_mode & 0o7777)
+        try:
+            os.chown(str(target), st.st_uid, st.st_gid)
+        except OSError:
+            pass
+        try:
+            exe = os.readlink('/proc/%s/exe' % pid)
+        except OSError:
+            exe = argv[0]
+        exe = exe[:-len(' (deleted)')] if exe.endswith(' (deleted)') else exe   # 代理升级过、还没重启
+        ok, detail = check_config(kind, exe, argv, cwd)
+        if not ok:
+            target.write_bytes(original)
+            backup.unlink()
+            print('✘ ' + name + ' 检查新配置没通过，已还原原配置，什么都没改' + ('（' + detail + '）' if detail else ''))
+            continue
+        try:
+            todo_msg = restart_proxy(pid, kind)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            target.write_bytes(original)
+            backup.unlink()
+            try:
+                restart_proxy(pid, kind)
+            except (OSError, subprocess.CalledProcessError):
+                pass
+            print('✘ ' + name + ' 重启失败，已还原原配置：' + str(getattr(exc, 'stderr', '') or exc).strip())
+            continue
+        print('✔ ' + name + ' 访问日志已打开（原配置备份在 ' + str(backup) + '）')
+        if todo_msg:
+            print('  还差一步：' + todo_msg)
+    # liuliang 后台立刻重新找日志，不用等 5 分钟。
+    if systemd_running():
+        subprocess.run(['systemctl', 'restart', 'liuliang'], capture_output=True)
+    elif shutil.which('rc-service'):
+        subprocess.run(['rc-service', 'liuliang', 'restart'], capture_output=True)
+    print('完成。之后的访问会开始记录：过几分钟运行 liuliang，输入序号查看。')
 
 
 class FileFollower:
@@ -1651,6 +1874,13 @@ class FileFollower:
             self._open(seek_end=False)
             return self._read()
         out = self._read()
+        # --enable-log 打开的日志由 liuliang 负责清理：读完、超过 20MB 就清空（代理是追加写，不受影响）。
+        if self.path == str(ACCESS_LOG) and self.handle.tell() > ACCESS_MAX and not self.buf:
+            try:
+                os.truncate(self.path, 0)
+                self.handle.seek(0)
+            except OSError:
+                pass
         try:
             st = os.stat(self.path)
         except OSError:
@@ -1728,7 +1958,7 @@ class SiteTracker:
         self.base = {}     # 流 key -> [已记字节, 时间]
         self.closed = {}   # 已关闭、日志还没对上的流：key -> (ip, up, down, 关闭时间)
         self.usage = {}    # (ip, 域名) -> [字节, 次数, 最近访问]
-        self.status = {'sources': [], 'notes': []}
+        self.status = None  # 还没找过日志时不写状态，免得报表误说「读不到」
 
     def start(self):
         self.watcher = ClosedWatcher(self.ports)
@@ -1838,7 +2068,7 @@ class SiteTracker:
     def drain(self):
         with self.lock:
             data, self.usage = self.usage, {}
-            return data, dict(self.status)
+            return data, (dict(self.status) if self.status is not None else None)
 
 
 def start_sites(config):
@@ -1861,7 +2091,8 @@ def save_sites(c, tracker, now):
     rows = [(now, ip, host, int(b), int(h), last) for (ip, host), (b, h, last) in data.items() if b > 0 or h > 0]
     if rows:
         c.executemany('INSERT INTO sites(ts,ip,host,bytes,hits,last) VALUES(?,?,?,?,?,?)', rows)
-    c.execute("INSERT OR REPLACE INTO metadata VALUES('sites',?)", (json.dumps(dict(status, at=now), ensure_ascii=False),))
+    if status is not None:
+        c.execute("INSERT OR REPLACE INTO metadata VALUES('sites',?)", (json.dumps(dict(status, at=now), ensure_ascii=False),))
     c.execute('DELETE FROM sites WHERE ts<?', (now - 8 * 86400,))
 
 
@@ -2038,9 +2269,19 @@ start_pre() { /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py --once; }
         sources, notes = site_sources(access_logs)
         print('访问的应用/网站：已开启（读代理访问日志，只记域名和流量，不记网址和内容；--sites no 关闭）')
         for note in notes:
-            print('  ' + note)
-        if not sources:
-            print('  没找到代理的访问日志，暂时记不到。' + SITE_HELP)
+            print('  原因：' + note)
+        if can_enable(sources, notes) and proxy_processes():
+            print('  现在还读不到代理的访问记录，所以看不到每个 IP 访问了哪些网站。')
+            answer = ''
+            if sys.stdin.isatty():
+                try:
+                    answer = input('  要现在自动打开吗？（会先备份代理配置，代理重启几秒）输入 y 回车打开，直接回车跳过：').strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    answer = ''
+            if answer in ('y', 'yes'):
+                enable_log(assume_yes=True)
+            else:
+                print('  ' + SITE_HELP)
     print('只看网站访客：liuliang --web    排查问题：liuliang --doctor')
     print('查看某个 IP 近7天访问的应用/网站：运行 liuliang 后输入序号，或 liuliang --ip IP')
 
@@ -2105,8 +2346,8 @@ def doctor():
         names = [('日志文件 ' if kind == 'file' else 'systemd 日志 ') + p for kind, p in sources]
         print(ok(bool(sources)) + ' 代理访问日志：' + ('、'.join(names) or '没找到'))
         for note in notes:
-            print('  ' + note)
-        if not sources:
+            print('  原因：' + note)
+        if can_enable(sources, notes):
             print('  ' + SITE_HELP)
     db = DATA / 'history-v1.db'
     if not db.exists():
@@ -2145,6 +2386,8 @@ def main():
     parser.add_argument('--ip', help='查看这个 IP 近7天访问的应用/网站和各自的流量')
     parser.add_argument('--sites', choices=['yes','no'], help='高级：--sites no 关闭访问的应用/网站记录（默认开启）')
     parser.add_argument('--access-log', help='高级：代理访问日志路径（自动找不到时用），多个用逗号隔开')
+    parser.add_argument('--enable-log', action='store_true', help='自动打开 Xray / sing-box 的访问日志（看不到访问的网站时用）')
+    parser.add_argument('-y', '--yes', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--daemon', action='store_true')
     parser.add_argument('--once', action='store_true')
     parser.add_argument('--version', action='version', version=VERSION)
@@ -2153,6 +2396,8 @@ def main():
         install(args); return
     if args.doctor:
         doctor(); return
+    if args.enable_log:
+        enable_log(args.yes); return
     config = json.loads(CONFIG.read_text())
     if args.once:
         collect(config)
@@ -2314,10 +2559,12 @@ def site_report(ip, config=None, show_all=False):
         if status is None:
             print('还没有记录：后台更新到 ' + VERSION + ' 后，从新产生的连接开始记，等两分钟再看')
         elif not status.get('sources'):
-            print('没找到代理的访问日志，记不到访问的网站。')
-            for note in status.get('notes') or []:
-                print('  ' + note)
-            print(SITE_HELP)
+            notes = status.get('notes') or []
+            print('看不到这个 IP 访问了哪些网站：liuliang 要读代理（Xray/sing-box）自己的访问记录，现在读不到。')
+            for note in notes:
+                print('  原因：' + note)
+            if can_enable([], notes):
+                print('  ' + SITE_HELP)
         else:
             print('(近7天这个 IP 没有访问记录' + ('，总流量 ' + sz(total) if total else '') + ')')
         return

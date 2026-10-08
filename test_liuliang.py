@@ -756,12 +756,85 @@ class SiteTests(unittest.TestCase):
                      ('4', 'sing-box', ['sing-box', 'run', '-c', conf('d.json', {})])]
             with patch.object(m, 'proxy_processes', return_value=procs), \
                  patch.object(m.os, 'readlink', return_value='/opt/x'), \
+                 patch.object(m, 'output_target', return_value='socket:[123]'), \
+                 patch.object(m, 'docker_log', return_value=None), \
+                 patch.object(m, 'panel_name', return_value=None), \
+                 patch.object(m, 'systemd_running', return_value=True), \
                  patch.object(m, 'service_unit', return_value='sing-box.service'), \
                  patch.object(m.shutil, 'which', return_value='/bin/journalctl'):
                 sources, notes = m.site_sources(['/extra.log'])
         self.assertEqual(sources, [('file', '/extra.log'), ('file', '/opt/x/access.log'), ('journal', 'sing-box.service')])
         self.assertEqual(len(notes), 2)
         self.assertIn('none', notes[0]); self.assertIn('warn', notes[1])
+    def _where(self, out='', docker=None, panel=None, systemd=False, log=None):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = Path(temp) / 'config.json'
+            cfg.write_text(json.dumps({'log': log or {'loglevel': 'warning'}}))
+            with patch.object(m.os, 'readlink', return_value=temp), \
+                 patch.object(m, 'output_target', return_value=out), \
+                 patch.object(m, 'docker_log', return_value=docker), \
+                 patch.object(m, 'panel_name', return_value=panel), \
+                 patch.object(m, 'systemd_running', return_value=systemd), \
+                 patch.object(m, 'service_unit', return_value='xray.service' if systemd else None), \
+                 patch.object(m.shutil, 'which', return_value='/bin/journalctl'):
+                return m.proxy_log('1', 'xray', ['xray', 'run', '-c', str(cfg)])[:2]
+    def test_proxy_log_finds_stdout_everywhere(self):
+        # 截图里的情况：配置没写日志文件、没有 systemd（Alpine / nohup / screen 启动）
+        source, note = self._where(out='pipe:[1]')
+        self.assertIsNone(source); self.assertIn('没有把访问记录保存下来', note)
+        self.assertTrue(m.can_enable([], [note]))
+        with tempfile.NamedTemporaryFile() as f:   # OpenRC output_log / nohup.out：终端输出写进了文件
+            self.assertEqual(self._where(out=f.name)[0], ('file', f.name))
+        self.assertIn('/dev/null', self._where(out='/dev/null')[1])
+        self.assertEqual(self._where(out='pipe:[1]', docker='/d.log')[0], ('file', '/d.log'))
+        self.assertEqual(self._where(out='socket:[1]', systemd=True)[0], ('journal', 'xray.service'))
+        source, note = self._where(out='pipe:[1]', panel='x-ui')
+        self.assertIsNone(source); self.assertIn('面板', note); self.assertFalse(m.can_enable([], [note]))
+        self.assertEqual(self._where(log={'access': '/var/log/xray/a.log'})[0], ('file', '/var/log/xray/a.log'))
+    def test_enable_log_edits_config_and_rolls_back(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = Path(temp) / 'config.json'
+            cfg.write_text(json.dumps({'log': {'loglevel': 'warning', 'access': 'none'}, 'inbounds': [1]}))
+            procs = [('1', 'xray', ['xray', 'run', '-c', str(cfg)])]
+            common = [patch.object(m, 'proxy_processes', return_value=procs),
+                      patch.object(m.os, 'geteuid', return_value=0),
+                      patch.object(m.os, 'readlink', return_value=temp),
+                      patch.object(m.os, 'chown'),
+                      patch.object(m, 'panel_name', return_value=None),
+                      patch.object(m, 'proc_status', return_value={'Uid': '65534 65534 65534 65534'}),
+                      patch.object(m, 'ACCESS_DIR', Path(temp) / 'acc'),
+                      patch.object(m, 'ACCESS_LOG', Path(temp) / 'acc' / 'access.log'),
+                      patch.object(m, 'systemd_running', return_value=False),
+                      patch.object(m.subprocess, 'run')]
+            with contextlib.ExitStack() as stack:
+                for c in common: stack.enter_context(c)
+                stack.enter_context(patch.object(m, 'check_config', return_value=(False, 'bad')))
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                m.enable_log(assume_yes=True)
+            self.assertEqual(json.loads(cfg.read_text())['log']['access'], 'none')   # 自检不过：还原
+            out = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                for c in common: stack.enter_context(c)
+                stack.enter_context(patch.object(m, 'check_config', return_value=(True, '')))
+                stack.enter_context(patch.object(m, 'restart_proxy', return_value=None))
+                stack.enter_context(contextlib.redirect_stdout(out))
+                m.enable_log(assume_yes=True)
+            data = json.loads(cfg.read_text())
+            self.assertEqual(data['log'], {'loglevel': 'warning', 'access': str(Path(temp) / 'acc' / 'access.log')})
+            self.assertEqual(data['inbounds'], [1])
+            self.assertIn('已打开', out.getvalue())
+            self.assertEqual(len(list(Path(temp).glob('config.json.liuliang-bak-*'))), 1)
+    def test_enabled_log_is_trimmed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'access.log'; path.write_text('')
+            with patch.object(m, 'ACCESS_LOG', path), patch.object(m, 'ACCESS_MAX', 10):
+                f = m.FileFollower(str(path))
+                with open(path, 'a') as h: h.write('a line longer than ten\n')
+                self.assertEqual(f.lines(), ['a line longer than ten'])
+                self.assertEqual(path.stat().st_size, 0)
+                with open(path, 'a') as h: h.write('next\n')
+                self.assertEqual(f.lines(), ['next'])
+                f.close()
     def test_file_follower_handles_rotation(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / 'access.log'
@@ -777,6 +850,9 @@ class SiteTests(unittest.TestCase):
     def test_sites_are_kept_eight_days(self):
         db = m.open_db(':memory:')
         t = m.SiteTracker([443]); t.tick(100, [self.XRAY], {}, {})
+        # 还没找过日志：不写状态，报表不会误说「读不到」
+        m.save_sites(db, m.SiteTracker([443]), 900)
+        self.assertIsNone(db.execute("select value from metadata where key='sites'").fetchone())
         m.save_sites(db, t, 1000)
         t.tick(100, [self.XRAY], {}, {})
         m.save_sites(db, t, 1000 + 8 * 86400 + 1)
