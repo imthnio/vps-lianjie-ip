@@ -108,7 +108,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.19'
+VERSION = '1.0.20'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -1671,6 +1671,38 @@ PANEL = re.compile(r'(x-ui|3x-ui|s-ui|h-ui|marzban|hiddify|v2board|xrayr|v2bx)',
 ACCESS_DIR = Path('/var/log/liuliang-access')
 ACCESS_LOG = ACCESS_DIR / 'access.log'
 ACCESS_MAX = 20 * 1024 * 1024
+# 小内存机器（内存 ≤128MB）上，日志文件超过 5MB 就清空，少占硬盘、少读数据。
+ACCESS_MAX_SMALL = 5 * 1024 * 1024
+
+
+# 名词小词典：MemTotal = 这台机器的总内存（/proc/meminfo 里那一行，单位 KB）。
+def mem_mb():
+    """返回机器总内存（MB），读不到返回 0。"""
+    try:
+        for line in Path('/proc/meminfo').read_text().splitlines():
+            if line.startswith('MemTotal:'):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+# 安装时要不要自动打开代理访问日志：
+# 用户明确说过（--log yes/no 或之前选过）就照用户的；
+# 否则默认打开，内存小于 48MB 的机器默认不开，免得代理多写日志拖慢机器。
+def auto_log_choice(arg, existing, mem):
+    if arg in ('yes', 'no'):
+        return arg
+    old = (existing or {}).get('log')
+    if old in ('yes', 'no'):
+        return old
+    return 'no' if 0 < mem < 48 else 'yes'
+
+
+def access_cap(mem=None):
+    """日志清空门槛：小内存机器用 5MB，其他 20MB。"""
+    mem = mem_mb() if mem is None else mem
+    return ACCESS_MAX_SMALL if 0 < mem <= 128 else ACCESS_MAX
 
 
 def proc_status(pid):
@@ -1934,6 +1966,7 @@ class FileFollower:
 
     def __init__(self, path):
         self.path = path
+        self.cap = access_cap()  # 日志超过这个大小就清空
         self.handle = None
         self.ident = None
         self.buf = ''
@@ -1967,7 +2000,7 @@ class FileFollower:
             return self._read()
         out = self._read()
         # --enable-log 打开的日志由 liuliang 负责清理：读完、超过 20MB 就清空（代理是追加写，不受影响）。
-        if self.path == str(ACCESS_LOG) and self.handle.tell() > ACCESS_MAX and not self.buf:
+        if self.path == str(ACCESS_LOG) and self.handle.tell() > self.cap and not self.buf:
             try:
                 os.truncate(self.path, 0)
                 self.handle.seek(0)
@@ -2301,8 +2334,13 @@ def install(args):
         access_logs = [p.strip() for p in args.access_log.split(',') if p.strip()]
     else:
         access_logs = list((existing or {}).get('access_logs') or [])
+    # log：安装时是否自动打开代理访问日志（yes/no），用户明确选过就一直保留。
+    explicit_log = getattr(args, 'log', None) in ('yes', 'no') or (existing or {}).get('log') in ('yes', 'no')
+    log_choice = auto_log_choice(getattr(args, 'log', None), existing, mem_mb())
     config = {'version':VERSION, 'ports':selected, 'geo':geo, 'backend':backend, 'web':web, 'auto':auto, 'realip':realip,
               'sites':sites, 'access_logs':access_logs}
+    if explicit_log:
+        config['log'] = log_choice
     if backend == 'diag':
         config['diag'] = sources
     for folder in [CONFIG.parent, PROGRAM.parent, DATA]:
@@ -2366,13 +2404,19 @@ start_pre() { /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py --once; }
             print('  原因：' + note)
         if can_enable(sources, notes) and proxy_processes():
             print('  现在还读不到代理的访问记录，所以看不到每个 IP 访问了哪些网站。')
-            answer = ''
-            if sys.stdin.isatty():
+            # 默认打开（推荐）：直接回车 = 打开；输入 n = 不打开，并记住这个选择，以后更新不再问。
+            answer = 'y' if log_choice == 'yes' else 'n'
+            if not explicit_log and sys.stdin.isatty():
+                tip = '（推荐，直接回车）' if log_choice == 'yes' else '（这台内存小，推荐不开，直接回车跳过）'
                 try:
-                    answer = input('  要现在自动打开吗？（会先备份代理配置，代理重启几秒）输入 y 回车打开，直接回车跳过：').strip().lower()
+                    got = input('  要自动打开代理访问日志吗？会先备份代理配置、代理重启几秒' + tip + ' [y/n]：').strip().lower()
                 except (EOFError, KeyboardInterrupt):
-                    answer = ''
-            if answer in ('y', 'yes'):
+                    got = ''
+                if got in ('y', 'yes', 'n', 'no'):
+                    answer = got[0]
+                    config['log'] = 'yes' if answer == 'y' else 'no'
+                    CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n')
+            if answer == 'y':
                 enable_log(assume_yes=True)
             else:
                 print('  ' + SITE_HELP)
@@ -2480,6 +2524,7 @@ def main():
     parser.add_argument('--ip', help='查看这个 IP 近7天访问的应用/网站和各自的流量')
     parser.add_argument('--sites', choices=['yes','no'], help='高级：--sites no 关闭访问的应用/网站记录（默认开启）')
     parser.add_argument('--access-log', help='高级：代理访问日志路径（自动找不到时用），多个用逗号隔开')
+    parser.add_argument('--log', choices=['yes','no'], help='高级：安装时是否自动打开代理访问日志（默认打开，内存<48MB 默认不开）')
     parser.add_argument('--enable-log', action='store_true', help='自动打开 Xray / sing-box 的访问日志（看不到访问的网站时用）')
     parser.add_argument('-y', '--yes', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--daemon', action='store_true')
@@ -2600,6 +2645,9 @@ def report(config, web_only=False, show_all=False):
    print('│ '+' │ '.join(out)+' │')
   real=[r for r in rows if r[7]!='CF节点']
   print(line('└','┴','┘'));a=sum(1 for r in real if r[3]>0 or r[4]>0);print('合计：IP 数 %d · 有流量 IP 数 %d · 近24小时总流量 %s · 近7天总流量 %s'%(len(real),a,sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))))
+  # 服务商口径：这里只数「用户 ↔ 本机」这一段；代理还要再从网上把同样的数据取一遍，
+  # 服务商按网卡进 + 出全算，所以后台用量大约是这里的 2 倍。
+  print(col('服务商后台显示的用量大约是这里合计的 2 倍：这里只算用户和服务器之间的流量，服务器替用户去网上取数据那一段，服务商也会再算一次',D))
   if any(r[8] for r in rows):print(col('最后上网：这个 IP 最后一次打开网站/App 或最后有数据来往的时间（取更晚的，每分钟更新）。带 * 的读不到它打开网站的记录（代理没开日志，或是网站访客），'
    '手机放着不用、后台心跳也算数据，所以可能比实际晚',D))
   if note:print(col(note,D))

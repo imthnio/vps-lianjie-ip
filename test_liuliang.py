@@ -902,4 +902,21 @@ class V119Tests(unittest.TestCase):
         a=s.index("<<'LIULIANG_PYTHON'\n")+len("<<'LIULIANG_PYTHON'\n"); b=s.index("\nLIULIANG_PYTHON\n")
         self.assertEqual(s[a:b], Path(__file__).with_name('liuliang.py').read_text().rstrip('\n'))
 
+class V120Tests(unittest.TestCase):
+    def test_log_choice(self):
+        self.assertEqual(m.auto_log_choice(None, {}, 512), 'yes')
+        self.assertEqual(m.auto_log_choice(None, {}, 32), 'no')
+        self.assertEqual(m.auto_log_choice(None, {'log':'no'}, 512), 'no')   # 保留用户选择
+        self.assertEqual(m.auto_log_choice('yes', {'log':'no'}, 32), 'yes')  # 命令行最优先
+        self.assertEqual(m.auto_log_choice(None, {}, 0), 'yes')              # 读不到内存按默认
+    def test_access_cap(self):
+        self.assertEqual(m.access_cap(64), m.ACCESS_MAX_SMALL)
+        self.assertEqual(m.access_cap(1024), m.ACCESS_MAX)
+    def test_report_has_provider_note(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db=m.open_db(Path(temp)/'history-v1.db'); m.save_sample(db,{('up4','5.5.5.5'):(9158, None)},m.time.time()); db.close()
+            out=io.StringIO()
+            with patch.object(m,'DATA',Path(temp)),contextlib.redirect_stdout(out):m.report({'ports':[443],'geo':True})
+            self.assertIn('大约是这里合计的 2 倍',out.getvalue())
+
 if __name__=='__main__':unittest.main(verbosity=2)
