@@ -1190,4 +1190,54 @@ class V126Tests(unittest.TestCase):
             with patch.object(m, 'ACCESS_LOG', log), patch.object(m, 'proxy_processes', return_value=[]):
                 self.assertTrue(m.can_enable([('file', str(log))], []))
 
+class V127Tests(unittest.TestCase):
+    def _nodes(self, temp):
+        root = Path(temp)
+        good = root / 'node1.log'; good.write_text('')
+        c1 = root / 'n1.json'; c2 = root / 'n2.json'
+        c1.write_text(json.dumps({'log': {'loglevel': 'warning', 'access': str(good), 'error': '/var/log/e1.log'}, 'inbounds': []}))
+        c2.write_text(json.dumps({'log': {'loglevel': 'warning', 'error': '/var/log/e2.log'}, 'inbounds': []}))   # log.access 被删了
+        procs = [(101, 'xray', ['xray', 'run', '-c', str(c1)]), (102, 'xray', ['xray', 'run', '-c', str(c2)])]
+        return root, c1, c2, procs
+    def test_config_is_authoritative(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, c1, c2, procs = self._nodes(temp)
+            self.assertTrue(m.config_log_ok(*procs[0])[0])
+            good, why, _ = m.config_log_ok(*procs[1])
+            self.assertFalse(good); self.assertIn('log.access', why)
+            c2.write_text(json.dumps({'log': {'access': 'none'}}))
+            self.assertFalse(m.config_log_ok(*procs[1])[0])
+            with patch.object(m, 'proxy_processes', return_value=procs), patch.object(m, 'panel_name', return_value=None):
+                self.assertEqual([x[0] for x in m.missing_logs()], [102])
+    def test_two_nodes_only_missing_one_fixed_and_merged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, c1, c2, procs = self._nodes(temp)
+            before1 = c1.read_text()
+            restarted = []
+            with patch.object(m, 'proxy_processes', return_value=procs), patch.object(m, 'panel_name', return_value=None), \
+                 patch.object(m, 'ACCESS_DIR', root / 'acc'), patch.object(m, 'ACCESS_LOG', root / 'acc' / 'access.log'), \
+                 patch.object(m, 'proc_status', return_value={'Uid': str(os.getuid())}), patch.object(m.os, 'geteuid', return_value=0), \
+                 patch.object(m, 'check_config', return_value=(True, '')), \
+                 patch.object(m, 'restart_proxy', side_effect=lambda pid, kind, cfg=None: restarted.append(pid)), \
+                 patch.object(m, 'systemd_running', return_value=False), patch.object(m.shutil, 'which', return_value=None), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                m.enable_log(assume_yes=True)
+            self.assertEqual(restarted, [102])                 # 只重启缺日志的那个节点
+            self.assertEqual(c1.read_text(), before1)          # 好的节点一个字没动
+            log = json.loads(c2.read_text())['log']
+            self.assertEqual(log['access'], str(root / 'acc' / 'access.log'))
+            self.assertEqual(log['loglevel'], 'warning'); self.assertEqual(log['error'], '/var/log/e2.log')   # 合并，不整个替换
+    def test_loglevel_none_raised(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, c1, c2, procs = self._nodes(temp)
+            c2.write_text(json.dumps({'log': {'loglevel': 'none'}}))
+            with patch.object(m, 'proxy_processes', return_value=procs), patch.object(m, 'panel_name', return_value=None), \
+                 patch.object(m, 'ACCESS_DIR', root / 'acc'), patch.object(m, 'ACCESS_LOG', root / 'acc' / 'access.log'), \
+                 patch.object(m, 'proc_status', return_value={'Uid': str(os.getuid())}), patch.object(m.os, 'geteuid', return_value=0), \
+                 patch.object(m, 'check_config', return_value=(True, '')), patch.object(m, 'restart_proxy', return_value=None), \
+                 patch.object(m, 'systemd_running', return_value=False), patch.object(m.shutil, 'which', return_value=None), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                m.enable_log(assume_yes=True)
+            self.assertEqual(json.loads(c2.read_text())['log']['loglevel'], 'warning')
+
 if __name__=='__main__':unittest.main(verbosity=2)

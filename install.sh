@@ -112,7 +112,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.26'
+VERSION = '1.0.27'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -2138,6 +2138,50 @@ def site_sources(extra=()):
     return sources, notes
 
 
+# 名词小词典：log.access = Xray 配置里「访问日志写到哪个文件」那一项；sing-box 对应 log.output。
+# 判断「这个代理的访问记录能不能读到」，以它自己的配置为准，每个节点分开看：
+# 配置里写了访问日志文件、不是 none、文件（或所在目录）可写，才算 ✔。
+# 只看「有个旧日志文件在、里面有旧记录」不行：配置被删以后它就不再更新了。
+def config_log_ok(pid, kind, argv):
+    """返回 (是否已开好, 大白话原因, 日志文件路径或 None)。"""
+    try:
+        cwd = os.readlink('/proc/%s/cwd' % pid)
+    except OSError:
+        cwd = '/'
+    files, cwd = proxy_configs(kind, argv, cwd)
+    log = {}
+    for path in files:
+        data = load_json(path)
+        if data and isinstance(data.get('log'), dict):
+            log.update(data['log'])
+    name = PROXY_NAMES[kind]
+    if kind == 'sing-box':
+        if log.get('disabled'):
+            return False, 'sing-box 把日志关掉了（log.disabled）', None
+        if str(log.get('level') or 'info').lower() in ('warn', 'warning', 'error', 'fatal', 'panic'):
+            return False, 'sing-box 日志级别太高，不记访问（要 info）', None
+        target = str(log.get('output') or '')
+    else:
+        target = str(log.get('access') or '')
+    if not target or target.lower() == 'none':
+        return False, name + ' 配置里没有设置访问日志（log.access）', None
+    path = os.path.join(cwd, target)
+    folder = os.path.dirname(path) or '/'
+    if os.path.isfile(path) and os.access(path, os.W_OK) or (not os.path.exists(path) and os.access(folder, os.W_OK)):
+        return True, '', path
+    return False, name + ' 配置里的访问日志 ' + path + ' 写不进去', None
+
+
+def missing_logs():
+    """正在运行、配置里没开访问日志、又不是面板管的代理（面板要在面板里开）。"""
+    out = []
+    for pid, kind, argv in proxy_processes():
+        good, why, _p = config_log_ok(pid, kind, argv)
+        if not good and not panel_name(pid, argv):
+            out.append((pid, kind, argv, why))
+    return out
+
+
 def can_enable(sources, notes):
     """读不到访问记录、又不是面板管理的（面板要在面板里开），--enable-log 能帮上忙。"""
     # 只要有一个来源里真的有访问记录就不用开；只是配了路径/只有报错行的不算。
@@ -2293,8 +2337,9 @@ def enable_log(assume_yes=False):
     for pid, kind, argv in procs:
         source, note, files, cwd, _log = proxy_log(pid, kind, argv)
         name = PROXY_NAMES[kind]
-        if source and has_access_lines(source, kind):
-            print('✔ ' + name + ' 的访问日志已经能读到（' + source[1] + '），不用改。')
+        good, why, path = config_log_ok(pid, kind, argv)
+        if good:
+            print('✔ ' + name + '（进程 ' + str(pid) + '）的访问日志已经开着（' + path + '），不用改。')
             continue
         if panel_name(pid, argv):
             print('✘ ' + note)
@@ -2339,7 +2384,10 @@ def enable_log(assume_yes=False):
             log['output'] = str(ACCESS_LOG)
             log.setdefault('timestamp', True)
         else:
+            # 只加 log.access，原来的 loglevel、error 等设置都保留；loglevel 是 none 时改成 warning。
             log['access'] = str(ACCESS_LOG)
+            if str(log.get('loglevel') or '').lower() == 'none':
+                log['loglevel'] = 'warning'
         data['log'] = log
         target.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
         os.chmod(str(target), st.st_mode & 0o7777)
@@ -2825,7 +2873,7 @@ start_pre() { /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py --once; }
         print('访问的应用/网站：已开启（读代理访问日志，只记域名和流量，不记网址和内容；--sites no 关闭）')
         for note in notes:
             print('  原因：' + note)
-        if can_enable(sources, notes) and proxy_processes():
+        if missing_logs():
             print('  现在还读不到代理的访问记录，所以看不到每个 IP 访问了哪些网站。')
             # 默认打开（推荐）：直接回车 = 打开；输入 n = 不打开，并记住这个选择，以后更新不再问。
             # 之前选过「打开」（config 里 log=yes），代理的日志设置后来被删了：直接重新加上，不再问。
@@ -2913,7 +2961,13 @@ def doctor():
         print(ok(bool(sources)) + ' 代理访问日志：' + ('、'.join(names) or '没找到'))
         for note in notes:
             print('  原因：' + note)
-        if can_enable(sources, notes):
+        # 每个代理（节点）分开看它的配置有没有开访问日志。
+        bad = False
+        for pid, kind, argv in proxy_processes():
+            good, why, path = config_log_ok(pid, kind, argv)
+            print(ok(good) + ' ' + PROXY_NAMES[kind] + '（进程 ' + str(pid) + '）访问日志：' + (path if good else why))
+            bad = bad or not good
+        if bad:
             print('  ' + SITE_HELP)
     db = DATA / 'history-v1.db'
     if not db.exists():
