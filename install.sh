@@ -108,7 +108,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.20'
+VERSION = '1.0.21'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -370,6 +370,7 @@ def collect(config, sniffer=None, sites=None):
             save_realip(c, sniffer, now)
             take_pending(c, now)
             save_sites(c, sites, now)
+            save_nic(c, now)
             c.execute("INSERT OR REPLACE INTO metadata VALUES('boot',?)", (boot,))
             c.execute("INSERT OR REPLACE INTO metadata VALUES('sample',?)", (str(now),))
             c.commit()
@@ -702,6 +703,110 @@ def capture_devices():
         if len(cols) >= 2 and cols[1] == '00000000' and cols[0] in names:
             return [cols[0]]
     return names[:1]
+
+
+# ===== 整块网卡用量（和服务商后台对账用）=====
+# 名词小词典：网卡 = 服务器连外网的那块网络接口（默认路由走的那块）；
+# rx = 收到的字节（进站），tx = 发出的字节（出站）；/proc/net/dev 里是开机以来的累计值，重启会归零。
+BILLING = {'both': '进+出', 'out': '出站', 'max': '取大'}
+
+
+def nic_bytes(dev, text=None):
+    """读 /proc/net/dev，返回这块网卡的 (收, 发) 累计字节；读不到返回 None。"""
+    try:
+        text = Path('/proc/net/dev').read_text() if text is None else text
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if ':' not in line:
+            continue
+        name, rest = line.split(':', 1)
+        if name.strip() == dev:
+            cols = rest.split()
+            try:
+                return int(cols[0]), int(cols[8])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def save_nic(c, now, dev=None, counts=None):
+    """把这次和上次之间网卡多收/多发的字节存进 nic 表；计数变小（重启/换网卡）就从 0 算起。"""
+    c.execute('CREATE TABLE IF NOT EXISTS nic(ts REAL NOT NULL, rx INTEGER NOT NULL, tx INTEGER NOT NULL)')
+    if dev is None:
+        devs = capture_devices()
+        dev = devs[0] if devs else None
+    if not dev:
+        return
+    counts = nic_bytes(dev) if counts is None else counts
+    if counts is None:
+        return
+    rx, tx = counts
+    row = c.execute("SELECT value FROM metadata WHERE key='nic'").fetchone()
+    try:
+        old = json.loads(row[0]) if row else None
+    except ValueError:
+        old = None
+    if old and old.get('dev') == dev:
+        drx = rx - old['rx'] if rx >= old['rx'] else rx
+        dtx = tx - old['tx'] if tx >= old['tx'] else tx
+        if drx > 0 or dtx > 0:
+            c.execute('INSERT INTO nic(ts,rx,tx) VALUES(?,?,?)', (now, drx, dtx))
+    c.execute("INSERT OR REPLACE INTO metadata VALUES('nic',?)", (json.dumps({'dev': dev, 'rx': rx, 'tx': tx}),))
+    c.execute('DELETE FROM nic WHERE ts<?', (now - 8 * 86400,))
+
+
+def nic_usage(c, since, until):
+    """这段时间网卡的 (收, 发) 合计。"""
+    try:
+        return tuple(c.execute('SELECT coalesce(sum(rx),0),coalesce(sum(tx),0) FROM nic WHERE ts>? AND ts<=?', (since, until)).fetchone())
+    except sqlite3.OperationalError:
+        return (0, 0)
+
+
+def billing_figure(mode, rx, tx):
+    return {'both': rx + tx, 'out': tx, 'max': max(rx, tx)}[mode]
+
+
+def billing_lines(config, c, now):
+    """合计下面那几行：服务商口径的整块网卡用量。"""
+    d = nic_usage(c, now - 86400, now); w = nic_usage(c, now - 604800, now)
+    if not any(d + w):
+        return []
+    mode = config.get('billing', 'both')
+    if mode in BILLING:
+        out = ['服务商口径（%s）整块网卡用量：近24小时 %s · 近7天 %s' % (BILLING[mode], sz(billing_figure(mode, *d)), sz(billing_figure(mode, *w)))]
+    else:
+        out = ['整块网卡用量 近24小时 / 近7天：' + ' · '.join('%s %s / %s' % (BILLING[k], sz(billing_figure(k, *d)), sz(billing_figure(k, *w))) for k in ('out', 'both', 'max')),
+               '和服务商后台的用量对一下，对得上的那个就是你的计费方式；改：liuliang --billing']
+    out.append('网卡用量包括所有流量（SSH、系统更新、代理去网上取数据），所以比上面每个 IP 的合计大；统计从装好 liuliang 后开始')
+    return out
+
+
+def set_billing(value=None):
+    """liuliang --billing：改服务商计费方式。不带值时一步一步问。"""
+    config = json.loads(CONFIG.read_text())
+    if value is None:
+        value = ask_billing(config.get('billing', 'both'))
+    config['billing'] = value
+    CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n')
+    print('已设置计费方式：' + BILLING.get(value, '不确定（三种都显示）'))
+
+
+def ask_billing(current='both'):
+    """问一次服务商怎么算流量。直接回车 = 当前/推荐的选项。"""
+    keys = ['both', 'out', 'max', 'all']
+    names = ['进+出双向（大多数服务商）', '只算出站', '进和出取大的那个', '不确定，三种都显示']
+    print('你的服务商怎么算流量？（看服务商后台或套餐说明）')
+    for i, n in enumerate(names, 1):
+        print('  %d) %s%s' % (i, n, '  ← 直接回车' if keys[i-1] == current else ''))
+    if not sys.stdin.isatty():
+        return current
+    try:
+        got = input('输入序号：').strip()
+    except (EOFError, KeyboardInterrupt):
+        got = ''
+    return keys[int(got) - 1] if got in ('1', '2', '3', '4') else current
 
 
 def raw_possible():
@@ -1350,6 +1455,7 @@ def diag_tick(config, flush, pump=None, watcher=None, sniffer=None, sites=None):
             if flush:
                 take_pending(c, now)
                 save_sites(c, sites, now)
+                save_nic(c, now)
                 c.execute("INSERT OR REPLACE INTO metadata VALUES('sample',?)", (str(now),))
             c.commit()
         finally:
@@ -1377,6 +1483,14 @@ def follow_ports(config, seen):
         return now, False
     config['ports'] = sorted(set(config['ports']) | set(fresh))
     config['web'] = sorted((set(config.get('web') or []) | set(web_fresh)) & set(config['ports']))
+    # 用户在后台运行期间用命令改过的选项（计费方式、日志）以硬盘上的为准，不要被旧值盖掉。
+    try:
+        disk = json.loads(CONFIG.read_text())
+        for key in ('billing', 'log'):
+            if key in disk:
+                config[key] = disk[key]
+    except (OSError, ValueError):
+        pass
     CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n')
     CONFIG.chmod(0o600)
     print('liuliang: 新检测到端口 ' + ','.join(map(str, fresh or web_fresh)) + '，已并入统计', file=sys.stderr, flush=True)
@@ -2341,6 +2455,8 @@ def install(args):
               'sites':sites, 'access_logs':access_logs}
     if explicit_log:
         config['log'] = log_choice
+    # billing：服务商计费方式。已经选过就一直保留（更新不再问），没选过默认进+出。
+    config['billing'] = (existing or {}).get('billing') or ''
     if backend == 'diag':
         config['diag'] = sources
     for folder in [CONFIG.parent, PROGRAM.parent, DATA]:
@@ -2420,6 +2536,10 @@ start_pre() { /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py --once; }
                 enable_log(assume_yes=True)
             else:
                 print('  ' + SITE_HELP)
+    if not config.get('billing'):
+        config['billing'] = ask_billing('both')
+        CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n')
+    print('计费方式：' + BILLING.get(config['billing'], '不确定（三种都显示）') + '（以后改：liuliang --billing）')
     print('只看网站访客：liuliang --web    排查问题：liuliang --doctor')
     print('查看某个 IP 近7天访问的应用/网站：运行 liuliang 后输入序号，或 liuliang --ip IP')
 
@@ -2524,6 +2644,7 @@ def main():
     parser.add_argument('--ip', help='查看这个 IP 近7天访问的应用/网站和各自的流量')
     parser.add_argument('--sites', choices=['yes','no'], help='高级：--sites no 关闭访问的应用/网站记录（默认开启）')
     parser.add_argument('--access-log', help='高级：代理访问日志路径（自动找不到时用），多个用逗号隔开')
+    parser.add_argument('--billing', nargs='?', const='', choices=['', 'both', 'out', 'max', 'all'], help='设置服务商计费方式：both 进+出 / out 出站 / max 取大 / all 三种都显示')
     parser.add_argument('--log', choices=['yes','no'], help='高级：安装时是否自动打开代理访问日志（默认打开，内存<48MB 默认不开）')
     parser.add_argument('--enable-log', action='store_true', help='自动打开 Xray / sing-box 的访问日志（看不到访问的网站时用）')
     parser.add_argument('-y', '--yes', action='store_true', help=argparse.SUPPRESS)
@@ -2537,6 +2658,8 @@ def main():
         doctor(); return
     if args.enable_log:
         enable_log(args.yes); return
+    if args.billing is not None:
+        set_billing(args.billing or None); return
     config = json.loads(CONFIG.read_text())
     if args.once:
         collect(config)
@@ -2645,9 +2768,8 @@ def report(config, web_only=False, show_all=False):
    print('│ '+' │ '.join(out)+' │')
   real=[r for r in rows if r[7]!='CF节点']
   print(line('└','┴','┘'));a=sum(1 for r in real if r[3]>0 or r[4]>0);print('合计：IP 数 %d · 有流量 IP 数 %d · 近24小时总流量 %s · 近7天总流量 %s'%(len(real),a,sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))))
-  # 服务商口径：这里只数「用户 ↔ 本机」这一段；代理还要再从网上把同样的数据取一遍，
-  # 服务商按网卡进 + 出全算，所以后台用量大约是这里的 2 倍。
-  print(col('服务商后台显示的用量大约是这里合计的 2 倍：这里只算用户和服务器之间的流量，服务器替用户去网上取数据那一段，服务商也会再算一次',D))
+  # 服务商口径：整块网卡的进/出用量，按 config.json 里的 billing 显示。
+  for t in billing_lines(config,c,now):print(col(t,D))
   if any(r[8] for r in rows):print(col('最后上网：这个 IP 最后一次打开网站/App 或最后有数据来往的时间（取更晚的，每分钟更新）。带 * 的读不到它打开网站的记录（代理没开日志，或是网站访客），'
    '手机放着不用、后台心跳也算数据，所以可能比实际晚',D))
   if note:print(col(note,D))

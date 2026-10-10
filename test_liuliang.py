@@ -912,11 +912,40 @@ class V120Tests(unittest.TestCase):
     def test_access_cap(self):
         self.assertEqual(m.access_cap(64), m.ACCESS_MAX_SMALL)
         self.assertEqual(m.access_cap(1024), m.ACCESS_MAX)
-    def test_report_has_provider_note(self):
+    NETDEV = 'Inter-|   Receive\n face |bytes packets errs drop fifo frame compressed multicast|bytes\n    lo: 5 0 0 0 0 0 0 0 5 0 0 0 0 0 0 0\n  eth0: 1000 10 0 0 0 0 0 0 3000 20 0 0 0 0 0 0\n'
+    def test_nic_bytes(self):
+        self.assertEqual(m.nic_bytes('eth0', self.NETDEV), (1000, 3000))
+        self.assertIsNone(m.nic_bytes('eth9', self.NETDEV))
+    def _nicdb(self, temp):
+        db=m.open_db(Path(temp)/'history-v1.db'); now=m.time.time()
+        m.save_nic(db, now-300, 'eth0', (1000, 3000))      # 第一次只记基线
+        m.save_nic(db, now-200, 'eth0', (3000, 4000))      # +2000 收 +1000 发
+        m.save_nic(db, now-100, 'eth0', (500, 200))        # 重启归零：从 0 算起
+        m.save_sample(db,{('up4','5.5.5.5'):(9158, None)},now); db.commit(); db.close()
+    def test_nic_reset_and_modes(self):
         with tempfile.TemporaryDirectory() as temp:
-            db=m.open_db(Path(temp)/'history-v1.db'); m.save_sample(db,{('up4','5.5.5.5'):(9158, None)},m.time.time()); db.close()
-            out=io.StringIO()
-            with patch.object(m,'DATA',Path(temp)),contextlib.redirect_stdout(out):m.report({'ports':[443],'geo':True})
-            self.assertIn('大约是这里合计的 2 倍',out.getvalue())
+            self._nicdb(temp)
+            db=sqlite3.connect(str(Path(temp)/'history-v1.db'))
+            rx,tx=m.nic_usage(db,0,m.time.time()+1)
+            self.assertEqual((rx,tx),(2500,1200))
+            self.assertEqual(m.billing_figure('both',rx,tx),3700)
+            self.assertEqual(m.billing_figure('out',rx,tx),1200)
+            self.assertEqual(m.billing_figure('max',rx,tx),2500)
+    def _report(self, temp, cfg):
+        out=io.StringIO()
+        with patch.object(m,'DATA',Path(temp)),contextlib.redirect_stdout(out):m.report(dict({'ports':[443],'geo':True},**cfg))
+        return out.getvalue()
+    def test_report_billing_default_both(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self._nicdb(temp); text=self._report(temp,{})
+            self.assertIn('服务商口径（进+出）',text); self.assertIn('3.6 KB',text); self.assertIn('SSH',text)
+    def test_report_billing_all(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self._nicdb(temp); text=self._report(temp,{'billing':'all'})
+            self.assertIn('出站',text); self.assertIn('取大',text); self.assertIn('对得上的那个',text)
+    def test_report_billing_out(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self._nicdb(temp); text=self._report(temp,{'billing':'out'})
+            self.assertIn('服务商口径（出站）',text); self.assertNotIn('取大',text)
 
 if __name__=='__main__':unittest.main(verbosity=2)
