@@ -112,7 +112,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.24'
+VERSION = '1.0.25'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -211,8 +211,22 @@ def parse_duration(value):
     return int(total) or None
 
 
+# 名词小词典：私有地址 = 10.x、172.16-31.x、192.168.x；CGNAT = 100.64-127.x（运营商级 NAT）。
+# NAT 小鸡上，商家网关会把所有来访地址换成它自己的私有地址（如 10.91.0.1），
+# 这时看不到真实 IP，但流量还是要算，所以这两类地址也入库。
+NAT_NETS = [ipaddress.ip_network(n) for n in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '100.64.0.0/10')]
+
+
+def is_nat_ip(value):
+    try:
+        ip = ipaddress.ip_address(str(value))
+    except ValueError:
+        return False
+    return ip.version == 4 and any(ip in n for n in NAT_NETS)
+
+
 def acceptable_ip(value):
-    """全局可路由地址才入库。回环、组播、链路本地、保留和运营商级 NAT 都丢掉。
+    """可入库的地址：公网地址，以及私有/CGNAT 地址（NAT 小鸡的网关）。回环、组播、链路本地、保留丢掉。
 
     Python 3.9 的 IPv4Address.is_global 不排除组播，所以这里逐项判断。
     """
@@ -220,6 +234,8 @@ def acceptable_ip(value):
         ip = ipaddress.ip_address(str(value))
     except ValueError:
         return None
+    if is_nat_ip(ip):
+        return ip
     if ip.is_multicast or ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_unspecified:
         return None
     if getattr(ip, 'is_global', True) is False:
@@ -447,6 +463,8 @@ def geo_resolve():
     c = open_db()
     try:
         for ip, in c.execute('SELECT ip FROM clients WHERE geo_due<=? ORDER BY last_seen DESC LIMIT 10', (now,)).fetchall():
+            if is_nat_ip(ip):   # 内网地址查不到归属地，不浪费网络
+                c.execute("UPDATE clients SET country='',city='内网',geo_due=? WHERE ip=?", (now + 30 * 86400, ip)); c.commit(); continue
             try:
                 country, city, isp = geo_lookup(ip)
                 c.execute('UPDATE clients SET country=?,city=?,isp=?,geo_due=? WHERE ip=?', (country,city,isp,now+30*86400,ip))
@@ -853,14 +871,18 @@ def billing_lines(config, c, now):
     a, b = cycle_bounds(now, config.get('reset_day', 1)); cyc = nic_usage(c, a, now)
     if not any(d + w + cyc):
         return []
-    span = '本周期 %s ~ %s' % (datetime.fromtimestamp(a, Z).strftime('%m-%d'), datetime.fromtimestamp(b - 1, Z).strftime('%m-%d'))
+    # 每行不超过 50 格，手机竖屏不折行。
+    span = '%s~%s' % (datetime.fromtimestamp(a, Z).strftime('%m-%d'), datetime.fromtimestamp(b - 1, Z).strftime('%m-%d'))
     mode = config.get('billing', 'both')
     if mode in BILLING:
-        out = ['服务商口径（%s）整块网卡用量：%s 共 %s · 近24小时 %s · 近7天 %s' % (BILLING[mode], span, sz(billing_figure(mode, *cyc)), sz(billing_figure(mode, *d)), sz(billing_figure(mode, *w)))]
+        out = ['服务商口径（%s）本周期 %s' % (BILLING[mode], span),
+               '  共 %s · 24小时 %s · 7天 %s' % (sz(billing_figure(mode, *cyc)), sz(billing_figure(mode, *d)), sz(billing_figure(mode, *w)))]
     else:
-        out = ['整块网卡用量（%s）：' % span + ' · '.join('%s %s' % (BILLING[k], sz(billing_figure(k, *cyc))) for k in ('out', 'both', 'max')),
-               '和服务商后台的用量对一下，对得上的那个就是你的计费方式；改：liuliang --billing']
-    out.append('网卡用量包括所有流量（SSH、系统更新、代理去网上取数据），所以比上面每个 IP 的合计大；统计从装好 liuliang 后开始')
+        out = ['整块网卡用量 本周期 %s' % span,
+               '  ' + ' · '.join('%s %s' % (BILLING[k], sz(billing_figure(k, *cyc))) for k in ('out', 'both', 'max')),
+               '  和服务商后台对一下，对上的就是计费方式',
+               '  改计费方式：liuliang --billing']
+    out.append('网卡用量含 SSH、系统更新等全部流量')
     return out
 
 
@@ -1279,6 +1301,9 @@ def header_ip(head):
         elif name == b'x-forwarded-for':
             xff = value.decode('latin-1')
     ip = normalize_ip(cf) if cf else None
+    # 请求头里的「真实 IP」不收内网地址（伪造或代理链内部的），只有网卡上看到的来访地址才收。
+    if ip is not None and is_nat_ip(ip):
+        ip = None
     if ip is None:
         return None
     if xff is not None:
@@ -1900,9 +1925,12 @@ ACCESS_MAX_SMALL = 5 * 1024 * 1024
 # 名词小词典：MemTotal = 这台机器的总内存（/proc/meminfo 里那一行，单位 KB）。
 # 名词小词典：tty = 你正在打字的那个终端。用 curl … | sh 安装时，标准输入是下载的脚本，
 # 不是键盘，所以提问要直接去终端（/dev/tty）读；连终端都没有时才用默认值，并说一声。
+TTY = '/dev/tty'
+
+
 def has_tty():
     try:
-        with open('/dev/tty'):
+        with open(TTY):
             return True
     except OSError:
         return False
@@ -1911,9 +1939,10 @@ def has_tty():
 def ask(prompt, default=''):
     """问一个问题，从终端读一行；没有终端就打印提示、返回默认值。"""
     try:
-        with open('/dev/tty', 'r+') as tty:
-            tty.write(prompt); tty.flush()
-            line = tty.readline()
+        # 终端不能「读写同开」（不支持 seek，会报错），所以读、写分开打开。
+        with open(TTY, 'w') as out, open(TTY) as inp:
+            out.write(prompt); out.flush()
+            line = inp.readline()
             return line.strip() if line else default
     except OSError:
         print(prompt + '（没有终端可以输入，用默认值）')
@@ -2055,9 +2084,11 @@ def has_access_lines(source, kind=None):
     """日志里真的有访问记录才算能读到：文件要存在且最近 256KB 里有访问行；
     systemd 日志看最近 300 行。只配了路径、或者只有 warning 报错行，都不算。"""
     parser = AccessParser()
-    # liuliang 自己打开的那个日志：文件在就算开好了（刚开时还没人上网，里面是空的），重复运行不会再改一遍。
-    if source[0] == 'file' and source[1] == str(ACCESS_LOG) and os.path.isfile(source[1]):
-        return True
+    # liuliang 自己打开的那个日志：要代理配置里真的写着这个文件才算开好了（刚开时可能还是空的）。
+    # 只看目录/文件在不在不行：删掉代理的日志设置后，旧目录还留着。
+    if source[0] == 'file' and source[1] == str(ACCESS_LOG):
+        if ours_configured():
+            return True
     try:
         if source[0] == 'file':
             with open(source[1], 'rb') as f:
@@ -2069,6 +2100,17 @@ def has_access_lines(source, kind=None):
     except OSError:
         return False
     return any(parser.feed(line) for line in text.splitlines())
+
+
+def ours_configured():
+    """有没有正在运行的代理，配置里把访问日志写到 liuliang 的文件。"""
+    for pid, kind, argv in proxy_processes():
+        try:
+            if proxy_log(pid, kind, argv)[0] == ('file', str(ACCESS_LOG)):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def site_sources(extra=()):
@@ -2113,8 +2155,53 @@ def check_config(kind, exe, argv, cwd):
     return out.returncode == 0, (text[-1] if text else '')
 
 
-def restart_proxy(pid, kind):
+# 名词小词典：服务 = 让代理开机自启、挂了自动拉起的那个启动文件；
+# OpenRC 在 /etc/init.d/，systemd 在 /etc/systemd/system/ 等目录。
+# 一键脚本常用 xray-node-1、sing-box-xxx 这类名字，所以按「启动文件里写着这个配置文件路径」来找。
+SERVICE_DIRS = ('/etc/init.d', '/etc/systemd/system', '/lib/systemd/system', '/usr/lib/systemd/system')
+SERVICE_NAME = re.compile(r'(xray|v2ray|sing-?box|hysteria|node)', re.I)
+
+
+def services_for_config(config, dirs=SERVICE_DIRS):
+    """返回启动文件里写着这个配置路径的服务：[('openrc'|'systemd', 名字)]。"""
+    found = []
+    config = str(config)
+    for d in dirs:
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(d, name)
+            if not SERVICE_NAME.search(name) or not os.path.isfile(path):
+                continue
+            try:
+                text = Path(path).read_text(errors='replace')
+            except OSError:
+                continue
+            # 写着这个配置文件；或者用 -confdir 指向它所在的目录（目录太通用如 /etc 不算）。
+            folder = os.path.dirname(config)
+            if config in text or (folder not in ('', '/', '/etc', '/root', '/usr/local/etc') and re.search(re.escape(folder) + r'/?["\s]', text)):
+                if 'init.d' in d:
+                    found.append(('openrc', name))
+                elif name.endswith('.service'):
+                    found.append(('systemd', name))
+    seen = set()
+    return [x for x in found if not (x in seen or seen.add(x))]
+
+
+def restart_proxy(pid, kind, config=None):
     """重启代理让新日志设置生效。返回 None 表示已重启，否则返回要用户自己做的事。"""
+    # 先找「启动文件里写着这个配置」的服务，有几个就全重启。
+    owners = services_for_config(config) if config else []
+    done = 0
+    for init, name in owners:
+        if init == 'systemd' and systemd_running():
+            subprocess.run(['timeout', '60', 'systemctl', 'restart', name], check=True, capture_output=True, text=True); done += 1
+        elif init == 'openrc' and shutil.which('rc-service'):
+            subprocess.run(['timeout', '60', 'rc-service', name, 'restart'], check=True, capture_output=True, text=True); done += 1
+    if done:
+        return None
     unit = service_unit(pid)
     if unit and systemd_running():
         subprocess.run(['systemctl', 'restart', unit], check=True, capture_output=True, text=True)
@@ -2205,12 +2292,12 @@ def enable_log(assume_yes=False):
             print('✘ ' + name + ' 检查新配置没通过，已还原原配置，什么都没改' + ('（' + detail + '）' if detail else ''))
             continue
         try:
-            todo_msg = restart_proxy(pid, kind)
+            todo_msg = restart_proxy(pid, kind, target)
         except (OSError, subprocess.CalledProcessError) as exc:
             target.write_bytes(original)
             backup.unlink()
             try:
-                restart_proxy(pid, kind)
+                restart_proxy(pid, kind, target)
             except (OSError, subprocess.CalledProcessError):
                 pass
             print('✘ ' + name + ' 重启失败，已还原原配置：' + str(getattr(exc, 'stderr', '') or exc).strip())
@@ -2914,11 +3001,20 @@ def report(config, web_only=False, show_all=False, wide=True):
   if not show_all and not web_only:
    bad=scan_ips(c,[r for r in rows if r[7]!='CF节点'],config,opened,now,hasweb)
    scanhidden=len(bad);rows=[r for r in rows if r[0] not in bad]
-  note=('已隐藏 %d 个 Cloudflare 节点 IP（网站开了橙色云 / Tunnel，真实访客已单独列出；liuliang --all 显示）'%cfhidden) if cfhidden else ''
-  if scanhidden:note=(note+'\n' if note else '')+'已隐藏 %d 个疑似扫描 IP（几 KB、没上过网，不计入合计），查看：liuliang --all'%scanhidden
+  note=('已隐藏 %d 个 Cloudflare 节点 IP（橙色云/Tunnel）\n真实访客已单独列出，查看：liuliang --all'%cfhidden) if cfhidden else ''
+  if scanhidden:note=(note+'\n' if note else '')+'已隐藏 %d 个疑似扫描 IP，查看：liuliang --all'%scanhidden
+  # NAT 小鸡：来访地址全是商家网关的内网地址，看不到真实用户。
+  natips=[r[0] for r in rows if is_nat_ip(r[0])]
+  if natips and len(natips)*2>=len(rows):
+   note=(note+'\n' if note else '')+'这台是 NAT 小鸡，商家的网关把来访地址\n换成了 %s，看不到用户真实 IP，\n只能显示总流量'%'、'.join(natips[:2])
   if not rows:
    print('(近7天没有网站访客)' if web_only else ('(近7天无达到 %dKB 的流量记录'%(limit//1024) if limit else '(近7天没有流量记录')+('，也没有网站访客' if config.get('web') else '')+')')
    if note:print(col(note,D))
+   # 没有任何 IP 记录时，说一下最可能的原因。
+   if not web_only and not cfhidden and not scanhidden:
+    for t in ('可能的原因：','  1. 还没人用过节点（用一下，2 分钟后再看）','  2. 节点端口没在统计里：liuliang --doctor','  3. 统计没在跑：liuliang --doctor 看后台服务'):print(col(t,D))
+   # 网卡用量不依赖 IP 记录，有数据就照样显示。
+   for t in billing_lines(config,c,now):print(col(t,D))
    if cfhidden and not c.execute("select 1 from metadata where key='realip_last'").fetchone():
     print('只看到 Cloudflare 的 IP、没有真实访客：运行 liuliang --doctor 排查')
    return
@@ -2953,7 +3049,7 @@ def report(config, web_only=False, show_all=False, wide=True):
    print('合计 %d 个 IP · 24小时 %s · 7天 %s'%(len(real),sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))))
   # 服务商口径：整块网卡的进/出用量，按 config.json 里的 billing 显示。
   for t in billing_lines(config,c,now):print(col(t,D))
-  if any(r[8] for r in rows) and not wide:print(col('带 * = 读不到打开网站的记录，按最后有数据的时间（可能偏晚）',D))
+  if any(r[8] for r in rows) and not wide:print(col('带 * = 没有访问记录，按最后有数据的时间',D))
   if any(r[8] for r in rows) and wide:print(col('最后上网：这个 IP 最后一次打开网站/App 或最后有数据来往的时间（取更晚的，每分钟更新）。带 * 的读不到它打开网站的记录（代理没开日志，或是网站访客），'
    '手机放着不用、后台心跳也算数据，所以可能比实际晚',D))
   if note:print(col(note,D))

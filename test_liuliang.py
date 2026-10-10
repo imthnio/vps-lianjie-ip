@@ -1,3 +1,5 @@
+import os
+import inspect
 import argparse
 import contextlib
 import importlib.util
@@ -96,7 +98,7 @@ class TrafficTests(unittest.TestCase):
             if expires is not None:elem['expires']=expires
             items.append({'set':{'name':name,'elem':[{'elem':elem}]}})
         actual=m.parse_counters({'nftables':items})
-        self.assertEqual(actual,{('up4',IP):(100,691190),('down4',IP):(200,691195),('up6','2606:4700:4700::1111'):(300,None)})
+        self.assertEqual(actual,{('up4',IP):(100,691190),('down4',IP):(200,691195),('up6','2606:4700:4700::1111'):(300,None),('up4','100.64.1.1'):(600,691200)})  # v1.0.25：CGNAT 也计数（NAT 小鸡网关）
     def test_last_seen_uses_expires_not_sample_time(self):
         # 采样时刻 now=10000，但 expires 显示最后一个包是 37 秒前：
         # last_seen 应 ≈ 9963，而不是 10000（原来直接记采样时刻，最多差 120 秒）
@@ -322,7 +324,7 @@ class TrafficTests(unittest.TestCase):
         self.assertEqual(flows['tcp|10.0.0.8|443|8.8.8.8|40000'], ('8.8.8.8', 2000, 1000))
         self.assertEqual(flows['tcp|2001:db8::1|443|2606:4700:4700::1111|50000'], ('2606:4700:4700::1111', 20, 10))
         self.assertEqual(flows['tcp|10.0.0.8|443|::ffff:8.8.4.4|50001'], ('8.8.4.4', 8, 7))
-        self.assertEqual(len(flows), 3)
+        self.assertEqual(len(flows), 4)  # 192.168 内网来访也计数（NAT 小鸡）
     def test_parse_conntrack_udp_only_when_tcp_disabled(self):
         text = '\n'.join([
             'ipv4 2 udp 17 20 src=8.8.8.8 dst=10.0.0.8 sport=1111 dport=443 packets=2 bytes=300 src=10.0.0.8 dst=8.8.8.8 sport=443 dport=1111 packets=1 bytes=100 mark=0 use=1',
@@ -330,7 +332,7 @@ class TrafficTests(unittest.TestCase):
             'ipv4 2 udp 17 20 src=10.0.0.9 dst=10.0.0.8 sport=1111 dport=443 packets=1 bytes=10 src=10.0.0.8 dst=10.0.0.9 sport=443 dport=1111 packets=1 bytes=10 mark=0 use=1',
         ])
         flows = m.parse_conntrack(text, [443], tcp=False, udp=True)
-        self.assertEqual(list(flows.values()), [('8.8.8.8', 300, 100)])
+        self.assertEqual(list(flows.values()), [('8.8.8.8', 300, 100), ('10.0.0.9', 10, 10)])  # 内网地址也计数
     def test_account_flows_delta_reuse_and_linger(self):
         prev = {'tcp|a': (100, 50, 0)}
         baselines, activity = m.account_flows(prev, {'tcp|a': ('8.8.8.8', 140, 80), 'tcp|b': ('1.1.1.1', 5, 7)}, 10)
@@ -942,7 +944,7 @@ class V120Tests(unittest.TestCase):
     def test_report_billing_all(self):
         with tempfile.TemporaryDirectory() as temp:
             self._nicdb(temp); text=self._report(temp,{'billing':'all'})
-            self.assertIn('出站',text); self.assertIn('取大',text); self.assertIn('对得上的那个',text)
+            self.assertIn('出站',text); self.assertIn('取大',text); self.assertIn('对上的就是计费方式',text)
     def test_report_billing_out(self):
         with tempfile.TemporaryDirectory() as temp:
             self._nicdb(temp); text=self._report(temp,{'billing':'out'})
@@ -1081,5 +1083,76 @@ class V124Tests(unittest.TestCase):
         with patch('builtins.open', side_effect=OSError), contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(m.ask('问？', 'd'), 'd')
         self.assertIn('默认值', out.getvalue())
+
+class V125Tests(unittest.TestCase):
+    def test_ask_reads_from_pty(self):
+        import pty
+        self.assertNotIn("'r+'", inspect.getsource(m.ask))
+        master, slave = pty.openpty()
+        try:
+            os.write(master, b'7\n')
+            with patch.object(m, 'TTY', os.ttyname(slave)):
+                self.assertEqual(m.ask('几号？', '1'), '7')
+                os.write(master, b'\n')
+                self.assertEqual(m.ask('几号？', '1'), '')
+        finally:
+            os.close(master); os.close(slave)
+    def test_nat_gateway_counted_and_noted(self):
+        self.assertIsNotNone(m.acceptable_ip('10.91.0.1'))
+        self.assertIsNotNone(m.acceptable_ip('100.64.1.1'))
+        self.assertIsNone(m.acceptable_ip('127.0.0.1'))
+        self.assertIsNone(m.acceptable_ip('169.254.1.1'))
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db'); now = m.time.time()
+            m.save_sample(db, {('up4', '10.91.0.1'): (2*1024**2, None), ('down4', '10.91.0.1'): (30*1024**2, None)}, now); db.close()
+            out = io.StringIO()
+            with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                m.report({'ports': [443], 'geo': True}, wide=False)
+            text = out.getvalue()
+            self.assertIn('10.91.0.1', text); self.assertIn('NAT 小鸡', text); self.assertIn('只能显示总流量', text)
+    def _empty_with_nic(self, temp):
+        db = m.open_db(Path(temp) / 'history-v1.db'); now = m.time.time()
+        m.save_nic(db, now - 300, 'eth0', (0, 0)); m.save_nic(db, now - 100, 'eth0', (5*1024**2, 9*1024**2))
+        db.execute("INSERT INTO clients(ip,last_seen) VALUES('1.2.3.4',?)", (now - 50,)); db.commit(); db.close()
+    def test_billing_shown_without_ip_records_and_reason(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self._empty_with_nic(temp)
+            out = io.StringIO()
+            with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                m.report({'ports': [443], 'geo': True, 'billing': 'both'}, wide=False)
+            text = out.getvalue()
+            self.assertIn('服务商口径', text); self.assertIn('14 MB', text); self.assertIn('可能的原因', text)
+    def test_lines_fit_50(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self._empty_with_nic(temp)
+            db = m.open_db(Path(temp) / 'history-v1.db'); now = m.time.time()
+            m.save_sample(db, {('up4', '10.91.0.1'): (2*1024**2, None), ('down4', '10.91.0.1'): (3*1024**2, None),
+                               ('up4', '175.19.1.1'): (3*1024, None), ('down4', '175.19.1.1'): (3*1024, None)}, now); db.close()
+            for billing in ('both', 'all', 'out'):
+                out = io.StringIO()
+                with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                    m.report({'ports': [443], 'geo': True, 'billing': billing}, wide=False)
+                for line in out.getvalue().splitlines():
+                    self.assertLessEqual(m.ww(line), 50, line)
+    def test_service_for_config_xray_node(self):
+        with tempfile.TemporaryDirectory() as temp:
+            d = Path(temp) / 'init.d'; d.mkdir()
+            (d / 'xray-node-1').write_text('#!/sbin/openrc-run\ncommand_args="run -c /etc/xray-node-1/config.json"\n')
+            (d / 'xray-node-2').write_text('#!/sbin/openrc-run\ncommand_args="run -c /etc/xray-node-2/config.json"\n')
+            (d / 'sshd').write_text('/etc/xray-node-1/config.json\n')
+            u = Path(temp) / 'systemd'; u.mkdir()
+            (u / 'sing-box-a.service').write_text('[Service]\nExecStart=/usr/bin/sing-box run -C /etc/sb/conf\n')
+            got = m.services_for_config('/etc/xray-node-1/config.json', dirs=(str(d), str(u)))
+            self.assertEqual(got, [('openrc', 'xray-node-1')])
+            got = m.services_for_config('/etc/sb/conf/01-log.json', dirs=(str(d), str(u)))
+            self.assertEqual(got, [('systemd', 'sing-box-a.service')])
+    def test_old_access_dir_not_treated_as_enabled(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / 'access.log'; log.write_text('')
+            with patch.object(m, 'ACCESS_LOG', log), patch.object(m, 'proxy_processes', return_value=[]):
+                self.assertFalse(m.has_access_lines(('file', str(log))))
+                self.assertTrue(m.can_enable([('file', str(log))], []))
+            with patch.object(m, 'ACCESS_LOG', log), patch.object(m, 'ours_configured', return_value=True):
+                self.assertTrue(m.has_access_lines(('file', str(log))))
 
 if __name__=='__main__':unittest.main(verbosity=2)
