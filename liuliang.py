@@ -18,7 +18,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.27'
+VERSION = '1.0.28'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -2829,6 +2829,11 @@ def service_state():
     return (text[-1] if text else '') + ('' if out.returncode == 0 else '（没在运行）')
 
 
+def log_summary(found, nbad, ok):
+    """自检里「代理访问日志」那一行的 ✔/✘：找到日志来源、并且没有节点缺日志才 ✔。"""
+    return ok(found and nbad == 0)
+
+
 def doctor():
     """把“为什么看不到网站访客 IP”最常见的几种原因逐条查一遍。"""
     ok = lambda b: col('✔', G) if b else col('✘', Y)
@@ -2864,15 +2869,15 @@ def doctor():
     if sites:
         sources, notes = site_sources(config.get('access_logs') or [])
         names = [('日志文件 ' if kind == 'file' else 'systemd 日志 ') + p for kind, p in sources]
-        print(ok(bool(sources)) + ' 代理访问日志：' + ('、'.join(names) or '没找到'))
+        # 先逐个节点检查，总的一行要和下面每个节点一致：全部 ✔ 才 ✔，否则写明几个没开。
+        checks = [(pid, kind, config_log_ok(pid, kind, argv)) for pid, kind, argv in proxy_processes()]
+        nbad = sum(1 for _p, _k, r in checks if not r[0])
+        print(log_summary(bool(sources), nbad, ok) + ' 代理访问日志：' + ('、'.join(names) or '没找到') + ('（%d 个节点没开）' % nbad if nbad else ''))
         for note in notes:
             print('  原因：' + note)
-        # 每个代理（节点）分开看它的配置有没有开访问日志。
-        bad = False
-        for pid, kind, argv in proxy_processes():
-            good, why, path = config_log_ok(pid, kind, argv)
+        bad = nbad > 0
+        for pid, kind, (good, why, path) in checks:
             print(ok(good) + ' ' + PROXY_NAMES[kind] + '（进程 ' + str(pid) + '）访问日志：' + (path if good else why))
-            bad = bad or not good
         if bad:
             print('  ' + SITE_HELP)
     db = DATA / 'history-v1.db'

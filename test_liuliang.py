@@ -1240,4 +1240,11 @@ class V127Tests(unittest.TestCase):
                 m.enable_log(assume_yes=True)
             self.assertEqual(json.loads(c2.read_text())['log']['loglevel'], 'warning')
 
+class V128Tests(unittest.TestCase):
+    def test_doctor_summary_matches_nodes(self):
+        ok = lambda b: 'Y' if b else 'N'
+        self.assertEqual(m.log_summary(True, 0, ok), 'Y')
+        self.assertEqual(m.log_summary(True, 1, ok), 'N')
+        self.assertEqual(m.log_summary(False, 0, ok), 'N')
+
 if __name__=='__main__':unittest.main(verbosity=2)
