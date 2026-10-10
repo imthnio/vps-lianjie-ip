@@ -68,7 +68,11 @@ time_sync() {
     if ! rc-service chronyd status >/dev/null 2>&1 && ! rc-service ntpd status >/dev/null 2>&1; then
       apk add --no-cache chrony >/dev/null 2>&1 || return 0
       rc-update add chronyd default >/dev/null 2>&1 || true
-      timeout 20 rc-service chronyd start >/dev/null 2>&1 || true
+      # 容器（LXC/OpenVZ/NAT 小鸡）没权限改时钟，chronyd 起不来：撤掉自启，时间由母鸡负责。
+      if ! timeout 20 rc-service chronyd start >/dev/null 2>&1; then
+        rc-update del chronyd default >/dev/null 2>&1 || true
+        echo '这台是容器，不能自己对时（时间跟着母鸡走），已跳过'
+      fi
     fi
   elif [ -d /run/systemd/system ]; then
     for _u in chronyd chrony ntp ntpd systemd-timesyncd; do
@@ -108,7 +112,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.23'
+VERSION = '1.0.24'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -396,10 +400,11 @@ def scan_ips(c, rows, config, opened, now, hasweb=True):
 
 
 def short(text, width=10):
+    # 截断用两个点 '..'（各占 1 格），不用 '…'：它在有的终端占 1 格、有的占 2 格，会让表格对不齐。
     text = str(text); out = ''
     for ch in text:
-        if ww(out + ch) > width - (1 if ww(text) > width else 0):
-            return out + '…'
+        if ww(out + ch) > width - (2 if ww(text) > width else 0):
+            return out + '..'
         out += ch
     return out
 
@@ -877,13 +882,8 @@ def parse_reset_day(text):
 
 def ask_reset_day(current=1):
     """问一次每月几号重置流量，直接回车 = 当前值（默认 1 号）。输错了再问。"""
-    if not sys.stdin.isatty():
-        return current
     while True:
-        try:
-            got = input('服务商每月几号重置流量？输入 1-31（直接回车 = %d 号；31 号遇到小月按月底算）：' % current).strip()
-        except (EOFError, KeyboardInterrupt):
-            return current
+        got = ask('服务商每月几号重置流量？输入 1-31（直接回车 = %d 号；31 号遇到小月按月底算）：' % current)
         if not got:
             return current
         day = parse_reset_day(got)
@@ -913,12 +913,7 @@ def ask_billing(current='both'):
     print('你的服务商怎么算流量？（看服务商后台或套餐说明）')
     for i, n in enumerate(names, 1):
         print('  %d) %s%s' % (i, n, '  ← 直接回车' if keys[i-1] == current else ''))
-    if not sys.stdin.isatty():
-        return current
-    try:
-        got = input('输入序号：').strip()
-    except (EOFError, KeyboardInterrupt):
-        got = ''
+    got = ask('输入序号：')
     return keys[int(got) - 1] if got in ('1', '2', '3', '4') else current
 
 
@@ -1903,6 +1898,30 @@ ACCESS_MAX_SMALL = 5 * 1024 * 1024
 
 
 # 名词小词典：MemTotal = 这台机器的总内存（/proc/meminfo 里那一行，单位 KB）。
+# 名词小词典：tty = 你正在打字的那个终端。用 curl … | sh 安装时，标准输入是下载的脚本，
+# 不是键盘，所以提问要直接去终端（/dev/tty）读；连终端都没有时才用默认值，并说一声。
+def has_tty():
+    try:
+        with open('/dev/tty'):
+            return True
+    except OSError:
+        return False
+
+
+def ask(prompt, default=''):
+    """问一个问题，从终端读一行；没有终端就打印提示、返回默认值。"""
+    try:
+        with open('/dev/tty', 'r+') as tty:
+            tty.write(prompt); tty.flush()
+            line = tty.readline()
+            return line.strip() if line else default
+    except OSError:
+        print(prompt + '（没有终端可以输入，用默认值）')
+        return default
+    except KeyboardInterrupt:
+        return default
+
+
 def mem_mb():
     """返回机器总内存（MB），读不到返回 0。"""
     try:
@@ -2011,6 +2030,7 @@ def proxy_log(pid, kind, argv):
                               '访问日志里选 ./access.log 并保存重启，liuliang 会自动读取'), files, cwd, log
             return None, name + ' 把访问记录关掉了（log.access 为 none），所以看不到访问了哪些网站', files, cwd, log
     if target:
+        # 文件还不存在也先记下（代理第一次写时才创建）；「是不是真有访问记录」由 has_access_lines 判断。
         return ('file', os.path.join(cwd, target)), '', files, cwd, log
     # 配置里没写日志文件：访问记录输出到终端。看终端输出最后去了哪里。
     out = output_target(pid, fd) or output_target(pid, 3 - fd)
@@ -2029,6 +2049,26 @@ def proxy_log(pid, kind, argv):
     if unit and shutil.which('journalctl') and systemd_running():
         return ('journal', unit), '', files, cwd, log
     return None, name + ' 没有把访问记录保存下来（没写进文件，也没有 systemd 日志）', files, cwd, log
+
+
+def has_access_lines(source, kind=None):
+    """日志里真的有访问记录才算能读到：文件要存在且最近 256KB 里有访问行；
+    systemd 日志看最近 300 行。只配了路径、或者只有 warning 报错行，都不算。"""
+    parser = AccessParser()
+    # liuliang 自己打开的那个日志：文件在就算开好了（刚开时还没人上网，里面是空的），重复运行不会再改一遍。
+    if source[0] == 'file' and source[1] == str(ACCESS_LOG) and os.path.isfile(source[1]):
+        return True
+    try:
+        if source[0] == 'file':
+            with open(source[1], 'rb') as f:
+                f.seek(0, 2); f.seek(max(0, f.tell() - (256 << 10)))
+                text = f.read().decode('utf-8', 'replace')
+        else:
+            text = subprocess.run(['timeout', '10', 'journalctl', '-u', source[1], '-n', '300', '--no-pager', '-o', 'cat'],
+                                  capture_output=True, text=True).stdout
+    except OSError:
+        return False
+    return any(parser.feed(line) for line in text.splitlines())
 
 
 def site_sources(extra=()):
@@ -2051,7 +2091,8 @@ def site_sources(extra=()):
 
 def can_enable(sources, notes):
     """读不到访问记录、又不是面板管理的（面板要在面板里开），--enable-log 能帮上忙。"""
-    return not sources and (not notes or any('面板' not in n for n in notes))
+    # 只要有一个来源里真的有访问记录就不用开；只是配了路径/只有报错行的不算。
+    return not any(has_access_lines(x) for x in sources) and (not notes or any('面板' not in n for n in notes))
 
 
 def check_config(kind, exe, argv, cwd):
@@ -2098,7 +2139,7 @@ def enable_log(assume_yes=False):
     for pid, kind, argv in procs:
         source, note, files, cwd, _log = proxy_log(pid, kind, argv)
         name = PROXY_NAMES[kind]
-        if source:
+        if source and has_access_lines(source, kind):
             print('✔ ' + name + ' 的访问日志已经能读到（' + source[1] + '），不用改。')
             continue
         if panel_name(pid, argv):
@@ -2117,11 +2158,8 @@ def enable_log(assume_yes=False):
     for _pid, kind, _argv, _cwd, target in todo:
         print('将修改 ' + PROXY_NAMES[kind] + ' 的配置 ' + str(target) + '：打开访问日志，写到 ' + str(ACCESS_LOG) + '（会先备份原配置）')
     print('改完要重启一下代理：正在使用的人会断开几秒钟，然后自动重连。')
-    if not assume_yes and sys.stdin.isatty():
-        try:
-            answer = input('确定要继续吗？输入 y 回车继续：').strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            answer = ''
+    if not assume_yes and has_tty():
+        answer = ask('确定要继续吗？输入 y 回车继续：').lower()
         if answer not in ('y', 'yes'):
             print('已取消，什么都没改。')
             return
@@ -2637,12 +2675,9 @@ start_pre() { /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py --once; }
             print('  现在还读不到代理的访问记录，所以看不到每个 IP 访问了哪些网站。')
             # 默认打开（推荐）：直接回车 = 打开；输入 n = 不打开，并记住这个选择，以后更新不再问。
             answer = 'y' if log_choice == 'yes' else 'n'
-            if not explicit_log and sys.stdin.isatty():
+            if not explicit_log:
                 tip = '（推荐，直接回车）' if log_choice == 'yes' else '（这台内存小，推荐不开，直接回车跳过）'
-                try:
-                    got = input('  要自动打开代理访问日志吗？会先备份代理配置、代理重启几秒' + tip + ' [y/n]：').strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    got = ''
+                got = ask('  要自动打开代理访问日志吗？会先备份代理配置、代理重启几秒' + tip + ' [y/n]：').lower()
                 if got in ('y', 'yes', 'n', 'no'):
                     answer = got[0]
                     config['log'] = 'yes' if answer == 'y' else 'no'
@@ -2756,6 +2791,7 @@ def main():
     parser.add_argument('--ports', help='高级：手动指定统计端口，如 443,8443（默认自动检测）')
     parser.add_argument('--geo', choices=['yes','no'], help='高级：--geo no 关闭城市查询（默认开启）')
     parser.add_argument('--realip', choices=['yes','no'], help='高级：--realip no 关闭 Cloudflare 后真实访客 IP 识别（默认开启）')
+    parser.add_argument('--wide', action='store_true', help='宽表：多显示运营商、近24小时等栏（电脑上看）')
     parser.add_argument('--web', action='store_true', help='只看网站访客（有网站流量就显示，不设门槛）')
     parser.add_argument('--all', action='store_true', help='显示全部 IP：包括未达门槛的和 Cloudflare 节点 IP')
     parser.add_argument('--doctor', action='store_true', help='检查安装状态，排查“看不到访客 IP”')
@@ -2815,7 +2851,7 @@ def main():
     elif args.ip:
         site_report(args.ip, config, show_all=args.all)
     else:
-        report(config, web_only=args.web, show_all=args.all)
+        report(config, web_only=args.web, show_all=args.all, wide=args.wide)
 
 
 from datetime import datetime,timedelta,timezone
@@ -2831,7 +2867,7 @@ def ww(s): return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_a
 def cell(s,n): return str(s)+' '*(n-ww(s))
 def diff(c,ip,a,b,col='bytes'):
  return c.execute(f'select coalesce(sum({col}),0) from traffic where ip=? and ts>? and ts<=?',(ip,a,b)).fetchone()[0]
-def report(config, web_only=False, show_all=False):
+def report(config, web_only=False, show_all=False, wide=True):
  DB=str(DATA / "history-v1.db")
  now=time.time();print(col('端口 '+','.join(map(str,config['ports']))+' · 近7天'+('网站访客' if web_only else '连接'),B,C))
  if not os.path.exists(DB):
@@ -2863,7 +2899,10 @@ def report(config, web_only=False, show_all=False):
     d=diff(c,ip,now-86400,now,'web') if hasweb else 0;w=wb
    # 节点流量 800KB 起显示；网站（文件分享）访客上传/下载 20KB 起就显示。
    # 节点流量（总流量减网站部分）大于 0 且达到门槛就显示；纯网站访客仍要 20KB 起，挡掉扫描器。
-   elif not show_all and not (w-wb>0 and w-wb>=limit) and wb<WEB_MIN_BYTES: continue
+   # 设了 min_kb：只看表格里「7天」那一栏的数字（进+出合计，1KB=1024 字节），低于就藏，和显示的完全一致。
+   elif not show_all and limit and w<limit: continue
+   # 没设门槛：有节点流量就显示；纯网站访客仍要 20KB 起，挡掉扫描器。
+   elif not show_all and not limit and not w-wb>0 and wb<WEB_MIN_BYTES: continue
    kind='CF节点' if cf else '+'.join(k for k,ok in (('节点',w-wb>=WEB_MIN_BYTES),('网站',wb>=WEB_MIN_BYTES or web_only and wb>0)) if ok) or ('网站' if wb>0 and wb>=w-wb else '节点')
    # 最后上网 = 最后打开网站时间 和 最后一个数据包时间 里更晚的那个：
    # 长连接（看视频、下载）一直有数据时，时间也会跟着走，不会停在刚连上那一刻。
@@ -2887,21 +2926,35 @@ def report(config, web_only=False, show_all=False):
   h=['#','IP','运营商','城市','24小时','7天','最后上网' if not web_only else '最近访问']+(['访问'] if showkind else []);N=[2,15,8,6,7,7,11]+([4] if showkind else [])
   vals=lambda n,ip,net,pl,d,w,ls,kind,mark:[n,ip,short(net),short(pl,10),sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%m-%d %H:%M')+mark]+([kind] if showkind else [])
   for n,r in enumerate(rows,1):N=[max(N[i],ww(x)) for i,x in enumerate(vals(n,*r[:6],r[7],r[8]))]
-  def line(a,m,b):return a+m.join('─'*(n+2) for n in N)+b
-  print(line('┌','┬','┐'));print(col('│ '+' │ '.join(cell(x,N[i]) for i,x in enumerate(h))+' │',B,C));print(line('├','┼','┤'))
-  for n,(ip,net,pl,d,w,ls,age,kind,mark) in enumerate(rows,1):
-   v=vals(n,ip,net,pl,d,w,ls,kind,mark);out=[]
-   for i,x in enumerate(v):
-    st=[D,X] if d<=0 and w<=0 or kind=='CF节点' else ([B,G] if i==1 and d>0 else [])
-    if i==4 and d>=100*1024**2 or i==5 and w>=1024**3:st=[B,Y]
-    if i==6:st=[B,G] if age<=3600 else ([D,X] if age>259200 else [])
-    out.append(col(cell(x,N[i]),*st))
-   print('│ '+' │ '.join(out)+' │')
-  real=[r for r in rows if r[7]!='CF节点']
-  print(line('└','┴','┘'));a=sum(1 for r in real if r[3]>0 or r[4]>0);print('合计：IP 数 %d · 有流量 IP 数 %d · 近24小时总流量 %s · 近7天总流量 %s'%(len(real),a,sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))))
+  if wide:
+   def line(a,m,b):return a+m.join('─'*(n+2) for n in N)+b
+   print(line('┌','┬','┐'));print(col('│ '+' │ '.join(cell(x,N[i]) for i,x in enumerate(h))+' │',B,C));print(line('├','┼','┤'))
+   for n,(ip,net,pl,d,w,ls,age,kind,mark) in enumerate(rows,1):
+    v=vals(n,ip,net,pl,d,w,ls,kind,mark);out=[]
+    for i,x in enumerate(v):
+     st=[D,X] if d<=0 and w<=0 or kind=='CF节点' else ([B,G] if i==1 and d>0 else [])
+     if i==4 and d>=100*1024**2 or i==5 and w>=1024**3:st=[B,Y]
+     if i==6:st=[B,G] if age<=3600 else ([D,X] if age>259200 else [])
+     out.append(col(cell(x,N[i]),*st))
+    print('│ '+' │ '.join(out)+' │')
+   real=[r for r in rows if r[7]!='CF节点']
+   print(line('└','┴','┘'));a=sum(1 for r in real if r[3]>0 or r[4]>0);print('合计：IP 数 %d · 有流量 IP 数 %d · 近24小时总流量 %s · 近7天总流量 %s'%(len(real),a,sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))))
+  else:
+   real=[r for r in rows if r[7]!='CF节点']
+   # 窄表（默认）：只放 序号、IP、7天流量、最后上网、城市，约 45 格宽，手机竖屏也能一行看完。
+   # 运营商、近24小时在 liuliang --wide 里看。
+   K=[2,15,7,12,6];hc=['#','IP','7天','最后上网' if not web_only else '最近访问','城市']
+   cv=lambda n,r:[str(n),r[0],sz(r[4]),datetime.fromtimestamp(r[5],Z).strftime('%m-%d %H:%M')+r[8],short(r[2],6)]
+   for n,r in enumerate(rows,1):K=[max(K[i],ww(x)) for i,x in enumerate(cv(n,r))]
+   print(col(' '.join(cell(x,K[i]) for i,x in enumerate(hc)).rstrip(),B,C))
+   for n,r in enumerate(rows,1):
+    st=[D,X] if r[4]<=0 or r[7]=='CF节点' else []
+    print(col(' '.join(cell(x,K[i]) for i,x in enumerate(cv(n,r))).rstrip(),*st))
+   print('合计 %d 个 IP · 24小时 %s · 7天 %s'%(len(real),sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))))
   # 服务商口径：整块网卡的进/出用量，按 config.json 里的 billing 显示。
   for t in billing_lines(config,c,now):print(col(t,D))
-  if any(r[8] for r in rows):print(col('最后上网：这个 IP 最后一次打开网站/App 或最后有数据来往的时间（取更晚的，每分钟更新）。带 * 的读不到它打开网站的记录（代理没开日志，或是网站访客），'
+  if any(r[8] for r in rows) and not wide:print(col('带 * = 读不到打开网站的记录，按最后有数据的时间（可能偏晚）',D))
+  if any(r[8] for r in rows) and wide:print(col('最后上网：这个 IP 最后一次打开网站/App 或最后有数据来往的时间（取更晚的，每分钟更新）。带 * 的读不到它打开网站的记录（代理没开日志，或是网站访客），'
    '手机放着不用、后台心跳也算数据，所以可能比实际晚',D))
   if note:print(col(note,D))
   picks=[r[0] for r in rows]

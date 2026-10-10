@@ -1029,7 +1029,57 @@ class V123Tests(unittest.TestCase):
             self.assertNotIn('175.19.1.1', self._run(temp))
             self.assertIn('175.19.1.1', self._run(temp, {'scan_tiny_kb': 0}))
     def test_short(self):
-        self.assertEqual(m.short('No.31,Jin-rong Street', 10), 'No.31,Jin…')
+        self.assertEqual(m.short('No.31,Jin-rong Street', 10), 'No.31,Ji..')
         self.assertEqual(m.short('中国联通'), '中国联通')
+
+class V124Tests(unittest.TestCase):
+    def _run(self, temp, cfg=None, wide=True):
+        out = io.StringIO()
+        with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+            m.report(dict({'ports': [443], 'geo': True}, **(cfg or {})), wide=wide)
+        return out.getvalue()
+    def _two(self, temp):
+        db = m.open_db(Path(temp) / 'history-v1.db'); now = m.time.time()
+        cur = {('up4', '1.1.1.1'): (400*1024, None), ('down4', '1.1.1.1'): (414*1024, None),
+               ('up4', '2.2.2.2'): (300*1024, None), ('down4', '2.2.2.2'): (365*1024, None),
+               ('web4', '2.2.2.2'): (665*1024, None)}
+        m.save_sample(db, cur, now); db.close()
+    def test_min_kb_uses_shown_7d_number(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self._two(temp); text = self._run(temp, {'min_kb': 800})
+            self.assertIn('1.1.1.1', text); self.assertIn('814 KB', text)   # 814KB ≥ 800 留下
+            self.assertNotIn('2.2.2.2', text)                               # 665KB < 800 藏起（网站访客也一样）
+    def test_compact_fits_phone(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self._two(temp)
+            db = sqlite3.connect(str(Path(temp) / 'history-v1.db'))
+            db.execute("update clients set city='No.31,Jin-rong Str',isp='Jilin Province Very Long ISP Name'"); db.commit(); db.close()
+            text = self._run(temp, wide=False)
+            rows = [l for l in text.splitlines() if l[:1].isdigit() or l.startswith('#')]
+            self.assertTrue(rows)
+            for l in rows:
+                self.assertLessEqual(m.ww(l), 50, l)
+            self.assertNotIn('…', text)
+    def test_wide_cells_aligned(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self._two(temp)
+            db = sqlite3.connect(str(Path(temp) / 'history-v1.db'))
+            db.execute("update clients set city='长春市朝阳区很长的地名',isp='Jilin Province Very Long ISP Name'"); db.commit(); db.close()
+            lines = [l for l in self._run(temp).splitlines() if l.startswith('│')]
+            self.assertEqual(len({m.ww(l) for l in lines}), 1)
+    def test_access_lines_detection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            f = Path(temp) / 'error.log'
+            f.write_text('2026/10/10 12:00:00 [Warning] core: something\n')
+            self.assertFalse(m.has_access_lines(('file', str(f))))           # 只有 warning：不算能读到
+            self.assertTrue(m.can_enable([('file', str(f))], []))            # 所以要提供打开
+            f.write_text('2026/10/10 12:00:00 from 1.2.3.4:5678 accepted tcp:www.youtube.com:443 [in -> out]\n')
+            self.assertTrue(m.has_access_lines(('file', str(f))))
+            self.assertFalse(m.can_enable([('file', str(f))], []))
+            self.assertFalse(m.has_access_lines(('file', str(Path(temp) / 'none.log'))))
+    def test_ask_without_tty_uses_default(self):
+        with patch('builtins.open', side_effect=OSError), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(m.ask('问？', 'd'), 'd')
+        self.assertIn('默认值', out.getvalue())
 
 if __name__=='__main__':unittest.main(verbosity=2)
