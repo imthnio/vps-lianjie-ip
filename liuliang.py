@@ -18,7 +18,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.22'
+VERSION = '1.0.23'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -258,6 +258,60 @@ def isp_display(raw):
     if not s:
         return '未解析'
     return s[:18]
+
+
+# 表格里运营商一栏最多显示这么宽（中文算 2），太长的截断加 …，让表格窄一点。
+# 名词小词典：扫描 = 服务商或网上的机器人挨个探测端口，每个 IP 只来几 KB、从不真正上网；
+# /16 = IP 的前两段相同（如 175.30.x.x），同一家机房/运营商的一批地址。
+# 判定规则（门槛都可在 /etc/liuliang/config.json 里改，填 0 关闭该条）：
+#   1. scan_tiny_kb（默认 16）：近7天总共不到这么多 KB；
+#   2. scan_kb（默认 64）：不到这么多 KB，且只有一个方向有数据（另一方向 0 B）；
+#   3. scan_batch（默认 5）个以上同一 /16 的新 IP，在 scan_window（默认 60）秒内先后出现，
+#      每个都不到 scan_batch_kb（默认 50）KB：整批算扫描。
+# 三条都只针对「访问日志里没打开过网站、也不是网站访客」的 IP，真人用户不会被藏。
+def scan_ips(c, rows, config, opened, now, hasweb=True):
+    kb = lambda key, d: int(config.get(key, d) or 0) * 1024
+    tiny, small, batch_kb = kb('scan_tiny_kb', 16), kb('scan_kb', 64), kb('scan_batch_kb', 50)
+    batch, window = int(config.get('scan_batch', 5) or 0), float(config.get('scan_window', 60) or 0)
+    since = now - 604800
+    # 每个 IP 两个方向的字节（nft 计数里 up=用户发来，down=发给用户）。
+    dirs = {}
+    for name, ip, n in c.execute('SELECT name,ip,bytes FROM counters'):
+        d = dirs.setdefault(ip, [0, 0]); d[0 if name.startswith('up') else 1] += n if name[:2] in ('up', 'do') else 0
+    cand, bad = [], set()
+    for r in rows:
+        ip, w = r[0], r[4]
+        if opened.get(ip) or (hasweb and diff(c, ip, since, now, 'web') > 0):
+            continue
+        d = dirs.get(ip)
+        if (tiny and w < tiny) or (small and w < small and d and min(d) == 0 and max(d) > 0):
+            bad.add(ip); continue
+        cand.append(r)
+    if batch and window:
+        groups = {}
+        for r in cand:
+            if r[4] >= batch_kb or ':' in r[0]:
+                continue
+            first = c.execute('SELECT min(ts) FROM traffic WHERE ip=?', (r[0],)).fetchone()[0] or now
+            groups.setdefault('.'.join(r[0].split('.')[:2]), []).append((first, r[0]))
+        for items in groups.values():
+            items.sort()
+            j = 0
+            for i in range(len(items)):
+                while items[i][0] - items[j][0] > window:
+                    j += 1
+                if i - j + 1 >= batch:
+                    bad.update(ip for _t, ip in items[j:i + 1])
+    return bad
+
+
+def short(text, width=10):
+    text = str(text); out = ''
+    for ch in text:
+        if ww(out + ch) > width - (1 if ww(text) > width else 0):
+            return out + '…'
+        out += ch
+    return out
 
 
 def collect(config, sniffer=None, sites=None):
@@ -2724,9 +2778,15 @@ def report(config, web_only=False, show_all=False):
    # 最后上网 = 最后打开网站时间 和 最后一个数据包时间 里更晚的那个：
    # 长连接（看视频、下载）一直有数据时，时间也会跟着走，不会停在刚连上那一刻。
    mark='' if web_only or opened.get(ip) else '*';ls=max(float(opened.get(ip) or 0),float(ls))
-   age=max(0,now-float(ls));place=' '.join(x for x in(co,ci) if x) or ('Cloudflare' if cf else '未解析');rows.append((ip,isp_display(isp),place,d,w,ls,age,kind,mark))
+   age=max(0,now-float(ls));place=ci or co or ('Cloudflare' if cf else '未解析');rows.append((ip,isp_display(isp),place,d,w,ls,age,kind,mark))
   rows.sort(key=lambda r:-float(r[5]))
+  # 疑似扫描 IP 不显示、不计入合计（规则见 scan_ips；liuliang --all 全显示）。
+  scanhidden=0
+  if not show_all and not web_only:
+   bad=scan_ips(c,[r for r in rows if r[7]!='CF节点'],config,opened,now,hasweb)
+   scanhidden=len(bad);rows=[r for r in rows if r[0] not in bad]
   note=('已隐藏 %d 个 Cloudflare 节点 IP（网站开了橙色云 / Tunnel，真实访客已单独列出；liuliang --all 显示）'%cfhidden) if cfhidden else ''
+  if scanhidden:note=(note+'\n' if note else '')+'已隐藏 %d 个疑似扫描 IP（几 KB、没上过网，不计入合计），查看：liuliang --all'%scanhidden
   if not rows:
    print('(近7天没有网站访客)' if web_only else ('(近7天无达到 %dKB 的流量记录'%(limit//1024) if limit else '(近7天没有流量记录')+('，也没有网站访客' if config.get('web') else '')+')')
    if note:print(col(note,D))
@@ -2734,8 +2794,8 @@ def report(config, web_only=False, show_all=False):
     print('只看到 Cloudflare 的 IP、没有真实访客：运行 liuliang --doctor 排查')
    return
   showkind=web_only is False and any(r[7]!='节点' for r in rows)
-  h=['#','IP','运营商','城市','近24小时','近7天','最后上网' if not web_only else '最近访问']+(['访问'] if showkind else []);N=[2,15,10,8,10,10,19]+([4] if showkind else [])
-  vals=lambda n,ip,net,pl,d,w,ls,kind,mark:[n,ip,net,pl,sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%Y-%m-%d %H:%M:%S')+mark]+([kind] if showkind else [])
+  h=['#','IP','运营商','城市','24小时','7天','最后上网' if not web_only else '最近访问']+(['访问'] if showkind else []);N=[2,15,8,6,7,7,11]+([4] if showkind else [])
+  vals=lambda n,ip,net,pl,d,w,ls,kind,mark:[n,ip,short(net),short(pl,10),sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%m-%d %H:%M')+mark]+([kind] if showkind else [])
   for n,r in enumerate(rows,1):N=[max(N[i],ww(x)) for i,x in enumerate(vals(n,*r[:6],r[7],r[8]))]
   def line(a,m,b):return a+m.join('─'*(n+2) for n in N)+b
   print(line('┌','┬','┐'));print(col('│ '+' │ '.join(cell(x,N[i]) for i,x in enumerate(h))+' │',B,C));print(line('├','┼','┤'))

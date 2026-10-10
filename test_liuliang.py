@@ -759,7 +759,7 @@ class SiteTests(unittest.TestCase):
             text = out.getvalue()
             opened = m.datetime.fromtimestamp(now - 7200, m.Z).strftime('%Y-%m-%d %H:%M:%S')
             self.assertIn('最后上网', text)
-            last = m.datetime.fromtimestamp(now, m.Z).strftime('%Y-%m-%d %H:%M:%S')
+            last = m.datetime.fromtimestamp(now, m.Z).strftime('%m-%d %H:%M')
             self.assertRegex(text, r'8\.8\.8\.8 .*' + last + r' +│')        # 取更晚的数据包时间
             self.assertRegex(text, r'1\.1\.1\.1 .*\* │')                 # 没有网站记录：退回并标 *
             self.assertIn(opened, self._site_report(temp))
@@ -883,7 +883,7 @@ class V119Tests(unittest.TestCase):
     def test_default_shows_small_node_traffic(self):
         with tempfile.TemporaryDirectory() as temp:
             now=m.time.time(); db=m.open_db(Path(temp)/'history-v1.db')
-            m.save_sample(db,{('up4','5.5.5.5'):(9158, None)},now); db.close()
+            m.save_sample(db,{('up4','5.5.5.5'):(200*1024, None)},now); db.close()
             out=io.StringIO()
             with patch.object(m,'DATA',Path(temp)),contextlib.redirect_stdout(out):m.report({'ports':[443],'geo':True})
             self.assertIn('5.5.5.5',out.getvalue())
@@ -921,7 +921,7 @@ class V120Tests(unittest.TestCase):
         m.save_nic(db, now-300, 'eth0', (1000, 3000))      # 第一次只记基线
         m.save_nic(db, now-200, 'eth0', (3000, 4000))      # +2000 收 +1000 发
         m.save_nic(db, now-100, 'eth0', (500, 200))        # 重启归零：从 0 算起
-        m.save_sample(db,{('up4','5.5.5.5'):(9158, None)},now); db.commit(); db.close()
+        m.save_sample(db,{('up4','5.5.5.5'):(200*1024, None)},now); db.commit(); db.close()
     def test_nic_reset_and_modes(self):
         with tempfile.TemporaryDirectory() as temp:
             self._nicdb(temp)
@@ -975,10 +975,61 @@ class V122Tests(unittest.TestCase):
             self.assertEqual(m.nic_usage(db, start, now + 1), (600, 1000))
             m.save_nic(db, now, 'eth0', (200, 400))                   # 清理不会删掉本周期（<40 天）
             self.assertEqual(db.execute('select count(*) from nic').fetchone()[0], 4)
-            m.save_sample(db, {('up4', '5.5.5.5'): (9158, None)}, now); db.commit(); db.close()
+            m.save_sample(db, {('up4', '5.5.5.5'): (200*1024, None)}, now); db.commit(); db.close()
             out = io.StringIO()
             with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
                 m.report({'ports': [443], 'geo': True, 'reset_day': 1})
             self.assertIn('本周期', out.getvalue())
+
+class V123Tests(unittest.TestCase):
+    def ts(self, *a):
+        return m.datetime(*a, tzinfo=m.Z).timestamp()
+    def test_reset_day_starts_on_the_day(self):
+        a, b = m.cycle_bounds(self.ts(2026, 10, 10, 15), 10)
+        self.assertEqual(m.datetime.fromtimestamp(a, m.Z).strftime('%m-%d'), '10-10')
+        self.assertEqual(m.datetime.fromtimestamp(b - 1, m.Z).strftime('%m-%d'), '11-09')
+    def _db(self, temp):
+        return m.open_db(Path(temp) / 'history-v1.db')
+    def _run(self, temp, cfg=None, show_all=False):
+        out = io.StringIO()
+        with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+            m.report(dict({'ports': [443], 'geo': True}, **(cfg or {})), show_all=show_all)
+        return out.getvalue()
+    def test_batch_same_16_hidden(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = self._db(temp); now = m.time.time()
+            for i in range(6):   # 6 个 175.30.x，40 秒内出现，每个 30KB，两个方向都有
+                m.save_sample(db, {('up4', '175.30.48.%d' % i): (15*1024, None), ('down4', '175.30.48.%d' % i): (15*1024, None)}, now - 40 + i * 8)
+            m.save_sample(db, {('up4', '9.9.9.9'): (300*1024, None), ('down4', '9.9.9.9'): (900*1024, None)}, now)
+            db.close()
+            text = self._run(temp)
+            self.assertNotIn('175.30.48.', text); self.assertIn('9.9.9.9', text)
+            self.assertIn('已隐藏 6 个疑似扫描 IP', text); self.assertIn('IP 数 1', text)
+            self.assertIn('175.30.48.1', self._run(temp, show_all=True))
+            self.assertIn('175.30.48.1', self._run(temp, {'scan_batch': 0}))   # 可关闭
+    def test_batch_spread_out_is_kept(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = self._db(temp); now = m.time.time()
+            for i in range(5):   # 同一 /16 但每隔 5 分钟一个：不算一批
+                m.save_sample(db, {('up4', '139.212.0.%d' % i): (20*1024, None), ('down4', '139.212.0.%d' % i): (20*1024, None)}, now - 3000 + i * 300)
+            db.close()
+            self.assertIn('139.212.0.4', self._run(temp))
+    def test_one_direction_zero_hidden(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = self._db(temp); now = m.time.time()
+            # 119.48.1.1 只有进、出 0 B；8.8.4.4 两个方向都有（同一次采样，和真实 nft 一样）
+            m.save_sample(db, {('up4', '119.48.1.1'): (46*1024, None), ('up4', '8.8.4.4'): (30*1024, None), ('down4', '8.8.4.4'): (30*1024, None)}, now)
+            db.close()
+            text = self._run(temp)
+            self.assertNotIn('119.48.1.1', text); self.assertIn('8.8.4.4', text)
+    def test_tiny_hidden(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = self._db(temp); now = m.time.time()
+            m.save_sample(db, {('up4', '175.19.1.1'): (3*1024, None), ('down4', '175.19.1.1'): (3*1024, None)}, now); db.close()
+            self.assertNotIn('175.19.1.1', self._run(temp))
+            self.assertIn('175.19.1.1', self._run(temp, {'scan_tiny_kb': 0}))
+    def test_short(self):
+        self.assertEqual(m.short('No.31,Jin-rong Street', 10), 'No.31,Jin…')
+        self.assertEqual(m.short('中国联通'), '中国联通')
 
 if __name__=='__main__':unittest.main(verbosity=2)
