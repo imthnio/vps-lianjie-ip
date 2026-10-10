@@ -108,7 +108,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.21'
+VERSION = '1.0.22'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -753,7 +753,8 @@ def save_nic(c, now, dev=None, counts=None):
         if drx > 0 or dtx > 0:
             c.execute('INSERT INTO nic(ts,rx,tx) VALUES(?,?,?)', (now, drx, dtx))
     c.execute("INSERT OR REPLACE INTO metadata VALUES('nic',?)", (json.dumps({'dev': dev, 'rx': rx, 'tx': tx}),))
-    c.execute('DELETE FROM nic WHERE ts<?', (now - 8 * 86400,))
+    # 网卡数据很小，留 40 天，够覆盖一整个月的计费周期。
+    c.execute('DELETE FROM nic WHERE ts<?', (now - 40 * 86400,))
 
 
 def nic_usage(c, since, until):
@@ -764,6 +765,24 @@ def nic_usage(c, since, until):
         return (0, 0)
 
 
+# 名词小词典：计费周期 = 服务商每月重置流量的那一天到下个月同一天；
+# 重置日是 31 号而这个月只有 30 天时，就按这个月最后一天算（月底对齐）。
+def cycle_bounds(ts, day):
+    """返回 ts 所在计费周期的 (开始, 结束) 时间戳，按北京时间（和表格一致）。"""
+    import calendar
+    day = min(max(int(day or 1), 1), 31)
+    def start_of(y, m):
+        return datetime(y, m, min(day, calendar.monthrange(y, m)[1]), tzinfo=Z)
+    now = datetime.fromtimestamp(ts, Z)
+    y, m = now.year, now.month
+    start = start_of(y, m)
+    if now < start:
+        y, m = (y - 1, 12) if m == 1 else (y, m - 1)
+        start = start_of(y, m)
+    ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
+    return start.timestamp(), start_of(ny, nm).timestamp()
+
+
 def billing_figure(mode, rx, tx):
     return {'both': rx + tx, 'out': tx, 'max': max(rx, tx)}[mode]
 
@@ -771,13 +790,16 @@ def billing_figure(mode, rx, tx):
 def billing_lines(config, c, now):
     """合计下面那几行：服务商口径的整块网卡用量。"""
     d = nic_usage(c, now - 86400, now); w = nic_usage(c, now - 604800, now)
-    if not any(d + w):
+    # 本计费周期：从上一个重置日到现在。
+    a, b = cycle_bounds(now, config.get('reset_day', 1)); cyc = nic_usage(c, a, now)
+    if not any(d + w + cyc):
         return []
+    span = '本周期 %s ~ %s' % (datetime.fromtimestamp(a, Z).strftime('%m-%d'), datetime.fromtimestamp(b - 1, Z).strftime('%m-%d'))
     mode = config.get('billing', 'both')
     if mode in BILLING:
-        out = ['服务商口径（%s）整块网卡用量：近24小时 %s · 近7天 %s' % (BILLING[mode], sz(billing_figure(mode, *d)), sz(billing_figure(mode, *w)))]
+        out = ['服务商口径（%s）整块网卡用量：%s 共 %s · 近24小时 %s · 近7天 %s' % (BILLING[mode], span, sz(billing_figure(mode, *cyc)), sz(billing_figure(mode, *d)), sz(billing_figure(mode, *w)))]
     else:
-        out = ['整块网卡用量 近24小时 / 近7天：' + ' · '.join('%s %s / %s' % (BILLING[k], sz(billing_figure(k, *d)), sz(billing_figure(k, *w))) for k in ('out', 'both', 'max')),
+        out = ['整块网卡用量（%s）：' % span + ' · '.join('%s %s' % (BILLING[k], sz(billing_figure(k, *cyc))) for k in ('out', 'both', 'max')),
                '和服务商后台的用量对一下，对得上的那个就是你的计费方式；改：liuliang --billing']
     out.append('网卡用量包括所有流量（SSH、系统更新、代理去网上取数据），所以比上面每个 IP 的合计大；统计从装好 liuliang 后开始')
     return out
@@ -791,6 +813,43 @@ def set_billing(value=None):
     config['billing'] = value
     CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n')
     print('已设置计费方式：' + BILLING.get(value, '不确定（三种都显示）'))
+
+
+def parse_reset_day(text):
+    """每月重置日：1-31 的整数，其他返回 None。"""
+    text = str(text).strip()
+    return int(text) if re.fullmatch(r'[0-9]{1,2}', text) and 1 <= int(text) <= 31 else None
+
+
+def ask_reset_day(current=1):
+    """问一次每月几号重置流量，直接回车 = 当前值（默认 1 号）。输错了再问。"""
+    if not sys.stdin.isatty():
+        return current
+    while True:
+        try:
+            got = input('服务商每月几号重置流量？输入 1-31（直接回车 = %d 号；31 号遇到小月按月底算）：' % current).strip()
+        except (EOFError, KeyboardInterrupt):
+            return current
+        if not got:
+            return current
+        day = parse_reset_day(got)
+        if day:
+            return day
+        print('请输入 1 到 31 之间的数字')
+
+
+def set_reset_day(value=None):
+    """liuliang --reset-day N：改每月重置日；不带数字时一步一步问。"""
+    config = json.loads(CONFIG.read_text())
+    if value is None:
+        day = ask_reset_day(int(config.get('reset_day') or 1))
+    else:
+        day = parse_reset_day(value)
+        if not day:
+            raise ValueError('重置日要是 1 到 31 之间的数字')
+    config['reset_day'] = day
+    CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n')
+    print('已设置：每月 %d 号重置流量' % day)
 
 
 def ask_billing(current='both'):
@@ -1486,7 +1545,7 @@ def follow_ports(config, seen):
     # 用户在后台运行期间用命令改过的选项（计费方式、日志）以硬盘上的为准，不要被旧值盖掉。
     try:
         disk = json.loads(CONFIG.read_text())
-        for key in ('billing', 'log'):
+        for key in ('billing', 'log', 'reset_day'):
             if key in disk:
                 config[key] = disk[key]
     except (OSError, ValueError):
@@ -2457,6 +2516,8 @@ def install(args):
         config['log'] = log_choice
     # billing：服务商计费方式。已经选过就一直保留（更新不再问），没选过默认进+出。
     config['billing'] = (existing or {}).get('billing') or ''
+    # reset_day：每月几号重置流量。选过就保留，没选过安装时问一次。
+    config['reset_day'] = (existing or {}).get('reset_day') or 0
     if backend == 'diag':
         config['diag'] = sources
     for folder in [CONFIG.parent, PROGRAM.parent, DATA]:
@@ -2539,7 +2600,10 @@ start_pre() { /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py --once; }
     if not config.get('billing'):
         config['billing'] = ask_billing('both')
         CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n')
-    print('计费方式：' + BILLING.get(config['billing'], '不确定（三种都显示）') + '（以后改：liuliang --billing）')
+    if not config.get('reset_day'):
+        config['reset_day'] = ask_reset_day(1)
+        CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n')
+    print('计费方式：' + BILLING.get(config['billing'], '不确定（三种都显示）') + '；每月 %d 号重置' % config['reset_day'] + '（以后改：liuliang --billing / liuliang --reset-day 几号）')
     print('只看网站访客：liuliang --web    排查问题：liuliang --doctor')
     print('查看某个 IP 近7天访问的应用/网站：运行 liuliang 后输入序号，或 liuliang --ip IP')
 
@@ -2645,6 +2709,7 @@ def main():
     parser.add_argument('--sites', choices=['yes','no'], help='高级：--sites no 关闭访问的应用/网站记录（默认开启）')
     parser.add_argument('--access-log', help='高级：代理访问日志路径（自动找不到时用），多个用逗号隔开')
     parser.add_argument('--billing', nargs='?', const='', choices=['', 'both', 'out', 'max', 'all'], help='设置服务商计费方式：both 进+出 / out 出站 / max 取大 / all 三种都显示')
+    parser.add_argument('--reset-day', nargs='?', const='', help='设置服务商每月几号重置流量（1-31），不带数字就一步一步问')
     parser.add_argument('--log', choices=['yes','no'], help='高级：安装时是否自动打开代理访问日志（默认打开，内存<48MB 默认不开）')
     parser.add_argument('--enable-log', action='store_true', help='自动打开 Xray / sing-box 的访问日志（看不到访问的网站时用）')
     parser.add_argument('-y', '--yes', action='store_true', help=argparse.SUPPRESS)
@@ -2659,7 +2724,13 @@ def main():
     if args.enable_log:
         enable_log(args.yes); return
     if args.billing is not None:
-        set_billing(args.billing or None); return
+        set_billing(args.billing or None)
+        # 不带参数的 --billing 顺便问一下重置日（直接回车保留原值）。
+        if not args.billing:
+            set_reset_day(None)
+        return
+    if args.reset_day is not None:
+        set_reset_day(args.reset_day or None); return
     config = json.loads(CONFIG.read_text())
     if args.once:
         collect(config)

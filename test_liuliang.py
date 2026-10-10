@@ -948,4 +948,37 @@ class V120Tests(unittest.TestCase):
             self._nicdb(temp); text=self._report(temp,{'billing':'out'})
             self.assertIn('服务商口径（出站）',text); self.assertNotIn('取大',text)
 
+class V122Tests(unittest.TestCase):
+    def ts(self, *a):
+        return m.datetime(*a, tzinfo=m.Z).timestamp()
+    def test_month_end_clamp(self):
+        a, b = m.cycle_bounds(self.ts(2026, 2, 15), 31)
+        self.assertEqual(a, self.ts(2026, 1, 31)); self.assertEqual(b, self.ts(2026, 2, 28))
+        a, b = m.cycle_bounds(self.ts(2026, 3, 1), 31)
+        self.assertEqual(a, self.ts(2026, 2, 28)); self.assertEqual(b, self.ts(2026, 3, 31))
+    def test_rollover(self):
+        self.assertEqual(m.cycle_bounds(self.ts(2026, 10, 4, 23, 59), 5)[0], self.ts(2026, 9, 5))
+        self.assertEqual(m.cycle_bounds(self.ts(2026, 10, 5, 0, 0, 1), 5)[0], self.ts(2026, 10, 5))
+        self.assertEqual(m.cycle_bounds(self.ts(2026, 1, 3), 10), (self.ts(2025, 12, 10), self.ts(2026, 1, 10)))
+    def test_parse_reset_day(self):
+        self.assertEqual(m.parse_reset_day('1'), 1); self.assertEqual(m.parse_reset_day('31'), 31)
+        for bad in ('0', '32', 'x', '', '-1'):
+            self.assertIsNone(m.parse_reset_day(bad))
+    def test_cycle_usage_across_reboot_and_retention(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db'); now = m.time.time()
+            start = m.cycle_bounds(now, 1)[0]
+            m.save_nic(db, start - 3600, 'eth0', (0, 0))
+            m.save_nic(db, start - 60, 'eth0', (10**6, 10**6))       # 上个周期，不算
+            m.save_nic(db, start + 60, 'eth0', (10**6 + 500, 10**6 + 700))
+            m.save_nic(db, start + 120, 'eth0', (100, 300))           # 重启归零
+            self.assertEqual(m.nic_usage(db, start, now + 1), (600, 1000))
+            m.save_nic(db, now, 'eth0', (200, 400))                   # 清理不会删掉本周期（<40 天）
+            self.assertEqual(db.execute('select count(*) from nic').fetchone()[0], 4)
+            m.save_sample(db, {('up4', '5.5.5.5'): (9158, None)}, now); db.commit(); db.close()
+            out = io.StringIO()
+            with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                m.report({'ports': [443], 'geo': True, 'reset_day': 1})
+            self.assertIn('本周期', out.getvalue())
+
 if __name__=='__main__':unittest.main(verbosity=2)
