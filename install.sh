@@ -112,7 +112,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.25'
+VERSION = '1.0.26'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -1965,6 +1965,13 @@ def mem_mb():
 # 安装时要不要自动打开代理访问日志：
 # 用户明确说过（--log yes/no 或之前选过）就照用户的；
 # 否则默认打开，内存小于 48MB 的机器默认不开，免得代理多写日志拖慢机器。
+def log_action(explicit, choice):
+    """安装时读不到访问记录怎么办：用户明确选过就照办（enable/skip），没选过就问（ask）。"""
+    if explicit:
+        return 'enable' if choice == 'yes' else 'skip'
+    return 'ask'
+
+
 def auto_log_choice(arg, existing, mem):
     if arg in ('yes', 'no'):
         return arg
@@ -2190,10 +2197,64 @@ def services_for_config(config, dirs=SERVICE_DIRS):
     return [x for x in found if not (x in seen or seen.add(x))]
 
 
+# 名词小词典：pidfile = 服务启动后把进程号写进去的文件（如 /run/xray-node-1.pid），
+# OpenRC 靠它认出「这个进程归哪个服务管」。
+def proc_parents(pid, proc='/proc'):
+    """这个进程和它的上级进程号（一直到 1），用来对 pidfile：服务可能先起一个外壳再起 xray。"""
+    chain, seen = [], set()
+    pid = str(pid)
+    while pid and pid not in ('0', '1') and pid not in seen:
+        seen.add(pid); chain.append(pid)
+        try:
+            status = Path(proc, pid, 'status').read_text()
+        except OSError:
+            break
+        found = re.search(r'^PPid:\s*(\d+)', status, re.M)
+        pid = found.group(1) if found else ''
+    return chain
+
+
+def services_for_pid(pid, config=None, initd='/etc/init.d', proc='/proc', unitdirs=SERVICE_DIRS[1:]):
+    """找管着这个代理进程的服务：
+    1. OpenRC 启动文件里的 pidfile，里面的进程号是它自己或它的上级；
+    2. 名字约定：配置在 /etc/xray-node/nodes/<N>/ 下 → 服务 xray-node-<N>（VPS-dajianjiedian 一键脚本）。"""
+    found = []
+    chain = set(proc_parents(pid, proc))
+    try:
+        names = sorted(os.listdir(initd))
+    except OSError:
+        names = []
+    for name in names:
+        try:
+            text = Path(initd, name).read_text(errors='replace')
+        except OSError:
+            continue
+        got = re.search(r'^\s*pidfile=["\']?([^"\'\s]+)', text, re.M)
+        if not got or '$' in got.group(1):
+            continue
+        try:
+            if Path(got.group(1)).read_text().strip() in chain:
+                found.append(('openrc', name))
+        except OSError:
+            continue
+    node = re.search(r'/xray-node/nodes/(\d+)/', str(config or ''))
+    if node and not found:
+        svc = 'xray-node-' + node.group(1)
+        if svc in names:
+            found.append(('openrc', svc))
+        for d in unitdirs:
+            for unit in (svc + '.service', 'xray-node@.service'):
+                if os.path.isfile(os.path.join(d, unit)):
+                    found.append(('systemd', svc + '.service' if unit.startswith(svc) else 'xray-node@%s.service' % node.group(1)))
+    seen = set()
+    return [x for x in found if not (x in seen or seen.add(x))]
+
+
 def restart_proxy(pid, kind, config=None):
     """重启代理让新日志设置生效。返回 None 表示已重启，否则返回要用户自己做的事。"""
     # 先找「启动文件里写着这个配置」的服务，有几个就全重启。
-    owners = services_for_config(config) if config else []
+    owners = services_for_pid(pid, config)
+    owners += [x for x in (services_for_config(config) if config else []) if x not in owners]
     done = 0
     for init, name in owners:
         if init == 'systemd' and systemd_running():
@@ -2201,6 +2262,12 @@ def restart_proxy(pid, kind, config=None):
         elif init == 'openrc' and shutil.which('rc-service'):
             subprocess.run(['timeout', '60', 'rc-service', name, 'restart'], check=True, capture_output=True, text=True); done += 1
     if done:
+        # 确认真的重启了：原来那个进程号应该没了。
+        for _ in range(20):
+            if not Path('/proc', str(pid)).exists():
+                break
+            time.sleep(0.5)
+        print('  已重启服务：' + '、'.join(n for _i, n in owners) + ('（进程号已更换）' if not Path('/proc', str(pid)).exists() else '（旧进程还在，请稍后用 liuliang --doctor 看一下）'))
         return None
     unit = service_unit(pid)
     if unit and systemd_running():
@@ -2761,8 +2828,9 @@ start_pre() { /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py --once; }
         if can_enable(sources, notes) and proxy_processes():
             print('  现在还读不到代理的访问记录，所以看不到每个 IP 访问了哪些网站。')
             # 默认打开（推荐）：直接回车 = 打开；输入 n = 不打开，并记住这个选择，以后更新不再问。
+            # 之前选过「打开」（config 里 log=yes），代理的日志设置后来被删了：直接重新加上，不再问。
             answer = 'y' if log_choice == 'yes' else 'n'
-            if not explicit_log:
+            if log_action(explicit_log, log_choice) == 'ask':
                 tip = '（推荐，直接回车）' if log_choice == 'yes' else '（这台内存小，推荐不开，直接回车跳过）'
                 got = ask('  要自动打开代理访问日志吗？会先备份代理配置、代理重启几秒' + tip + ' [y/n]：').lower()
                 if got in ('y', 'yes', 'n', 'no'):

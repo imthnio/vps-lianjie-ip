@@ -1155,4 +1155,39 @@ class V125Tests(unittest.TestCase):
             with patch.object(m, 'ACCESS_LOG', log), patch.object(m, 'ours_configured', return_value=True):
                 self.assertTrue(m.has_access_lines(('file', str(log))))
 
+class V126Tests(unittest.TestCase):
+    def _layout(self, temp, pid_in_file):
+        root = Path(temp)
+        initd = root / 'init.d'; initd.mkdir(); run = root / 'run'; run.mkdir(); proc = root / 'proc'
+        for n in ('1', '2'):
+            (initd / ('xray-node-' + n)).write_text('#!/sbin/openrc-run\ncommand="/usr/local/bin/xray-node-run"\ncommand_args="%s"\npidfile="%s/xray-node-%s.pid"\n' % (n, run, n))
+        (initd / 'sshd').write_text('pidfile="%s/sshd.pid"\n' % run)
+        (run / 'xray-node-1.pid').write_text(pid_in_file + '\n'); (run / 'xray-node-2.pid').write_text('999\n'); (run / 'sshd.pid').write_text('5\n')
+        for pid, ppid in (('300', '200'), ('200', '1')):
+            (proc / pid).mkdir(parents=True); (proc / pid / 'status').write_text('Name:\tx\nPPid:\t%s\n' % ppid)
+        return initd, proc
+    def test_pidfile_of_process(self):
+        with tempfile.TemporaryDirectory() as temp:
+            initd, proc = self._layout(temp, '300')
+            self.assertEqual(m.services_for_pid('300', None, str(initd), str(proc), ()), [('openrc', 'xray-node-1')])
+    def test_pidfile_of_parent_wrapper(self):
+        with tempfile.TemporaryDirectory() as temp:
+            initd, proc = self._layout(temp, '200')   # pidfile 里是外壳进程，xray 是它的子进程
+            self.assertEqual(m.services_for_pid('300', None, str(initd), str(proc), ()), [('openrc', 'xray-node-1')])
+    def test_node_dir_name_convention(self):
+        with tempfile.TemporaryDirectory() as temp:
+            initd, proc = self._layout(temp, '777')   # pidfile 对不上：按目录编号找
+            got = m.services_for_pid('300', '/etc/xray-node/nodes/2/config.json', str(initd), str(proc), ())
+            self.assertEqual(got, [('openrc', 'xray-node-2')])
+    def test_log_yes_readds_without_prompt(self):
+        self.assertEqual(m.log_action(True, 'yes'), 'enable')
+        self.assertEqual(m.log_action(True, 'no'), 'skip')
+        self.assertEqual(m.log_action(False, 'yes'), 'ask')
+        self.assertEqual(m.auto_log_choice(None, {'log': 'yes'}, 512), 'yes')
+        # 日志设置被删了：只剩旧目录，没有访问记录 → 需要重新打开
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / 'access.log'; log.write_text('')
+            with patch.object(m, 'ACCESS_LOG', log), patch.object(m, 'proxy_processes', return_value=[]):
+                self.assertTrue(m.can_enable([('file', str(log))], []))
+
 if __name__=='__main__':unittest.main(verbosity=2)
