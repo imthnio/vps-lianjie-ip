@@ -260,7 +260,7 @@ class TrafficTests(unittest.TestCase):
             m.save_sample(db,{('up4','2.2.2.2'):(800*1024, None)},now)
             db.close()
             out=io.StringIO()
-            with patch.object(m,'DATA',Path(temp)),contextlib.redirect_stdout(out):m.report({'ports':[443],'geo':True})
+            with patch.object(m,'DATA',Path(temp)),contextlib.redirect_stdout(out):m.report({'ports':[443],'geo':True,'min_kb':800})
             text=out.getvalue()
             self.assertNotIn('1.1.1.1',text)
             self.assertIn('2.2.2.2',text)
@@ -745,7 +745,7 @@ class SiteTests(unittest.TestCase):
         self.assertRegex(out.getvalue(), r'│ #  │ IP')
         self.assertRegex(out.getvalue(), r'│ 1  │ 8\.8\.8\.8')
     def test_last_online_is_last_site_opened(self):
-        # 最后上网 = 最后一次打开网站/App 的时间；之后只有数据来往（心跳）不算
+        # v1.0.19：最后上网 = 打开网站时间和最后一个数据包时间里更晚的（长连接在用也会更新）
         t = m.SiteTracker([443]); now = m.time.time()
         t.tick(now - 7200, [self.XRAY], m.parse_ss(self.ss(50001, 1000, 0), [443]), {})
         t.tick(now - 60, [], m.parse_ss(self.ss(50001, 900 * 1024, 0), [443]), {})
@@ -759,9 +759,9 @@ class SiteTests(unittest.TestCase):
             text = out.getvalue()
             opened = m.datetime.fromtimestamp(now - 7200, m.Z).strftime('%Y-%m-%d %H:%M:%S')
             self.assertIn('最后上网', text)
-            self.assertRegex(text, r'8\.8\.8\.8 .*' + opened + r' +│')      # 打开网站的时间，不是最后一个包
+            last = m.datetime.fromtimestamp(now, m.Z).strftime('%Y-%m-%d %H:%M:%S')
+            self.assertRegex(text, r'8\.8\.8\.8 .*' + last + r' +│')        # 取更晚的数据包时间
             self.assertRegex(text, r'1\.1\.1\.1 .*\* │')                 # 没有网站记录：退回并标 *
-            self.assertLess(text.index('1.1.1.1'), text.index('8.8.8.8'))  # 按最后上网时间排序
             self.assertIn(opened, self._site_report(temp))
     def test_site_sources_reads_proxy_configs(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -878,5 +878,28 @@ class SiteTests(unittest.TestCase):
         self.assertEqual(db.execute('select count(*) from sites').fetchone()[0], 1)
         db.close()
 
+
+class V119Tests(unittest.TestCase):
+    def test_default_shows_small_node_traffic(self):
+        with tempfile.TemporaryDirectory() as temp:
+            now=m.time.time(); db=m.open_db(Path(temp)/'history-v1.db')
+            m.save_sample(db,{('up4','5.5.5.5'):(9158, None)},now); db.close()
+            out=io.StringIO()
+            with patch.object(m,'DATA',Path(temp)),contextlib.redirect_stdout(out):m.report({'ports':[443],'geo':True})
+            self.assertIn('5.5.5.5',out.getvalue())
+    def test_last_seen_follows_long_connection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db=m.open_db(Path(temp)/'h.db'); t0=1_000_000.0
+            for i in range(5):
+                m.save_sample(db,{('up4','6.6.6.6'):(1000*(i+1), m.SET_TIMEOUT-3)},t0+60*i)
+            ls=db.execute("select last_seen from clients where ip='6.6.6.6'").fetchone()[0]
+            self.assertAlmostEqual(ls, t0+240-3, delta=1)
+            self.assertEqual(db.execute("select sum(bytes) from traffic").fetchone()[0],5000)
+    def test_interval_at_most_60(self):
+        self.assertLessEqual(m.INTERVAL,60)
+    def test_install_embeds_same_program(self):
+        s=Path(__file__).with_name('install.sh').read_text()
+        a=s.index("<<'LIULIANG_PYTHON'\n")+len("<<'LIULIANG_PYTHON'\n"); b=s.index("\nLIULIANG_PYTHON\n")
+        self.assertEqual(s[a:b], Path(__file__).with_name('liuliang.py').read_text().rstrip('\n'))
 
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -17,15 +17,14 @@ import sys
 import threading
 import time
 import unicodedata
-import urllib.parse
-import urllib.request
 
-VERSION = '1.0.18'
+VERSION = '1.0.19'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
 PROGRAM = Path('/usr/local/lib/liuliang/liuliang.py')
-INTERVAL = 120
+# 每隔多少秒把计数写进数据库一次。60 秒：最后上网时间误差不超过 1 分钟。
+INTERVAL = 60
 POLL = 2
 LOCK = Path('/run/liuliang.lock')
 # 某次 ss/conntrack 读空时，已断开的流还留这么久，避免基线丢失后把累计字节再加一遍。
@@ -35,8 +34,9 @@ FLOW_KEEP = 120
 # 反推出"最后一个包"的时间（约 1 秒精度），而不用采样时刻代替。
 SET_TIMEOUT = 8 * 86400
 # 展示过滤阈值：近7天总流量低于该值的 IP 不在表格中显示（也不计入合计）。
-# 用户要求：低于 800KB 的流量不用统计。
-MIN_TRAFFIC_BYTES = 800 * 1024
+# 默认 0：有流量就显示，轻度使用的人也能看到。想隐藏小流量可在
+# /etc/liuliang/config.json 里加 "min_kb": 800（单位 KB）。
+MIN_TRAFFIC_BYTES = 0
 # 网站（文件分享网盘等非代理的对外 TCP 服务）访客的显示门槛。打开一次分享页
 # 只有几 KB，扫描器打一枪也是几 KB；上传/下载一个文件就会超过这个值。
 # 800KB 门槛只管节点流量，网站访客按这里单独判断。
@@ -231,6 +231,8 @@ def save_sample(c, current, now, reset=False):
 
 
 def geo_lookup(ip):
+    # 用到时才加载网络模块，后台常驻时少占几 MB 内存。
+    import urllib.parse, urllib.request
     url = 'https://ipwho.is/' + urllib.parse.quote(ip, safe=':') + '?fields=success,country_code,city,connection.isp&lang=zh-CN'
     req = urllib.request.Request(url, headers={'User-Agent':'liuliang/' + VERSION})
     with urllib.request.urlopen(req, timeout=3) as response:
@@ -1860,7 +1862,7 @@ class FileFollower:
     def _read(self):
         if self.handle is None:
             return []
-        data = self.handle.read(4 << 20)
+        data = self.handle.read(256 << 10)  # 每次最多读 256KB，小内存机器不爆
         if not data:
             return []
         lines = (self.buf + data).split('\n')
@@ -2229,6 +2231,7 @@ Description=Per-IP port traffic statistics
 After=network.target nftables.service
 [Service]
 Type=simple
+Environment=MALLOC_ARENA_MAX=1 PYTHONDONTWRITEBYTECODE=1
 ExecStart=/usr/bin/python3 -u /usr/local/lib/liuliang/liuliang.py --daemon
 Restart=on-failure
 RestartSec=5
@@ -2248,6 +2251,7 @@ name="liuliang"
 description="Per-IP port traffic statistics"
 supervisor="supervise-daemon"
 command="/usr/bin/python3"
+export MALLOC_ARENA_MAX=1
 command_args="-u /usr/local/lib/liuliang/liuliang.py --daemon"
 respawn_delay=5
 respawn_max=5
@@ -2451,6 +2455,8 @@ def report(config, web_only=False, show_all=False):
   if DATA.exists() and not os.access(str(DATA), os.R_OK | os.X_OK):
    print('无法读取流量数据，请使用 root 运行：liuliang');return
   print('(暂无流量数据库记录)');return
+ # 显示门槛：默认 0（全显示），config.json 里 min_kb 可调。
+ limit=int(config.get('min_kb',MIN_TRAFFIC_BYTES//1024) or 0)*1024
  c=sqlite3.connect(DB, timeout=30); rows=[]; cfhidden=0; picks=[]
  try:
   hasweb='web' in [r[1] for r in c.execute('PRAGMA table_info(traffic)')]
@@ -2473,14 +2479,17 @@ def report(config, web_only=False, show_all=False):
     if wb<=0: continue
     d=diff(c,ip,now-86400,now,'web') if hasweb else 0;w=wb
    # 节点流量 800KB 起显示；网站（文件分享）访客上传/下载 20KB 起就显示。
-   elif not show_all and w<MIN_TRAFFIC_BYTES and wb<WEB_MIN_BYTES: continue
+   # 节点流量（总流量减网站部分）大于 0 且达到门槛就显示；纯网站访客仍要 20KB 起，挡掉扫描器。
+   elif not show_all and not (w-wb>0 and w-wb>=limit) and wb<WEB_MIN_BYTES: continue
    kind='CF节点' if cf else '+'.join(k for k,ok in (('节点',w-wb>=WEB_MIN_BYTES),('网站',wb>=WEB_MIN_BYTES or web_only and wb>0)) if ok) or ('网站' if wb>0 and wb>=w-wb else '节点')
-   mark='' if web_only or opened.get(ip) else '*';ls=opened.get(ip) or ls
+   # 最后上网 = 最后打开网站时间 和 最后一个数据包时间 里更晚的那个：
+   # 长连接（看视频、下载）一直有数据时，时间也会跟着走，不会停在刚连上那一刻。
+   mark='' if web_only or opened.get(ip) else '*';ls=max(float(opened.get(ip) or 0),float(ls))
    age=max(0,now-float(ls));place=' '.join(x for x in(co,ci) if x) or ('Cloudflare' if cf else '未解析');rows.append((ip,isp_display(isp),place,d,w,ls,age,kind,mark))
   rows.sort(key=lambda r:-float(r[5]))
   note=('已隐藏 %d 个 Cloudflare 节点 IP（网站开了橙色云 / Tunnel，真实访客已单独列出；liuliang --all 显示）'%cfhidden) if cfhidden else ''
   if not rows:
-   print('(近7天没有网站访客)' if web_only else '(近7天无达到 800KB 的流量记录'+('，也没有网站访客' if config.get('web') else '')+')')
+   print('(近7天没有网站访客)' if web_only else ('(近7天无达到 %dKB 的流量记录'%(limit//1024) if limit else '(近7天没有流量记录')+('，也没有网站访客' if config.get('web') else '')+')')
    if note:print(col(note,D))
    if cfhidden and not c.execute("select 1 from metadata where key='realip_last'").fetchone():
     print('只看到 Cloudflare 的 IP、没有真实访客：运行 liuliang --doctor 排查')
@@ -2501,8 +2510,8 @@ def report(config, web_only=False, show_all=False):
    print('│ '+' │ '.join(out)+' │')
   real=[r for r in rows if r[7]!='CF节点']
   print(line('└','┴','┘'));a=sum(1 for r in real if r[3]>0 or r[4]>0);print('合计：IP 数 %d · 有流量 IP 数 %d · 近24小时总流量 %s · 近7天总流量 %s'%(len(real),a,sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))))
-  if any(r[8] for r in rows):print(col('最后上网：这个 IP 最后一次打开网站/App 的时间。带 * 的读不到它打开网站的记录（代理没开日志，或是网站访客），'
-   '显示的是最后有数据来往的时间，手机放着不用、后台也会有数据，所以可能比实际晚',D))
+  if any(r[8] for r in rows):print(col('最后上网：这个 IP 最后一次打开网站/App 或最后有数据来往的时间（取更晚的，每分钟更新）。带 * 的读不到它打开网站的记录（代理没开日志，或是网站访客），'
+   '手机放着不用、后台心跳也算数据，所以可能比实际晚',D))
   if note:print(col(note,D))
   picks=[r[0] for r in rows]
  finally:
