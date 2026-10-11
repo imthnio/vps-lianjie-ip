@@ -18,7 +18,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.29'
+VERSION = '1.0.30'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -3014,7 +3014,7 @@ def main():
                     print('liuliang:', str(exc), file=sys.stderr, flush=True)
                 time.sleep(RESCAN)
     elif args.ip:
-        site_report(args.ip, config, show_all=args.all)
+        site_report(args.ip, config, show_all=args.all, wide=args.wide)
     else:
         report(config, web_only=args.web, show_all=args.all, wide=args.wide)
 
@@ -3138,10 +3138,10 @@ def report(config, web_only=False, show_all=False, wide=True):
  finally:
   c.close()
  # 在终端里看表时，可以接着选一个 IP 看它访问了哪些应用/网站。
- if picks and sys.stdin.isatty() and sys.stdout.isatty():choose_ip(config,picks,show_all)
+ if picks and sys.stdin.isatty() and sys.stdout.isatty():choose_ip(config,picks,show_all,wide)
 
 
-def choose_ip(config, picks, show_all=False):
+def choose_ip(config, picks, show_all=False, wide=False):
     while True:
         try:
             text = input('\n输入序号或 IP，查看它近7天访问的应用/网站（直接回车退出）：').strip()
@@ -3158,10 +3158,10 @@ def choose_ip(config, picks, show_all=False):
                 print('没有这个序号，也不是有效的公网 IP')
                 continue
         print()
-        site_report(str(ip), config, show_all)
+        site_report(str(ip), config, show_all, wide)
 
 
-def site_report(ip, config=None, show_all=False):
+def site_report(ip, config=None, show_all=False, wide=True):
     """一个 IP 近7天访问的应用/网站：按应用归类，显示流量、访问次数和最近访问时间。"""
     DB = str(DATA / 'history-v1.db')
     found = normalize_ip(ip)
@@ -3178,10 +3178,18 @@ def site_report(ip, config=None, show_all=False):
         info = c.execute('select * from clients where ip=?', (ip,)).fetchone()
         info = dict(zip([d[0] for d in c.execute('select * from clients limit 0').description], info)) if info else {}
         status = c.execute("select value from metadata where key='sites'").fetchone()
+        # 最后上网：和主表一样，取最后打开网站时间和最后一个数据包时间里更晚的。
+        opened = c.execute('select max(last) from sites where ip=? and ts>? and hits>0', (ip, since)).fetchone()[0] if 'sites' in tables else None
     finally:
         c.close()
     place = ' '.join(x for x in (isp_display(info.get('isp')) if info.get('isp') else '', info.get('country'), info.get('city')) if x)
-    print(col(ip + (' · ' + place if place else '') + ' · 近7天访问的应用/网站', B, C))
+    seen = max(float(opened or 0), float(info.get('last_seen') or 0))
+    if wide:
+        print(col(ip + (' · ' + place if place else '') + ' · 近7天访问的应用/网站', B, C))
+    else:
+        # 窄版开头两行：IP 和城市；7天流量和最后上网。
+        print(col(ip + ' · ' + short(info.get('city') or info.get('country') or '未解析', 12), B, C))
+        print('7天 %s · 最后上网 %s' % (sz(total), datetime.fromtimestamp(seen, Z).strftime('%m-%d %H:%M') if seen else '-'))
     groups = {}
     for host, b, h, last in rows:
         g = groups.setdefault(site_label(host), [0, 0, 0, []])
@@ -3206,6 +3214,8 @@ def site_report(ip, config=None, show_all=False):
         else:
             print('(近7天这个 IP 没有访问记录' + ('，总流量 ' + sz(total) if total else '') + ')')
         return
+    if not wide:
+        return site_compact(ip, groups, total, show_all)
     items = sorted(groups.items(), key=lambda kv: (-kv[1][0], -kv[1][1], kv[0]))
     limit = len(items) if show_all else 30
     shown, rest = items[:limit], items[limit:]
@@ -3236,6 +3246,29 @@ def site_report(ip, config=None, show_all=False):
     print('合计：应用/网站 %d 个 · 访问 %d 次 · 已按网站细分 %s · 该 IP 近7天总流量 %s' % (len(items), sum(g[1] for _n, g in items), sz(counted), sz(max(total, counted))))
     if other > 0 or any(not g[0] for _n, g in items):
         print(col('流量为「-」的网站走的是 UDP（hy2/tuic）或 mux 连接，只能记次数，流量算在「其他」里', D))
+
+
+
+def site_compact(ip, groups, total, show_all=False):
+    """窄版的「这个 IP 访问了哪些应用/网站」：和主表同样的样式，每行不超过 50 格，按最后访问时间从新到旧。"""
+    items = sorted(groups.items(), key=lambda kv: (-kv[1][2], -kv[1][1], kv[0]))
+    limit = len(items) if show_all else 30
+    shown, rest = items[:limit], items[limit:]
+    # 列：序号、应用/网站（最多 16 格，超出用 .. 截断）、流量、次数、最后访问。
+    rows = [[str(n), short(name, 16), sz(g[0]) if g[0] else '-', str(g[1]),
+             datetime.fromtimestamp(g[2], Z).strftime('%m-%d %H:%M') if g[2] else '-'] for n, (name, g) in enumerate(shown, 1)]
+    h = ['#', '应用/网站', '流量', '次数', '最后访问']
+    K = [max([ww(x) for x in [h[i]] + [r[i] for r in rows]]) for i in range(len(h))]
+    print(col(' '.join(cell(x, K[i]) for i, x in enumerate(h)).rstrip(), B, C))
+    for r in rows:
+        print(' '.join(cell(x, K[i]) for i, x in enumerate(r)).rstrip())
+    counted = sum(g[0] for _n, g in items)
+    print('共 %d 个 · 访问 %d 次 · 总流量 %s' % (len(items), sum(g[1] for _n, g in items), sz(max(total, counted))))
+    if rest:
+        print(col('还有 %d 个没显示：liuliang --ip %s --all' % (len(rest), ip), D))
+    if total - counted > 0 or any(not g[0] for _n, g in items):
+        print(col('「-」= UDP/mux 连接，只记次数', D))
+    print(col('看域名明细：liuliang --ip %s --wide' % ip, D))
 
 
 if __name__ == '__main__':

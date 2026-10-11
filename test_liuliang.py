@@ -1273,4 +1273,43 @@ class V129Tests(unittest.TestCase):
             for line in text.splitlines():
                 self.assertLessEqual(m.ww(line), 50, line)
 
+class V130Tests(unittest.TestCase):
+    def _db(self, temp):
+        db = m.open_db(Path(temp) / 'history-v1.db'); now = m.time.time()
+        m.save_sample(db, {('up4', '8.8.8.8'): (5*1024**2, None), ('down4', '8.8.8.8'): (60*1024**2, None)}, now)
+        db.execute("update clients set city='长春市朝阳区很长很长的地名'")
+        for host, b, h, ago in (('www.youtube.com', 50*1024**2, 12, 60), ('a-very-long-subdomain.example-cdn-network.com', 3*1024**2, 4, 600),
+                                ('www.google.com', 0, 3, 30), ('谷歌中文很长很长很长的应用名字.com', 1024, 1, 9000)):
+            db.execute('INSERT INTO sites(ts,ip,host,bytes,hits,last) VALUES(?,?,?,?,?,?)', (now, '8.8.8.8', host, b, h, now - ago))
+        db.commit(); db.close()
+    def _out(self, temp, **kw):
+        out = io.StringIO()
+        with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+            m.site_report('8.8.8.8', {'ports': [443]}, wide=False, **kw)
+        return out.getvalue()
+    def test_compact_width_and_alignment(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self._db(temp); text = self._out(temp)
+            lines = text.splitlines()
+            for line in lines:
+                self.assertLessEqual(m.ww(line), 50, line)
+            self.assertNotIn('', lines)                          # 没有空行
+            self.assertNotIn('…', text)
+            hi = next(i for i, l in enumerate(lines) if l.startswith('#'))
+            body = [l for l in lines[hi + 1:] if l[:1].isdigit()]
+            # 「流量」列在每行的起始位置一样（按显示宽度算）
+            starts = set()
+            for l in [lines[hi]] + body:
+                parts = l.split()
+                # 第 3 栏（流量）开始的显示宽度：前面两栏 + 空格，按 K 宽度对齐后应相同
+                idx = l.index(parts[2], len(parts[0]) + 1 + len(parts[1]))
+                starts.add(m.ww(l[:idx]))
+            self.assertEqual(len(starts), 1, starts)
+    def test_compact_sorted_by_last_visit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self._db(temp); text = self._out(temp)
+            first = next(l for l in text.splitlines() if l.startswith('1 '))
+            self.assertIn('Google', first) if 'Google' in text else self.assertIn('google', first.lower())
+            self.assertIn('最后上网', text); self.assertIn('7天', text); self.assertIn('共 ', text)
+
 if __name__=='__main__':unittest.main(verbosity=2)
