@@ -18,7 +18,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.31'
+VERSION = '1.0.32'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -2914,7 +2914,11 @@ def doctor():
         # 先逐个节点检查，总的一行要和下面每个节点一致：全部 ✔ 才 ✔，否则写明几个没开。
         checks = [(pid, kind, config_log_ok(pid, kind, argv)) for pid, kind, argv in proxy_processes()]
         nbad = sum(1 for _p, _k, r in checks if not r[0])
-        print(log_summary(bool(sources), nbad, ok) + ' 代理访问日志：' + ('、'.join(names) or '没找到') + ('（%d 个节点没开）' % nbad if nbad else ''))
+        if not checks and not sources:
+            # 只跑网站、没有节点的机器：没有代理就没有访问日志，这是正常的，不打 ✘。
+            print('  代理访问日志：本机没有运行 Xray / V2Ray / sing-box，不需要（只统计网站访客）')
+        else:
+            print(log_summary(bool(sources), nbad, ok) + ' 代理访问日志：' + ('、'.join(names) or '没找到') + ('（%d 个节点没开）' % nbad if nbad else ''))
         for note in notes:
             print('  原因：' + note)
         bad = nbad > 0

@@ -934,6 +934,24 @@ class InstallShellTests(unittest.TestCase):
         s = Path(__file__).with_name('install.sh').read_text()
         self.assertLess(s.index('flock -n 9'), s.index('apt-get'))
 
+class DoctorTests(unittest.TestCase):
+    def test_doctor_no_proxy_is_not_an_error(self):
+        # 只跑网站（网盘/下载站）、没有节点的机器：没有代理访问日志是正常的，不能打 ✘ 吓人
+        cfg = {'ports': [39232], 'web': [39232], 'sites': True, 'realip': True}
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(m, 'saved_config', return_value=cfg), \
+             patch.object(m, 'service_state', return_value='active'), \
+             patch.object(m, 'read_socket_table', return_value=''), \
+             patch.object(m, 'cloudflared_running', return_value=False), \
+             patch.object(m, 'proxy_processes', return_value=[]), \
+             patch.object(m, 'site_sources', return_value=([], [])), \
+             patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+            m.doctor()
+        text = out.getvalue()
+        self.assertIn('不需要', text)
+        self.assertNotRegex(text, '✘ 代理访问日志')
+
 class V120Tests(unittest.TestCase):
     def test_log_choice(self):
         self.assertEqual(m.auto_log_choice(None, {}, 512), 'yes')
