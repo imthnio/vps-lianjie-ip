@@ -1247,4 +1247,30 @@ class V128Tests(unittest.TestCase):
         self.assertEqual(m.log_summary(True, 1, ok), 'N')
         self.assertEqual(m.log_summary(False, 0, ok), 'N')
 
+class V129Tests(unittest.TestCase):
+    def test_ask_small_enter_keeps_current(self):
+        for cur, ans, want in ((0, '', 0), (800, '', 800), (0, '2', 800), (800, '1', 0)):
+            with patch.object(m, 'ask', return_value=ans), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(m.ask_small(cur), want)
+    def test_set_small_on_off(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = Path(temp) / 'config.json'; cfg.write_text(json.dumps({'ports': [443], 'billing': 'both'}))
+            with patch.object(m, 'CONFIG', cfg), contextlib.redirect_stdout(io.StringIO()):
+                m.set_small('on'); self.assertEqual(json.loads(cfg.read_text())['min_kb'], 800)
+                m.set_small('off'); self.assertEqual(json.loads(cfg.read_text())['min_kb'], 0)
+            self.assertEqual(json.loads(cfg.read_text())['billing'], 'both')
+    def test_footer_when_small_hidden(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db'); now = m.time.time()
+            m.save_sample(db, {('up4', '1.1.1.1'): (500*1024, None), ('down4', '1.1.1.1'): (500*1024, None),
+                               ('up4', '2.2.2.2'): (100*1024, None), ('down4', '2.2.2.2'): (100*1024, None)}, now); db.close()
+            out = io.StringIO()
+            with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                m.report({'ports': [443], 'geo': True, 'min_kb': 800}, wide=False)
+            text = out.getvalue()
+            self.assertIn('1.1.1.1', text); self.assertNotIn('2.2.2.2', text)
+            self.assertIn('已隐藏 1 个 800KB 以下的 IP', text); self.assertIn('liuliang --small off', text)
+            for line in text.splitlines():
+                self.assertLessEqual(m.ww(line), 50, line)
+
 if __name__=='__main__':unittest.main(verbosity=2)

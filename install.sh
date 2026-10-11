@@ -112,7 +112,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.28'
+VERSION = '1.0.29'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -912,6 +912,42 @@ def ask_reset_day(current=1):
         if day:
             return day
         print('请输入 1 到 31 之间的数字')
+
+
+# 名词小词典：小流量 IP = 近7天总共不到 800KB 的 IP。服务商扫描服务器时会冒出一大堆这样的 IP，
+# 打开「隐藏」后表格里就不显示它们（config.json 里 "min_kb": 800；关掉是 0）。
+SMALL_KB = 800
+
+
+def ask_small(current=0):
+    """问一次要不要隐藏 800KB 以下的 IP。直接回车 = 保持现在的设置。返回 800 或 0。"""
+    now = '现在：隐藏' if current else '现在：不隐藏'
+    print('是否隐藏 800KB 以下的 IP？（服务商会扫描时建议打开）' + now)
+    print('  1) 不隐藏' + ('  ← 直接回车' if not current else ''))
+    print('  2) 隐藏' + ('  ← 直接回车' if current else ''))
+    got = ask('输入序号：')
+    if got == '1':
+        return 0
+    if got == '2':
+        return SMALL_KB
+    return SMALL_KB if current else 0
+
+
+def set_small(value=None):
+    """liuliang --small on|off：打开/关闭隐藏小流量 IP；不带参数就一步一步问。"""
+    config = json.loads(CONFIG.read_text())
+    cur = int(config.get('min_kb') or 0)
+    if value is None or value == '':
+        kb = ask_small(cur)
+    elif value in ('on', 'yes', '1'):
+        kb = SMALL_KB
+    elif value in ('off', 'no', '0'):
+        kb = 0
+    else:
+        raise ValueError('用法：liuliang --small on（隐藏）或 liuliang --small off（不隐藏）')
+    config['min_kb'] = kb
+    CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n')
+    print('已设置：' + ('隐藏 800KB 以下的 IP' if kb else '不隐藏小流量 IP'))
 
 
 def set_reset_day(value=None):
@@ -2812,6 +2848,8 @@ def install(args):
     config['billing'] = (existing or {}).get('billing') or ''
     # reset_day：每月几号重置流量。选过就保留，没选过安装时问一次。
     config['reset_day'] = (existing or {}).get('reset_day') or 0
+    # min_kb：隐藏小流量 IP 的门槛，更新时保留原来的设置（新装默认 0 = 不隐藏），下面每次安装都会再问一次。
+    config['min_kb'] = int((existing or {}).get('min_kb') or 0)
     if backend == 'diag':
         config['diag'] = sources
     for folder in [CONFIG.parent, PROGRAM.parent, DATA]:
@@ -2892,6 +2930,10 @@ start_pre() { /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py --once; }
     if not config.get('billing'):
         config['billing'] = ask_billing('both')
         CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n')
+    # 每次运行安装都问一次（显示现在的设置，直接回车不变）。
+    config['min_kb'] = ask_small(config.get('min_kb', 0))
+    CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n')
+    print('小流量 IP：' + ('隐藏 800KB 以下' if config['min_kb'] else '不隐藏') + '（以后改：liuliang --small on/off）')
     if not config.get('reset_day'):
         config['reset_day'] = ask_reset_day(1)
         CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n')
@@ -3013,6 +3055,7 @@ def main():
     parser.add_argument('--sites', choices=['yes','no'], help='高级：--sites no 关闭访问的应用/网站记录（默认开启）')
     parser.add_argument('--access-log', help='高级：代理访问日志路径（自动找不到时用），多个用逗号隔开')
     parser.add_argument('--billing', nargs='?', const='', choices=['', 'both', 'out', 'max', 'all'], help='设置服务商计费方式：both 进+出 / out 出站 / max 取大 / all 三种都显示')
+    parser.add_argument('--small', nargs='?', const='', help='隐藏 800KB 以下的 IP：on 隐藏 / off 不隐藏，不带参数就一步一步问')
     parser.add_argument('--reset-day', nargs='?', const='', help='设置服务商每月几号重置流量（1-31），不带数字就一步一步问')
     parser.add_argument('--log', choices=['yes','no'], help='高级：安装时是否自动打开代理访问日志（默认打开，内存<48MB 默认不开）')
     parser.add_argument('--enable-log', action='store_true', help='自动打开 Xray / sing-box 的访问日志（看不到访问的网站时用）')
@@ -3033,6 +3076,8 @@ def main():
         if not args.billing:
             set_reset_day(None)
         return
+    if args.small is not None:
+        set_small(args.small); return
     if args.reset_day is not None:
         set_reset_day(args.reset_day or None); return
     config = json.loads(CONFIG.read_text())
@@ -3090,7 +3135,7 @@ def report(config, web_only=False, show_all=False, wide=True):
   print('(暂无流量数据库记录)');return
  # 显示门槛：默认 0（全显示），config.json 里 min_kb 可调。
  limit=int(config.get('min_kb',MIN_TRAFFIC_BYTES//1024) or 0)*1024
- c=sqlite3.connect(DB, timeout=30); rows=[]; cfhidden=0; picks=[]
+ c=sqlite3.connect(DB, timeout=30); rows=[]; cfhidden=0; picks=[]; smallhidden=0
  try:
   hasweb='web' in [r[1] for r in c.execute('PRAGMA table_info(traffic)')]
   cols=[r[1] for r in c.execute('PRAGMA table_info(clients)')]
@@ -3114,7 +3159,8 @@ def report(config, web_only=False, show_all=False, wide=True):
    # 节点流量 800KB 起显示；网站（文件分享）访客上传/下载 20KB 起就显示。
    # 节点流量（总流量减网站部分）大于 0 且达到门槛就显示；纯网站访客仍要 20KB 起，挡掉扫描器。
    # 设了 min_kb：只看表格里「7天」那一栏的数字（进+出合计，1KB=1024 字节），低于就藏，和显示的完全一致。
-   elif not show_all and limit and w<limit: continue
+   elif not show_all and limit and w<limit:
+    smallhidden+=1;continue
    # 没设门槛：有节点流量就显示；纯网站访客仍要 20KB 起，挡掉扫描器。
    elif not show_all and not limit and not w-wb>0 and wb<WEB_MIN_BYTES: continue
    kind='CF节点' if cf else '+'.join(k for k,ok in (('节点',w-wb>=WEB_MIN_BYTES),('网站',wb>=WEB_MIN_BYTES or web_only and wb>0)) if ok) or ('网站' if wb>0 and wb>=w-wb else '节点')
@@ -3130,6 +3176,8 @@ def report(config, web_only=False, show_all=False, wide=True):
    scanhidden=len(bad);rows=[r for r in rows if r[0] not in bad]
   note=('已隐藏 %d 个 Cloudflare 节点 IP（橙色云/Tunnel）\n真实访客已单独列出，查看：liuliang --all'%cfhidden) if cfhidden else ''
   if scanhidden:note=(note+'\n' if note else '')+'已隐藏 %d 个疑似扫描 IP，查看：liuliang --all'%scanhidden
+  # 打开了「隐藏小流量 IP」时，在表格下面说清楚藏了几个、怎么看、怎么关。
+  if smallhidden:note=(note+'\n' if note else '')+'已隐藏 %d 个 %dKB 以下的 IP\n查看：liuliang --all · 关闭：liuliang --small off'%(smallhidden,limit//1024)
   # NAT 小鸡：来访地址全是商家网关的内网地址，看不到真实用户。
   natips=[r[0] for r in rows if is_nat_ip(r[0])]
   if natips and len(natips)*2>=len(rows):
