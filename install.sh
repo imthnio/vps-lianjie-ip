@@ -1,6 +1,15 @@
 #!/bin/sh
 set -eu
 if [ "$(id -u)" != 0 ]; then echo "请先使用 root 登录 VPS" >&2; exit 1; fi
+# 同一时间只能有一个安装在跑：两个一起装会互相抢 apt 锁，看起来就像卡住了。
+# 锁跟着 9 号文件描述符一直传到最后的 python 安装，装完自动释放。
+if command -v flock >/dev/null 2>&1; then
+  exec 9>/run/liuliang-install.lock
+  if ! flock -n 9; then
+    echo '已经有一个 liuliang 安装正在运行（可能在另一个窗口）。请回到那个窗口等它装完或按提示回答，不用再装一次。' >&2
+    exit 1
+  fi
+fi
 # 已经装过也会继续往下走：python --install 更新程序，并保留流量记录和原端口。
 # Install only standard packages from this machine's configured distribution repositories.
 # apt/dpkg 锁被系统自动更新占住时等待重试（Ubuntu 刚开机常见）；非锁错误直接失败。
@@ -61,29 +70,53 @@ else
 fi
 # ===== 自动对时 =====
 # 名词小词典：对时 = 让服务器时钟和网上的标准时间保持一致；时钟不准，「最后上网」时间就会跟着错。
-# Alpine 用 chronyd（OpenRC 开机自启）；systemd 系统用 systemd-timesyncd，没有就退回 chrony。
-# 已经在对时就不动；容器（LXC/OpenVZ）改不了时钟，失败也不影响安装。
+# 名词小词典：容器 = docker / podman / LXC / OpenVZ 这类「小鸡」，时钟由宿主机（母鸡）管，自己改不了。
+# 容器直接跳过，什么都不装（以前会去装对时软件，每次装、每次超时，看起来像卡住）。
+# 已经在对时就不动；装了但没开的直接打开，不再在 timesyncd 和 chrony 之间来回换。
+in_container() {
+  if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt -c -q 2>/dev/null; then return 0; fi
+  if [ -f /run/.containerenv ] || [ -f /.dockerenv ]; then return 0; fi
+  if [ -d /proc/vz ] && [ ! -d /proc/bc ]; then return 0; fi
+  if tr '\0' '\n' < /proc/1/environ 2>/dev/null | grep -q '^container='; then return 0; fi
+  return 1
+}
 time_sync() {
+  if in_container; then
+    echo '  这台是容器，时间跟着宿主机走，不用自己对时，跳过'
+    return 0
+  fi
   if command -v rc-update >/dev/null 2>&1 && [ ! -d /run/systemd/system ]; then
-    if ! rc-service chronyd status >/dev/null 2>&1 && ! rc-service ntpd status >/dev/null 2>&1; then
-      apk add --no-cache chrony >/dev/null 2>&1 || return 0
-      rc-update add chronyd default >/dev/null 2>&1 || true
-      # 容器（LXC/OpenVZ/NAT 小鸡）没权限改时钟，chronyd 起不来：撤掉自启，时间由母鸡负责。
-      if ! timeout 20 rc-service chronyd start >/dev/null 2>&1; then
-        rc-update del chronyd default >/dev/null 2>&1 || true
-        echo '这台是容器，不能自己对时（时间跟着母鸡走），已跳过'
-      fi
+    if rc-service chronyd status >/dev/null 2>&1 || rc-service ntpd status >/dev/null 2>&1; then
+      echo '  已经在自动对时'
+      return 0
+    fi
+    echo '  安装对时服务 chrony…'
+    timeout 120 apk add --no-cache chrony >/dev/null 2>&1 || { echo '  对时服务没装上，跳过（不影响 liuliang 使用）'; return 0; }
+    rc-update add chronyd default >/dev/null 2>&1 || true
+    if timeout 20 rc-service chronyd start >/dev/null 2>&1; then
+      echo '  已打开自动对时'
+    else
+      rc-update del chronyd default >/dev/null 2>&1 || true
+      echo '  这台机器不能自己对时（时间跟着母鸡走），已跳过'
     fi
   elif [ -d /run/systemd/system ]; then
-    for _u in chronyd chrony ntp ntpd systemd-timesyncd; do
-      systemctl is-active --quiet "$_u" 2>/dev/null && return 0
+    for _u in chronyd chrony ntp ntpd ntpsec systemd-timesyncd; do
+      if systemctl is-active --quiet "$_u" 2>/dev/null; then echo '  已经在自动对时'; return 0; fi
     done
-    if ! systemctl list-unit-files systemd-timesyncd.service >/dev/null 2>&1 || ! systemctl cat systemd-timesyncd >/dev/null 2>&1; then
-      DEBIAN_FRONTEND=noninteractive timeout 120 apt-get install -y systemd-timesyncd >/dev/null 2>&1 || \
-        DEBIAN_FRONTEND=noninteractive timeout 120 apt-get install -y chrony >/dev/null 2>&1 || true
+    if systemctl cat systemd-timesyncd >/dev/null 2>&1; then
+      timeout 30 systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
+    elif systemctl cat chrony >/dev/null 2>&1; then
+      timeout 30 systemctl enable --now chrony >/dev/null 2>&1 || true
+    else
+      echo '  安装对时服务 systemd-timesyncd（最多等 2 分钟）…'
+      if ! DEBIAN_FRONTEND=noninteractive timeout 120 apt-get install -y -o DPkg::Lock::Timeout=60 systemd-timesyncd >/dev/null 2>&1; then
+        echo '  对时服务没装上，跳过（不影响 liuliang 使用）'
+        return 0
+      fi
+      timeout 30 systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
     fi
-    timedatectl set-ntp true >/dev/null 2>&1 || true
-    systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || systemctl enable --now chrony >/dev/null 2>&1 || true
+    timeout 15 timedatectl set-ntp true >/dev/null 2>&1 || true
+    echo '  已打开自动对时'
   fi
   return 0
 }
@@ -112,7 +145,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.30'
+VERSION = '1.0.31'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'

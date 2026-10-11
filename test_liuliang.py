@@ -904,6 +904,36 @@ class V119Tests(unittest.TestCase):
         a=s.index("<<'LIULIANG_PYTHON'\n")+len("<<'LIULIANG_PYTHON'\n"); b=s.index("\nLIULIANG_PYTHON\n")
         self.assertEqual(s[a:b], Path(__file__).with_name('liuliang.py').read_text().rstrip('\n'))
 
+class InstallShellTests(unittest.TestCase):
+    """install.sh 里的对时和防重复安装（用假命令跑真脚本）。"""
+    def _time_sync(self, virt_rc):
+        import os, subprocess
+        s = Path(__file__).with_name('install.sh').read_text()
+        funcs = s[s.index('in_container() {'):s.index("echo '检查服务器时间同步…'")]
+        with tempfile.TemporaryDirectory() as temp:
+            bin_ = Path(temp)
+            calls = bin_ / 'calls'
+            stubs = {'systemd-detect-virt': 'exit %d' % virt_rc, 'timeout': 'shift; exec "$@"'}
+            for name in ('apt-get', 'apk', 'systemctl', 'timedatectl', 'rc-service', 'rc-update'):
+                stubs[name] = 'echo %s "$@" >> %s; exit 0' % (name, calls)
+            for name, body in stubs.items():
+                (bin_ / name).write_text('#!/bin/sh\n' + body + '\n'); (bin_ / name).chmod(0o755)
+            env = dict(os.environ, PATH=str(bin_) + ':/usr/bin:/bin')
+            out = subprocess.run(['sh', '-c', funcs + 'time_sync'], env=env, capture_output=True, text=True, timeout=30)
+            return out.stdout, (calls.read_text() if calls.exists() else '')
+    def test_container_skips_time_sync_without_installing(self):
+        out, calls = self._time_sync(0)
+        self.assertIn('容器', out)
+        self.assertEqual(calls, '')        # 一个软件都不装、一个服务都不动
+    def test_time_sync_never_swaps_packages(self):
+        s = Path(__file__).with_name('install.sh').read_text()
+        # 以前 timesyncd 装超时就去装 chrony，下次又换回来，每次安装白等 4 分钟
+        self.assertNotIn('apt-get install -y chrony', s)
+        self.assertIn('DPkg::Lock::Timeout=60 systemd-timesyncd', s)
+    def test_only_one_install_at_a_time(self):
+        s = Path(__file__).with_name('install.sh').read_text()
+        self.assertLess(s.index('flock -n 9'), s.index('apt-get'))
+
 class V120Tests(unittest.TestCase):
     def test_log_choice(self):
         self.assertEqual(m.auto_log_choice(None, {}, 512), 'yes')
