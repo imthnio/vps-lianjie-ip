@@ -145,7 +145,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.32'
+VERSION = '1.0.33'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -1688,7 +1688,8 @@ def follow_ports(config, seen):
     # 用户在后台运行期间用命令改过的选项（计费方式、日志）以硬盘上的为准，不要被旧值盖掉。
     try:
         disk = json.loads(CONFIG.read_text())
-        for key in ('billing', 'log', 'reset_day'):
+        # min_kb 也要同步：用户可能刚用 liuliang --small 改过，不能被旧内存值盖回去。
+        for key in ('billing', 'log', 'reset_day', 'min_kb'):
             if key in disk:
                 config[key] = disk[key]
     except (OSError, ValueError):
@@ -2615,7 +2616,9 @@ class SiteTracker:
         self.followers = {}
         self.journal = None
         self.watcher = None
-        self.conns = {}    # (ip, 客户端端口) -> [域名, 认到的时间, ss 里还在]；域名 None = 多个网站共用（mux）
+        # (ip, 客户端端口) -> [域名, 认到的时间, ss 里还在, 是否曾在 ss 出现过]
+        # 域名 None = 多个网站共用（mux）。「曾出现过」用来区分：mux 日志早于 ss，还是短连接断开后端口被复用。
+        self.conns = {}
         self.base = {}     # 流 key -> [已记字节, 时间]
         self.closed = {}   # 已关闭、日志还没对上的流：key -> (ip, up, down, 关闭时间)
         self.usage = {}    # (ip, 域名) -> [字节, 次数, 最近一次打开的时间]
@@ -2690,12 +2693,14 @@ class SiteTracker:
                 entry = self.conns.get((ip, peer_port(key)))
                 if entry is not None:
                     entry[2] = True
+                    entry[3] = True  # 在 ss 里见到过，断开后再来别的网站就是端口复用，不是 mux
                     self._account(key, ip, entry, up + down, now)
             for key, (ip, up, down, t) in list(self.closed.items()):
                 entry = self.conns.get((ip, peer_port(key)))
                 if entry is not None:
                     self._account(key, ip, entry, up + down, now)
                     entry[2] = False
+                    entry[3] = True  # 关闭事件也说明这条连接真实存在过
                     del self.closed[key]
                     self.base.pop(key, None)
                 elif now - t > SITE_GRACE:
@@ -2710,11 +2715,21 @@ class SiteTracker:
         use[1] += 1
         use[2] = now
         old = self.conns.get((ip, port))
-        # 同一条连接还开着（或刚认到）又来了别的网站：mux，字节分不开。
-        if old is not None and old[0] != host and (old[2] or now - old[1] < 5):
-            old[0], old[1] = None, now
+        # 同一条连接访问了多个网站：mux，字节分不开。
+        # 短连接断开后 NAT 马上复用同一端口：要换成新网站，不能当成 mux
+        # （否则新连接的流量会掉进「其他」）。
+        if old is not None and old[0] != host and old[0] is not None:
+            if old[2]:
+                # 还在 ss 里：确是同一条连接
+                old[0], old[1] = None, now
+            elif not old[3] and now - old[1] < 5:
+                # 还没在 ss 出现过，短时间两个网站：多半是 mux 日志比 ss 先到
+                old[0], old[1] = None, now
+            else:
+                # 旧连接已在 ss 出现过并断开，或已过窗口：端口复用
+                self.conns[(ip, port)] = [host, now, False, False]
         else:
-            self.conns[(ip, port)] = [host, now, False]
+            self.conns[(ip, port)] = [host, now, False, False]
 
     def _account(self, key, ip, entry, total, now):
         old = self.base.get(key)
@@ -3132,7 +3147,7 @@ def main():
                 collect(config, sniffer, sites)
             except Exception as exc:
                 print('liuliang:', str(exc), file=sys.stderr, flush=True)
-            # 两分钟采一次，端口每分钟看一次：新端口最多约 2 分钟后开始统计。
+            # 每分钟采一次（INTERVAL），端口也每分钟看一次：新端口连续两次见到才并入，最多约 2 分钟。
             for _ in range(INTERVAL // RESCAN):
                 try:
                     refresh_sniffer(sniffer)

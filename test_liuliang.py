@@ -470,6 +470,21 @@ class TrafficTests(unittest.TestCase):
                 manual = {'ports': [443], 'web': [], 'auto': False}
                 self.assertFalse(m.follow_ports(manual, {443, 18080})[1])
                 self.assertEqual(manual['ports'], [443])
+    def test_follow_ports_keeps_min_kb_from_disk(self):
+        """后台发现新端口写配置时，不能把用户刚用 --small 改的 min_kb 盖成旧值。"""
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = Path(temp) / 'config.json'
+            # 磁盘上是用户刚打开的「隐藏 800KB」；内存里还是启动时的 0
+            cfg.write_text(json.dumps({'ports': [443], 'auto': True, 'web': [], 'min_kb': 800, 'billing': 'both', 'reset_day': 1, 'log': 'yes'}))
+            memory = {'ports': [443], 'auto': True, 'web': [], 'min_kb': 0, 'billing': 'both', 'reset_day': 1}
+            with patch.object(m, 'CONFIG', cfg), patch.object(m, 'scan_ports', return_value=([443, 8443], 'proxy', [8443])):
+                seen, changed = m.follow_ports(memory, {443, 8443})
+            self.assertTrue(changed)
+            disk = json.loads(cfg.read_text())
+            self.assertEqual(disk['min_kb'], 800)
+            self.assertEqual(memory['min_kb'], 800)
+            self.assertEqual(disk.get('log'), 'yes')
+
     def test_follow_ports_never_drops_ports(self):
         with tempfile.TemporaryDirectory() as temp:
             cfg = {'ports': [443, 8443], 'web': [8443], 'auto': True}
@@ -697,6 +712,15 @@ class SiteTests(unittest.TestCase):
         t.tick(100, [self.XRAY], m.parse_ss(self.ss(50001, 100, 0), [443]), {})
         t.tick(102, [], {}, {})
         t.tick(200, [self.XRAY.replace('www.youtube.com', 'github.com')], m.parse_ss(self.ss(50001, 50, 0), [443]), {})
+        data, _ = t.drain()
+        self.assertEqual(data[('8.8.8.8', 'www.youtube.com')][0], 100)
+        self.assertEqual(data[('8.8.8.8', 'github.com')][0], 50)
+    def test_tracker_port_reuse_within_5s_after_seen(self):
+        """短连接在 ss 里出现过后马上断开，NAT 5 秒内复用端口：应记到新网站，不能当 mux。"""
+        t = m.SiteTracker([443])
+        t.tick(100, [self.XRAY], m.parse_ss(self.ss(50001, 100, 0), [443]), {})
+        t.tick(101, [], {}, {})  # 断开
+        t.tick(103, [self.XRAY.replace('www.youtube.com', 'github.com')], m.parse_ss(self.ss(50001, 50, 0), [443]), {})
         data, _ = t.drain()
         self.assertEqual(data[('8.8.8.8', 'www.youtube.com')][0], 100)
         self.assertEqual(data[('8.8.8.8', 'github.com')][0], 50)
