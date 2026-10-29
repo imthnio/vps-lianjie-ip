@@ -1384,4 +1384,92 @@ class V130Tests(unittest.TestCase):
             self.assertIn('Google', first) if 'Google' in text else self.assertIn('google', first.lower())
             self.assertIn('最后上网', text); self.assertIn('7天', text); self.assertIn('共 ', text)
 
+class V134Tests(unittest.TestCase):
+    """统计和时间线：抓包字节不被清零、关闭连接的基线作废、后台停过后的字节按时间摊开。"""
+    def _tick(self, temp, cfg, flows, **kw):
+        with patch.object(m, 'DATA', Path(temp)), patch.object(m, 'LOCK', Path(temp) / 'lock'), \
+             patch.object(m, 'read_flow_snapshot', return_value=dict(flows)), patch.object(m, 'save_nic', lambda *a, **k: None):
+            m.diag_tick(cfg, True, **kw)
+    def _sum(self, temp):
+        db = m.open_db(Path(temp) / 'history-v1.db')
+        try:
+            return db.execute('select coalesce(sum(bytes),0) from traffic').fetchone()[0]
+        finally:
+            db.close()
+    def test_udp_capture_counted_every_minute_without_tcp(self):
+        # 纯 hy2/tuic（UDP 抓包）、端口上没有 TCP 连接：以前第一分钟之后的字节全被清零
+        class Pump:
+            def drain_all(self):
+                return {'8.8.8.8': 1000}, {}
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = {'ports': [443], 'diag': {'tcp': 'ss', 'udp': 'raw'}}
+            for _ in range(5):
+                self._tick(temp, cfg, {}, pump=Pump())
+            self.assertEqual(self._sum(temp), 5000)
+    def test_switch_from_nft_still_skips_socket_history_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db'); m.save_sample(db, {('up4', '8.8.8.8'): (5000, None)}, m.time.time()); db.close()
+            cfg = {'ports': [443], 'diag': {'tcp': 'ss', 'udp': None}}
+            self._tick(temp, cfg, {'tcp|a': ('8.8.8.8', 9000, 1000)})
+            self.assertEqual(self._sum(temp), 5000)
+            self._tick(temp, cfg, {})
+            # 之后的新连接照常从 0 算
+            self._tick(temp, cfg, {'tcp|b': ('8.8.8.8', 300, 100)})
+            self.assertEqual(self._sum(temp), 5400)
+    def test_closed_connection_port_reuse_counts_new_bytes(self):
+        class Watcher:
+            def __init__(self): self.data = {}
+            def drain(self):
+                data, self.data = self.data, {}
+                return data
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = {'ports': [443], 'diag': {'tcp': 'ss', 'udp': None}}
+            w = Watcher(); key = 'tcp|1.1.1.1|443|8.8.8.8|5000'
+            self._tick(temp, cfg, {key: ('8.8.8.8', 600, 400)}, watcher=w)    # 1000
+            w.data = {key: ('8.8.8.8', 700, 500)}                              # 关闭：+200
+            self._tick(temp, cfg, {}, watcher=w)
+            self._tick(temp, cfg, {key: ('8.8.8.8', 3000, 2000)}, watcher=w)   # 同端口新连接：+5000
+            self.assertEqual(self._sum(temp), 6200)
+    def test_spread_sums_and_bounds(self):
+        now = 1_000_000_000
+        self.assertEqual(m.spread(500, now - 60, now), [(now, 500)])
+        self.assertEqual(m.spread(500, None, now), [(now, 500)])
+        parts = m.spread(10**9 + 7, now - 3 * 86400, now)
+        self.assertEqual(len(parts), 72)
+        self.assertEqual(sum(p for _t, p in parts), 10**9 + 7)
+        self.assertEqual(parts[-1][0], now)
+        self.assertTrue(all(now - 3 * 86400 < t <= now for t, _p in parts))
+        kept = m.spread(1000, now - 20 * 86400, now, floor=now - 8 * 86400)
+        self.assertTrue(all(t >= now - 8 * 86400 for t, _p in kept))
+    def test_nft_backlog_after_downtime_is_spread(self):
+        # 后台停了 3 天，期间 3GB：不能全算进「近24小时」，摊到这 3 天里，而且只到最后一个包为止
+        db = m.open_db(':memory:'); t0 = 1_000_000_000.0
+        m.save_sample(db, {('down4', '8.8.8.8'): (1000, None)}, t0)
+        db.execute("INSERT OR REPLACE INTO metadata VALUES('sample',?)", (str(t0),))
+        now = t0 + 3 * 86400; last = now - 7200
+        m.save_sample(db, {('down4', '8.8.8.8'): (1000 + 3 * 1024**3, m.SET_TIMEOUT - 7200)}, now)
+        day = m.diff(db, '8.8.8.8', now - 86400, now)
+        self.assertEqual(m.diff(db, '8.8.8.8', t0 - 1, now), 1000 + 3 * 1024**3)
+        self.assertLess(day, 1.1 * 1024**3)
+        self.assertGreater(day, 0.9 * 1024**3)
+        self.assertLessEqual(db.execute('select max(ts) from traffic').fetchone()[0], last + 1)
+        db.close()
+    def test_nft_no_gap_keeps_sample_time(self):
+        db = m.open_db(':memory:'); t0 = 1_000_000_000.0
+        db.execute("INSERT OR REPLACE INTO metadata VALUES('sample',?)", (str(t0 - 60),))
+        m.save_sample(db, {('down4', '8.8.8.8'): (5000, m.SET_TIMEOUT - 30)}, t0)
+        self.assertEqual(db.execute('select ts,bytes from traffic').fetchall(), [(t0, 5000)])
+        db.close()
+    def test_nic_backlog_split_across_reset_day(self):
+        # 停机跨过了重置日：上个周期的用量不能全算进本周期
+        db = m.open_db(':memory:'); now = m.time.time()
+        start = m.cycle_bounds(now, 1)[0]
+        before, after = start - 86400, start + 86400
+        m.save_nic(db, before, 'eth0', (0, 0))
+        db.execute("INSERT OR REPLACE INTO metadata VALUES('sample',?)", (str(before),))
+        m.save_nic(db, after, 'eth0', (2000, 4000))
+        self.assertEqual(m.nic_usage(db, start, after + 1), (1000, 2000))
+        self.assertEqual(m.nic_usage(db, 0, after + 1), (2000, 4000))
+        db.close()
+
 if __name__=='__main__':unittest.main(verbosity=2)

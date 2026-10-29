@@ -18,7 +18,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.33'
+VERSION = '1.0.34'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -45,6 +45,9 @@ WEB_MIN_BYTES = 20 * 1024
 # （或者换了端口）会自动并入统计，不用再重跑安装。连续两次都看到才并入，
 # 避免临时起来又关掉的端口混进来。
 RESCAN = 60
+# 两次采样隔了这么久以上，就是后台停过（更新、重启服务、卡住）。内核计数（nft、网卡）
+# 停着的时候照样在数，下一次采到的是这一整段攒下的字节。
+GAP = 3 * INTERVAL
 
 
 def run(args, **kwargs):
@@ -212,8 +215,49 @@ def open_db(path=None):
     return c
 
 
+def last_sample(c):
+    """上一次采样的时间（metadata 里的 sample），没有就是 None。"""
+    try:
+        row = c.execute("SELECT value FROM metadata WHERE key='sample'").fetchone()
+        return float(row[0]) if row else None
+    except (sqlite3.OperationalError, TypeError, ValueError):
+        return None
+
+
+def boot_time(now):
+    """这次开机的时刻。读不到 /proc/uptime 时返回 None。"""
+    try:
+        return now - float(Path('/proc/uptime').read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def spread(n, start, end, floor=None, step=3600):
+    """把 (start, end] 之间攒下的 n 字节按时间平摊，每小时一笔，返回 [(时间, 字节)]，合计正好 n。
+
+    后台停过一阵再采到的字节，全记在采到的那一刻会让「近24小时」虚高、
+    跨过重置日的流量算进错的计费周期。没有断档（不到 GAP）时整笔记在 end。
+    floor：早于它的那几笔反正马上会被清理，不写。
+    """
+    if start is None or end - start <= GAP:
+        return [(end, n)]
+    k = max(1, int((end - start + step - 1) // step))
+    out, given = [], 0
+    for i in range(1, k + 1):
+        part = n * i // k - given
+        given += part
+        t = end - (end - start) * (k - i) / k
+        if floor is None or t >= floor:
+            out.append((t, part))
+    return out
+
+
 def save_sample(c, current, now, reset=False):
+    since = last_sample(c)
     if reset:
+        # 计数是开机（或建表）后才开始的，最早只能从那时摊起。
+        boot = boot_time(now)
+        since = max(since, boot) if since is not None and boot is not None else None
         c.execute('DELETE FROM counters')
     previous = {(name, ip): n for name, ip, n in c.execute('SELECT name,ip,bytes FROM counters')}
     activity = {}
@@ -237,7 +281,16 @@ def save_sample(c, current, now, reset=False):
     for name, ip in previous.keys() - current.keys():
         c.execute('DELETE FROM counters WHERE name=? AND ip=?', (name, ip))
     for ip, n in activity.items():
-        c.execute('INSERT INTO traffic(ts,ip,bytes,web) VALUES(?,?,?,?)', (now, ip, n, min(web.get(ip, 0), n)))
+        # 断档后攒下的字节摊到「上次采样 ~ 最后一个包」之间：最后一个包之后肯定没有流量了。
+        end = last_seen.get(ip, now)
+        if since is None or now - since <= GAP or end <= since:
+            start, end = None, now
+        else:
+            start = since
+        w = min(web.get(ip, 0), n)
+        for (ts, part), (_t, wpart) in zip(spread(n, start, end, now - 8 * 86400), spread(w, start, end, now - 8 * 86400)):
+            if part > 0:
+                c.execute('INSERT INTO traffic(ts,ip,bytes,web) VALUES(?,?,?,?)', (ts, ip, part, min(wpart, part)))
         # 取四个方向里最晚的那个包的时间；没有 expires 时回退到采样时刻；
         # max() 保证 last_seen 只增不减，避免时钟抖动造成时间倒退。
         c.execute('INSERT INTO clients(ip,last_seen) VALUES(?,?) ON CONFLICT(ip) DO UPDATE SET last_seen=max(clients.last_seen, excluded.last_seen)', (ip, last_seen.get(ip, now)))
@@ -731,10 +784,19 @@ def save_nic(c, now, dev=None, counts=None):
     except ValueError:
         old = None
     if old and old.get('dev') == dev:
+        since = last_sample(c)
+        if rx < old['rx'] or tx < old['tx']:
+            # 计数变小 = 重启过，读到的是开机以来的字节，最早只能从开机摊起。
+            boot = boot_time(now)
+            since = max(since, boot) if since is not None and boot is not None else None
         drx = rx - old['rx'] if rx >= old['rx'] else rx
         dtx = tx - old['tx'] if tx >= old['tx'] else tx
         if drx > 0 or dtx > 0:
-            c.execute('INSERT INTO nic(ts,rx,tx) VALUES(?,?,?)', (now, drx, dtx))
+            # 后台停过一阵：攒下的用量按时间摊开，不全算进采到的这一刻（以免跨重置日算错周期）。
+            start = since if since is not None and now - since > GAP else None
+            for (ts, prx), (_t, ptx) in zip(spread(drx, start, now, now - 40 * 86400), spread(dtx, start, now, now - 40 * 86400)):
+                if prx > 0 or ptx > 0:
+                    c.execute('INSERT INTO nic(ts,rx,tx) VALUES(?,?,?)', (ts, prx, ptx))
     c.execute("INSERT OR REPLACE INTO metadata VALUES('nic',?)", (json.dumps({'dev': dev, 'rx': rx, 'tx': tx}),))
     # 网卡数据很小，留 40 天，够覆盖一整个月的计费周期。
     c.execute('DELETE FROM nic WHERE ts<?', (now - 40 * 86400,))
@@ -1505,14 +1567,26 @@ def diag_tick(config, flush, pump=None, watcher=None, sniffer=None, sites=None):
     with open(LOCK, 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         current = read_flow_snapshot(ports, sources)
-        if watcher is not None:
-            # 两次采样之间已经关掉的连接：用关闭时的最终字节，跟基线相减只补差额。
-            current.update(watcher.drain())
+        # 两次采样之间已经关掉的连接：用关闭时的最终字节，跟基线相减只补差额。
+        closed = watcher.drain() if watcher is not None else {}
+        current.update(closed)
         c = open_db()
         try:
             prev = load_flows(c)
             baselines, activity = account_flows(prev, current, now)
             web = web_activity(prev, current, config.get('web'), now)
+            # 关掉的连接不会再有字节：基线作废。客户端马上复用同一个端口时，新连接从 0 算，
+            # 不然新连接的字节要先减掉旧连接的总数，少算。
+            for key in closed:
+                baselines.pop(key, None)
+            # 从已经有流量记录的 nft 安装切过来时，套接字上的历史字节不要再加一遍。
+            # 只在第一次采样时判断（记在 metadata 的 flows）：以前用「flows 表是空的」判断，
+            # 没有 TCP 连接的机器（纯 hy2/tuic）flows 表一直是空的，每分钟都被清零。
+            if c.execute("SELECT 1 FROM metadata WHERE key='flows'").fetchone() is None:
+                if not prev and c.execute('SELECT 1 FROM traffic LIMIT 1').fetchone():
+                    activity, web = {}, {}
+                c.execute("INSERT OR REPLACE INTO metadata VALUES('flows','1')")
+            # 抓包数的是这两秒新来的包，没有「历史字节」，任何时候都要算上。
             if pump is not None:
                 raw, raw_web = pump.drain_all()
                 for ip, n in raw.items():
@@ -1521,9 +1595,6 @@ def diag_tick(config, flush, pump=None, watcher=None, sniffer=None, sites=None):
                 for ip, n in raw_web.items():
                     if n > 0:
                         web[ip] = web.get(ip, 0) + n
-            # 从已经有流量记录的 nft 安装切过来时，套接字上的历史字节不要再加一遍。
-            if not prev and c.execute('SELECT 1 FROM traffic LIMIT 1').fetchone():
-                activity = {}
             save_flows(c, baselines)
             add_pending(c, activity, now, web)
             save_realip(c, sniffer, now)
@@ -3016,12 +3087,13 @@ def main():
         sniffer = start_sniffer(config)
         sites = start_sites(config)
         while True:
+            started = time.monotonic()
             try:
                 collect(config, sniffer, sites)
             except Exception as exc:
                 print('liuliang:', str(exc), file=sys.stderr, flush=True)
             # 每分钟采一次（INTERVAL），端口也每分钟看一次：新端口连续两次见到才并入，最多约 2 分钟。
-            for _ in range(INTERVAL // RESCAN):
+            for i in range(INTERVAL // RESCAN):
                 try:
                     refresh_sniffer(sniffer)
                     seen, changed = follow_ports(config, seen)
@@ -3031,7 +3103,9 @@ def main():
                             sites.set_ports(config['ports'])
                 except Exception as exc:
                     print('liuliang:', str(exc), file=sys.stderr, flush=True)
-                time.sleep(RESCAN)
+                # 按钟点睡，不是固定睡 60 秒：查归属地（最多 10 个×3 秒）、扫端口花的时间
+                # 不再把下一次采样往后推，间隔稳定在一分钟。
+                time.sleep(max(1, started + RESCAN * (i + 1) - time.monotonic()))
     elif args.ip:
         site_report(args.ip, config, show_all=args.all, wide=args.wide)
     else:
