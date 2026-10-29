@@ -1,15 +1,48 @@
 #!/bin/sh
 set -eu
 if [ "$(id -u)" != 0 ]; then echo "请先使用 root 登录 VPS" >&2; exit 1; fi
-# 同一时间只能有一个安装在跑：两个一起装会互相抢 apt 锁，看起来就像卡住了。
-# 锁跟着 9 号文件描述符一直传到最后的 python 安装，装完自动释放。
-if command -v flock >/dev/null 2>&1; then
-  exec 9>/run/liuliang-install.lock
-  if ! flock -n 9; then
-    echo '已经有一个 liuliang 安装正在运行（可能在另一个窗口）。请回到那个窗口等它装完或按提示回答，不用再装一次。' >&2
-    exit 1
-  fi
+# ===== 同一时间只能有一个安装在跑 =====
+# 两个一起装会互相抢 apt 锁，看起来就像卡住了。
+# 名词小词典：进程号 = 系统给每个正在跑的程序编的号。锁文件里记着「正在安装的这个 sh 的进程号 + 启动时刻」，
+# 那个进程还活着、启动时刻也对得上，才算有安装正在跑。
+# 以前用 flock 锁 9 号文件描述符，它会传给 python 子进程：安装跑到一半 sh 被杀（小内存 Killed、关窗口），
+# 留下的 python 在后台等输入被系统暂停、一直拿着锁，之后每次安装都说「正在运行」，只能重启机器。
+PROC=${LIULIANG_PROC:-/proc}
+LOCK=${LIULIANG_LOCK:-/run/liuliang-install.pid}
+me=''
+proc_start() { sed 's/.*) //' "$PROC/$1/stat" 2>/dev/null | cut -d' ' -f20; }
+lock_owner_alive() {
+  set -- $(cat "$LOCK" 2>/dev/null)
+  [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null && { [ -z "${2:-}" ] || [ "$(proc_start "$1")" = "$2" ]; }
+}
+# 拿到锁之后还在跑的 liuliang 安装进程，都是上次被打断留下的半截（真在装的那个会拿着锁），清掉。
+kill_leftovers() {
+  for _d in "$PROC"/[0-9]*; do
+    _p=${_d##*/}
+    [ "$_p" = "$$" ] && continue
+    tr '\0' ' ' < "$_d/cmdline" 2>/dev/null | grep -q 'liuliang\.py --install' || continue
+    kill -CONT "$_p" 2>/dev/null || true
+    kill -KILL "$_p" 2>/dev/null && echo "已清掉上次没装完的安装进程（进程号 ${_p}）"
+  done
+  return 0
+}
+take_lock() {
+  me="$$ $(proc_start $$)"
+  ( set -C; echo "$me" > "$LOCK" ) 2>/dev/null && return 0
+  lock_owner_alive && return 1
+  rm -f "$LOCK"   # 上次的安装已经不在了：锁作废
+  ( set -C; echo "$me" > "$LOCK" ) 2>/dev/null
+}
+release_lock() { [ -n "$me" ] && [ "$(cat "$LOCK" 2>/dev/null)" = "$me" ] && rm -f "$LOCK"; return 0; }
+if ! take_lock; then
+  _owner=$(cut -d' ' -f1 "$LOCK" 2>/dev/null || true)
+  echo "已经有一个 liuliang 安装正在运行（进程号 ${_owner}，可能在另一个窗口）。请回到那个窗口等它装完或按提示回答，不用再装一次。" >&2
+  echo "那个窗口已经关掉、装不下去了的话：先运行 kill $_owner 再装。" >&2
+  exit 1
 fi
+trap 'release_lock' EXIT
+trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+kill_leftovers
 # 已经装过也会继续往下走：python --install 更新程序，并保留流量记录和原端口。
 # Install only standard packages from this machine's configured distribution repositories.
 # apt/dpkg 锁被系统自动更新占住时等待重试（Ubuntu 刚开机常见）；非锁错误直接失败。
@@ -20,7 +53,7 @@ apt_retry() {
     if "$@" 2>/tmp/liuliang-apt.log; then return 0; fi
     grep -qiE 'Could not get lock|Unable to acquire|lock.*frontend|frontend.*lock' /tmp/liuliang-apt.log || return 1
     _ar_i=$((_ar_i + 1))
-    echo "apt 正被系统更新占用，等待 20 秒后重试（$_ar_i/$_ar_rounds）…"
+    echo "apt 正被系统更新占用，等待 20 秒后重试（$_ar_i/${_ar_rounds}）…"
     sleep 20
   done
   return 1
@@ -123,7 +156,7 @@ time_sync() {
 echo '检查服务器时间同步…'
 time_sync || true
 jobdir=$(mktemp -d)
-trap 'rm -rf "$jobdir"' EXIT HUP INT TERM
+trap 'rm -rf "$jobdir"; release_lock' EXIT
 cat > "$jobdir/liuliang.py" <<'LIULIANG_PYTHON'
 #!/usr/bin/env python3
 """Per-IP port traffic accounting. Python standard library only."""
@@ -145,7 +178,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.36'
+VERSION = '1.0.37'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -1059,20 +1092,32 @@ def ask_scope(existing=None, detected=(), web=()):
     got = ask('输入序号：')
     if got == '1' or (got != '2' and not manual):
         return None
-    default = ','.join(map(str, existing['ports'] if manual else detected))
-    while True:
-        got = ask('要统计的端口，多个用逗号隔开（如 10000,20000' + ('；直接回车 = ' + default if default else '') + '）：') or default
+    # 一次输入一个端口，回车；输完了直接回车结束。现在已经是指定端口时，第一个就直接回车 = 保持原来的。
+    keep = list(existing['ports']) if manual else []
+    print('一次输入一个端口按回车，输完了直接回车结束')
+    picked = []
+    while len(picked) < 64:
+        tip = '（直接回车 = 保持 ' + ','.join(map(str, keep)) + '）' if keep and not picked else ''
+        got = ask('  第 %d 个端口%s：' % (len(picked) + 1, tip))
         if not got:
-            print('至少填一个端口')
-            if not has_tty():
-                return None
+            if picked:
+                break
+            if keep or not has_tty():
+                return keep or None
+            print('  至少输入一个端口')
             continue
         try:
-            return ports(got)
+            new = [p for p in ports(got) if p not in picked]
         except ValueError as exc:
-            print(str(exc))
-            if not has_tty():
-                return None
+            print('  ' + str(exc).replace('或 443,8443', ''))
+            continue
+        if not new:
+            print('  %s 已经加过了' % got)
+            continue
+        picked += new
+    picked = sorted(picked)[:64]
+    print('  只统计：' + ','.join(map(str, picked)))
+    return picked
 
 
 def set_scope(value=None):
@@ -2135,9 +2180,13 @@ TTY = '/dev/tty'
 
 
 def has_tty():
+    """有终端、而且自己在前台（能问用户问题）。"""
     try:
-        with open(TTY):
-            return True
+        with open(TTY) as inp:
+            try:
+                return os.tcgetpgrp(inp.fileno()) == os.getpgrp()
+            except OSError:
+                return True
     except OSError:
         return False
 
@@ -2147,6 +2196,13 @@ def ask(prompt, default=''):
     try:
         # 终端不能「读写同开」（不支持 seek，会报错），所以读、写分开打开。
         with open(TTY, 'w') as out, open(TTY) as inp:
+            # 安装的 sh 被杀掉后，留下的 python 成了后台进程：这时读终端会被系统暂停，
+            # 一直卡在那里。不在前台就不问，直接用默认值把安装做完。
+            try:
+                if os.tcgetpgrp(inp.fileno()) != os.getpgrp():
+                    return default
+            except OSError:
+                pass
             out.write(prompt); out.flush()
             line = inp.readline()
             return line.strip() if line else default

@@ -956,7 +956,49 @@ class InstallShellTests(unittest.TestCase):
         self.assertIn('DPkg::Lock::Timeout=60 systemd-timesyncd', s)
     def test_only_one_install_at_a_time(self):
         s = Path(__file__).with_name('install.sh').read_text()
-        self.assertLess(s.index('flock -n 9'), s.index('apt-get'))
+        self.assertLess(s.index('if ! take_lock'), s.index('apk add'))
+        self.assertNotIn('flock -n', s[:s.index("<<'LIULIANG_PYTHON'")])  # 不再用会传给子进程的 flock
+    # ---- 安装锁：用假的 /proc 目录 + 真的 sleep 进程跑 install.sh 里的锁函数 ----
+    def _lock(self, temp, cmds):
+        import subprocess
+        s = Path(__file__).with_name('install.sh').read_text()
+        funcs = s[s.index('# ===== 同一时间只能有一个安装在跑 ====='):s.index('if ! take_lock; then')]
+        env = dict(os.environ, LIULIANG_PROC=str(Path(temp) / 'proc'), LIULIANG_LOCK=str(Path(temp) / 'lock'))
+        (Path(temp) / 'proc').mkdir(exist_ok=True)
+        return subprocess.run(['sh', '-c', 'set -eu\n' + funcs + cmds], env=env, capture_output=True, text=True, timeout=30)
+    def _sleeper(self, temp, cmdline=None, start=None):
+        import subprocess
+        p = subprocess.Popen(['sleep', '30']); self.addCleanup(p.wait); self.addCleanup(p.kill)
+        d = Path(temp) / 'proc' / str(p.pid); d.mkdir(parents=True)
+        if cmdline: (d / 'cmdline').write_bytes(cmdline.replace(' ', '\0').encode() + b'\0')
+        if start: (d / 'stat').write_text('%d (sleep) S ' % p.pid + ' '.join(['0'] * 18) + ' %d 0\n' % start)
+        return p
+    def test_lock_free_then_released_on_exit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = self._lock(temp, 'take_lock; trap release_lock EXIT; cat "$LOCK"')
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertTrue(out.stdout.strip())
+            self.assertFalse((Path(temp) / 'lock').exists())               # 退出时释放
+    def test_lock_held_by_running_install(self):
+        with tempfile.TemporaryDirectory() as temp:
+            p = self._sleeper(temp, start=111)
+            (Path(temp) / 'lock').write_text('%d 111\n' % p.pid)
+            self.assertEqual(self._lock(temp, 'take_lock').returncode, 1)
+    def test_stale_lock_from_killed_install_is_taken(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / 'lock').write_text('4000000 5\n')               # 那个 sh 已经被杀
+            self.assertEqual(self._lock(temp, 'take_lock').returncode, 0)
+            p = self._sleeper(temp, start=111)                               # 进程号被别的程序复用了
+            (Path(temp) / 'lock').write_text('%d 222\n' % p.pid)
+            self.assertEqual(self._lock(temp, 'take_lock').returncode, 0)
+    def test_leftover_installer_is_killed_but_daemon_kept(self):
+        with tempfile.TemporaryDirectory() as temp:
+            left = self._sleeper(temp, 'python3 /tmp/tmp.abc/liuliang.py --install')
+            daemon = self._sleeper(temp, 'python3 -u /usr/local/lib/liuliang/liuliang.py --daemon')
+            out = self._lock(temp, 'take_lock; kill_leftovers')
+            self.assertIn('已清掉上次没装完的安装进程', out.stdout)
+            self.assertEqual(left.wait(timeout=5), -9)
+            self.assertIsNone(daemon.poll())
 
 class DoctorTests(unittest.TestCase):
     def test_doctor_no_proxy_is_not_an_error(self):
@@ -1521,11 +1563,16 @@ class V136Tests(unittest.TestCase):
         self.assertIsNone(got)
         self.assertIn('10000 网站', out); self.assertIn('20000 节点', out)
     def test_pick_two_ports(self):
-        got, _ = self._ask(['2', '10000,20000'], None, [10000, 20000, 30000], [10000])
-        self.assertEqual(got, [10000, 20000])
+        # 一次输入一个端口，直接回车结束
+        got, out = self._ask(['2', '10000', '20000', ''], None, [10000, 20000, 30000], [10000])
+        self.assertEqual(got, [10000, 20000]); self.assertIn('只统计：10000,20000', out)
     def test_bad_ports_asked_again(self):
-        got, out = self._ask(['2', '99999', '10000 20000'], None, [10000], [])
+        got, out = self._ask(['2', '99999', 'abc', '10000', '20000', ''], None, [10000], [])
         self.assertEqual(got, [10000, 20000]); self.assertIn('1–65535', out)
+    def test_duplicate_and_empty_first(self):
+        got, out = self._ask(['2', '', '20000', '20000', '10000', ''], None, [], [])
+        self.assertEqual(got, [10000, 20000])
+        self.assertIn('至少输入一个端口', out); self.assertIn('已经加过', out)
     def test_enter_keeps_manual_ports(self):
         existing = {'ports': [10000, 20000], 'auto': False}
         got, out = self._ask(['', ''], existing, [10000, 20000, 30000], [10000])
@@ -1557,6 +1604,19 @@ class V136Tests(unittest.TestCase):
                 m.set_scope('all')
             data = json.loads(cfg.read_text())
             self.assertEqual((data['ports'], data['auto']), ([10000, 20000, 30000], True))
+    def test_background_installer_never_waits_for_input(self):
+        # sh 被杀后留下的 python 在后台：读终端会被系统暂停、一直占着安装锁，所以直接用默认值
+        import pty
+        master, slave = pty.openpty(); self.addCleanup(os.close, master); self.addCleanup(os.close, slave)
+        os.write(master, b'typed\n')
+        with patch.object(m, 'TTY', os.ttyname(slave)), patch.object(m.os, 'tcgetpgrp', return_value=99999), \
+             patch.object(m.os, 'getpgrp', return_value=1):
+            self.assertEqual(m.ask('问：', 'dflt'), 'dflt')
+            self.assertFalse(m.has_tty())
+        with patch.object(m, 'TTY', os.ttyname(slave)), patch.object(m.os, 'tcgetpgrp', return_value=1), \
+             patch.object(m.os, 'getpgrp', return_value=1):
+            self.assertEqual(m.ask('问：', 'dflt'), 'typed')
+            self.assertTrue(m.has_tty())
     def test_manual_scope_not_auto_merged(self):
         cfg = {'ports': [10000, 20000], 'auto': False}
         self.assertEqual(m.follow_ports(cfg, {10000, 20000, 30000}), ({10000, 20000, 30000}, False))

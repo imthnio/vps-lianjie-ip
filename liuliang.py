@@ -18,7 +18,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.36'
+VERSION = '1.0.37'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -932,20 +932,32 @@ def ask_scope(existing=None, detected=(), web=()):
     got = ask('输入序号：')
     if got == '1' or (got != '2' and not manual):
         return None
-    default = ','.join(map(str, existing['ports'] if manual else detected))
-    while True:
-        got = ask('要统计的端口，多个用逗号隔开（如 10000,20000' + ('；直接回车 = ' + default if default else '') + '）：') or default
+    # 一次输入一个端口，回车；输完了直接回车结束。现在已经是指定端口时，第一个就直接回车 = 保持原来的。
+    keep = list(existing['ports']) if manual else []
+    print('一次输入一个端口按回车，输完了直接回车结束')
+    picked = []
+    while len(picked) < 64:
+        tip = '（直接回车 = 保持 ' + ','.join(map(str, keep)) + '）' if keep and not picked else ''
+        got = ask('  第 %d 个端口%s：' % (len(picked) + 1, tip))
         if not got:
-            print('至少填一个端口')
-            if not has_tty():
-                return None
+            if picked:
+                break
+            if keep or not has_tty():
+                return keep or None
+            print('  至少输入一个端口')
             continue
         try:
-            return ports(got)
+            new = [p for p in ports(got) if p not in picked]
         except ValueError as exc:
-            print(str(exc))
-            if not has_tty():
-                return None
+            print('  ' + str(exc).replace('或 443,8443', ''))
+            continue
+        if not new:
+            print('  %s 已经加过了' % got)
+            continue
+        picked += new
+    picked = sorted(picked)[:64]
+    print('  只统计：' + ','.join(map(str, picked)))
+    return picked
 
 
 def set_scope(value=None):
@@ -2008,9 +2020,13 @@ TTY = '/dev/tty'
 
 
 def has_tty():
+    """有终端、而且自己在前台（能问用户问题）。"""
     try:
-        with open(TTY):
-            return True
+        with open(TTY) as inp:
+            try:
+                return os.tcgetpgrp(inp.fileno()) == os.getpgrp()
+            except OSError:
+                return True
     except OSError:
         return False
 
@@ -2020,6 +2036,13 @@ def ask(prompt, default=''):
     try:
         # 终端不能「读写同开」（不支持 seek，会报错），所以读、写分开打开。
         with open(TTY, 'w') as out, open(TTY) as inp:
+            # 安装的 sh 被杀掉后，留下的 python 成了后台进程：这时读终端会被系统暂停，
+            # 一直卡在那里。不在前台就不问，直接用默认值把安装做完。
+            try:
+                if os.tcgetpgrp(inp.fileno()) != os.getpgrp():
+                    return default
+            except OSError:
+                pass
             out.write(prompt); out.flush()
             line = inp.readline()
             return line.strip() if line else default
