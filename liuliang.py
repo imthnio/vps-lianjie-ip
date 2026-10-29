@@ -18,7 +18,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.34'
+VERSION = '1.0.35'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -1976,6 +1976,23 @@ def mem_mb():
     return 0
 
 
+def uses_file(pid, path):
+    """进程有没有打开这个文件（或同一目录下的文件，日志被轮转改名也算）。看不到 /proc 时返回 None。"""
+    folder = os.path.dirname(os.path.realpath(path))
+    try:
+        fds = os.listdir('/proc/%s/fd' % pid)
+    except OSError:
+        return None
+    for fd in fds:
+        try:
+            target = os.readlink('/proc/%s/fd/%s' % (pid, fd))
+        except OSError:
+            continue
+        if os.path.dirname(target.replace(' (deleted)', '')) == folder:
+            return True
+    return False
+
+
 # 安装时要不要自动打开代理访问日志：
 # 用户明确说过（--log yes/no 或之前选过）就照用户的；
 # 否则默认打开，内存小于 48MB 的机器默认不开，免得代理多写日志拖慢机器。
@@ -2182,6 +2199,10 @@ def config_log_ok(pid, kind, argv):
     path = os.path.join(cwd, target)
     folder = os.path.dirname(path) or '/'
     if os.path.isfile(path) and os.access(path, os.W_OK) or (not os.path.exists(path) and os.access(folder, os.W_OK)):
+        # sing-box 启动时就打开日志文件、一直开着。配置里写了、进程却没打开：配置改了还没重启
+        # （比如上次安装改完配置、重启代理前被内存不足杀掉），要重启一下才生效。
+        if kind == 'sing-box' and not path.startswith(('/dev/', '/proc/')) and uses_file(pid, path) is False:
+            return False, 'sing-box 配置里已经打开访问日志，但代理还没重启，没用上', None
         return True, '', path
     return False, name + ' 配置里的访问日志 ' + path + ' 写不进去', None
 
@@ -2212,10 +2233,19 @@ def check_config(kind, exe, argv, cwd):
             args.insert(0, 'check')
     else:
         args.append('-test')
+    def first_to_kill():
+        # 内存不够时让内核先杀这个检查进程，而不是安装程序或正在用的代理：
+        # 检查被杀 = 没通过，配置会还原。
+        try:
+            Path('/proc/self/oom_score_adj').write_text('1000')
+        except OSError:
+            pass
     try:
-        out = subprocess.run([exe] + args, cwd=cwd, capture_output=True, text=True, timeout=30)
+        out = subprocess.run([exe] + args, cwd=cwd, capture_output=True, text=True, timeout=30, preexec_fn=first_to_kill)
     except (OSError, subprocess.SubprocessError) as exc:
         return False, str(exc)
+    if out.returncode == -9:
+        return False, '内存不够，检查新配置的进程被系统杀掉了'
     text = (out.stdout + out.stderr).strip().splitlines()
     return out.returncode == 0, (text[-1] if text else '')
 
@@ -2376,6 +2406,25 @@ def enable_log(assume_yes=False):
         if answer not in ('y', 'yes'):
             print('已取消，什么都没改。')
             return
+    # 先停 liuliang 后台腾出内存：检查新配置时代理会整个再加载一遍配置，64MB 的小鸡上
+    # 安装程序 + 后台 + 代理 + 检查四个一起跑会内存不足，安装程序被系统杀掉（Killed）。
+    # 改完（或出错）都会在最后重新启动后台。
+    if systemd_running():
+        subprocess.run(['systemctl', 'stop', 'liuliang'], capture_output=True)
+    elif shutil.which('rc-service'):
+        subprocess.run(['rc-service', 'liuliang', 'stop'], capture_output=True)
+    try:
+        _enable_each(todo)
+    finally:
+        # liuliang 后台立刻重新找日志，不用等 5 分钟。
+        if systemd_running():
+            subprocess.run(['systemctl', 'restart', 'liuliang'], capture_output=True)
+        elif shutil.which('rc-service'):
+            subprocess.run(['rc-service', 'liuliang', 'restart'], capture_output=True)
+    print('完成。之后的访问会开始记录：过几分钟运行 liuliang，输入序号查看。')
+
+
+def _enable_each(todo):
     for pid, kind, argv, cwd, target in todo:
         name = PROXY_NAMES[kind]
         uid = int((proc_status(pid).get('Uid', '0').split() or ['0'])[0])
@@ -2434,12 +2483,6 @@ def enable_log(assume_yes=False):
         print('✔ ' + name + ' 访问日志已打开（原配置备份在 ' + str(backup) + '）')
         if todo_msg:
             print('  还差一步：' + todo_msg)
-    # liuliang 后台立刻重新找日志，不用等 5 分钟。
-    if systemd_running():
-        subprocess.run(['systemctl', 'restart', 'liuliang'], capture_output=True)
-    elif shutil.which('rc-service'):
-        subprocess.run(['rc-service', 'liuliang', 'restart'], capture_output=True)
-    print('完成。之后的访问会开始记录：过几分钟运行 liuliang，输入序号查看。')
 
 
 class FileFollower:

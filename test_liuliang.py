@@ -1472,4 +1472,42 @@ class V134Tests(unittest.TestCase):
         self.assertEqual(m.nic_usage(db, 0, after + 1), (2000, 4000))
         db.close()
 
+class V135Tests(unittest.TestCase):
+    """64MB 小鸡：打开访问日志时不能被内存不足杀掉，被杀过一次的半成品下次能补上。"""
+    def _singbox(self, temp, log):
+        cfg = Path(temp) / 'gw.json'; cfg.write_text(json.dumps({'log': log, 'inbounds': []}))
+        return cfg, (7, 'sing-box', ['sing-box', 'run', '-c', str(cfg)])
+    def test_check_killed_by_oom_is_a_failure(self):
+        done = m.subprocess.CompletedProcess([], -9, '', '')
+        with patch.object(m.subprocess, 'run', return_value=done) as run:
+            ok, why = m.check_config('sing-box', '/usr/bin/sing-box', ['sing-box', 'run', '-c', 'x.json'], '/')
+        self.assertFalse(ok); self.assertIn('内存不够', why)
+        self.assertIsNotNone(run.call_args.kwargs.get('preexec_fn'))      # 检查进程优先被系统杀
+    def test_singbox_config_changed_but_not_restarted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            access = Path(temp) / 'acc' / 'access.log'; access.parent.mkdir(); access.write_text('')
+            cfg, proc = self._singbox(temp, {'level': 'info', 'output': str(access)})
+            with patch.object(m, 'uses_file', return_value=False):
+                good, why, _ = m.config_log_ok(*proc)
+            self.assertFalse(good); self.assertIn('还没重启', why)
+            for opened in (True, None):                                   # 已打开 / 看不到 /proc：都算好的
+                with patch.object(m, 'uses_file', return_value=opened):
+                    self.assertTrue(m.config_log_ok(*proc)[0])
+    def test_enable_log_frees_memory_before_check_and_always_restarts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg, proc = self._singbox(temp, {'level': 'warn'})
+            calls = []
+            run = lambda cmd, **kw: calls.append(' '.join(cmd[:3])) or m.subprocess.CompletedProcess(cmd, 0, '', '')
+            def check(*a):
+                calls.append('check'); raise RuntimeError('boom')
+            with patch.object(m, 'proxy_processes', return_value=[proc]), patch.object(m, 'panel_name', return_value=None), \
+                 patch.object(m, 'ACCESS_DIR', Path(temp) / 'acc'), patch.object(m, 'ACCESS_LOG', Path(temp) / 'acc' / 'access.log'), \
+                 patch.object(m, 'proc_status', return_value={'Uid': str(os.getuid())}), patch.object(m.os, 'geteuid', return_value=0), \
+                 patch.object(m, 'check_config', side_effect=check), patch.object(m, 'systemd_running', return_value=False), \
+                 patch.object(m.shutil, 'which', return_value='/sbin/rc-service'), patch.object(m.subprocess, 'run', side_effect=run), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(RuntimeError):
+                    m.enable_log(assume_yes=True)
+            self.assertEqual(calls, ['rc-service liuliang stop', 'check', 'rc-service liuliang restart'])
+
 if __name__=='__main__':unittest.main(verbosity=2)
