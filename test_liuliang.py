@@ -1510,4 +1510,55 @@ class V135Tests(unittest.TestCase):
                     m.enable_log(assume_yes=True)
             self.assertEqual(calls, ['rc-service liuliang stop', 'check', 'rc-service liuliang restart'])
 
+class V136Tests(unittest.TestCase):
+    """统计范围：整机，还是只统计指定端口（如 10000 网站 + 20000 节点）。"""
+    def _ask(self, answers, *a):
+        with patch.object(m, 'ask', side_effect=list(answers)), patch.object(m, 'has_tty', return_value=True), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            return m.ask_scope(*a), out.getvalue()
+    def test_enter_keeps_whole_machine(self):
+        got, out = self._ask([''], None, [10000, 20000, 30000], [10000])
+        self.assertIsNone(got)
+        self.assertIn('10000 网站', out); self.assertIn('20000 节点', out)
+    def test_pick_two_ports(self):
+        got, _ = self._ask(['2', '10000,20000'], None, [10000, 20000, 30000], [10000])
+        self.assertEqual(got, [10000, 20000])
+    def test_bad_ports_asked_again(self):
+        got, out = self._ask(['2', '99999', '10000 20000'], None, [10000], [])
+        self.assertEqual(got, [10000, 20000]); self.assertIn('1–65535', out)
+    def test_enter_keeps_manual_ports(self):
+        existing = {'ports': [10000, 20000], 'auto': False}
+        got, out = self._ask(['', ''], existing, [10000, 20000, 30000], [10000])
+        self.assertEqual(got, [10000, 20000]); self.assertIn('只统计 10000,20000', out)
+        got, _ = self._ask(['1'], existing, [10000, 20000, 30000], [10000])
+        self.assertIsNone(got)
+    def test_no_terminal_keeps_current(self):
+        with patch.object(m, 'ask', side_effect=lambda p, d='': d), patch.object(m, 'has_tty', return_value=False), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(m.ask_scope(None, [443], []))
+            self.assertEqual(m.ask_scope({'ports': [10000], 'auto': False}, [443], []), [10000])
+    def test_set_scope_writes_config_and_restarts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = Path(temp) / 'config.json'
+            cfg.write_text(json.dumps({'ports': [10000, 20000, 30000], 'web': [10000], 'auto': True, 'backend': 'diag', 'billing': 'out'}))
+            calls = []
+            with patch.object(m, 'CONFIG', cfg), patch.object(m, 'scan_ports', return_value=([10000, 20000, 30000], 'proxy', [10000])), \
+                 patch.object(m, 'systemd_running', return_value=False), patch.object(m.shutil, 'which', return_value='/sbin/rc-service'), \
+                 patch.object(m.subprocess, 'run', side_effect=lambda cmd, **kw: calls.append(cmd[-1])), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                m.set_scope('10000,20000')
+            data = json.loads(cfg.read_text())
+            self.assertEqual((data['ports'], data['web'], data['auto'], data['billing']), ([10000, 20000], [10000], False, 'out'))
+            self.assertEqual(calls, ['stop', 'restart'])
+            self.assertIn('只统计端口 10000,20000', out.getvalue())
+            with patch.object(m, 'CONFIG', cfg), patch.object(m, 'scan_ports', return_value=([10000, 20000, 30000], 'proxy', [10000])), \
+                 patch.object(m, 'systemd_running', return_value=False), patch.object(m.shutil, 'which', return_value=None), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                m.set_scope('all')
+            data = json.loads(cfg.read_text())
+            self.assertEqual((data['ports'], data['auto']), ([10000, 20000, 30000], True))
+    def test_manual_scope_not_auto_merged(self):
+        cfg = {'ports': [10000, 20000], 'auto': False}
+        self.assertEqual(m.follow_ports(cfg, {10000, 20000, 30000}), ({10000, 20000, 30000}, False))
+
 if __name__=='__main__':unittest.main(verbosity=2)

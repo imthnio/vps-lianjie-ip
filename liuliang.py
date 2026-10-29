@@ -18,7 +18,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.35'
+VERSION = '1.0.36'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -916,6 +916,71 @@ def set_small(value=None):
     config['min_kb'] = kb
     CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n')
     print('已设置：' + ('隐藏 800KB 以下的 IP' if kb else '不隐藏小流量 IP'))
+
+
+# 名词小词典：统计范围 = 统计哪些端口的流量。
+#   整机：本机全部节点和网站端口（自动检测），以后新装的也自动并入；
+#   指定端口：只统计填的端口，比如 10000 是网站、20000 是节点，就填 10000,20000，别的端口不管、也不自动加。
+def ask_scope(existing=None, detected=(), web=()):
+    """问统计范围。返回 None = 整机；返回端口列表 = 只统计这些端口。直接回车 = 保持现在的设置。"""
+    manual = bool(existing) and existing.get('auto', True) is False
+    print('统计范围（现在：' + ('只统计 ' + ','.join(map(str, existing['ports'])) if manual else '整机') + '）')
+    print('  1) 整机：全部节点和网站端口，新装的自动并入' + ('' if manual else '  ← 直接回车'))
+    print('  2) 指定端口：只统计你填的端口' + ('  ← 直接回车' if manual else ''))
+    if detected:
+        print('  检测到：' + ' · '.join('%d %s' % (p, '网站' if p in set(web) else '节点') for p in detected))
+    got = ask('输入序号：')
+    if got == '1' or (got != '2' and not manual):
+        return None
+    default = ','.join(map(str, existing['ports'] if manual else detected))
+    while True:
+        got = ask('要统计的端口，多个用逗号隔开（如 10000,20000' + ('；直接回车 = ' + default if default else '') + '）：') or default
+        if not got:
+            print('至少填一个端口')
+            if not has_tty():
+                return None
+            continue
+        try:
+            return ports(got)
+        except ValueError as exc:
+            print(str(exc))
+            if not has_tty():
+                return None
+
+
+def set_scope(value=None):
+    """liuliang --scope：改统计范围。all = 整机，10000,20000 = 只统计这些端口，不带参数就一步一步问。"""
+    config = json.loads(CONFIG.read_text())
+    try:
+        detected, _mode, service = scan_ports(True)
+    except Exception:
+        detected, service = [], []
+    if value is None or value == '':
+        scope = ask_scope(config, detected, service)
+    elif value in ('all', 'auto'):
+        scope = None
+    else:
+        scope = ports(value)
+    # 整机：原来的端口一个不删（代理重启的瞬间可能检测不到），加上现在检测到的。
+    selected = scope or sorted(set(config['ports']) | set(detected))[:64]
+    web = sorted((set(service) | set(config.get('web') or [])) & set(selected))
+    config.update(ports=selected, web=web, auto=scope is None)
+    # 先停后台再改：后台内存里还是旧端口，改完重启才会用新的。
+    if systemd_running():
+        subprocess.run(['systemctl', 'stop', 'liuliang'], capture_output=True)
+    elif shutil.which('rc-service'):
+        subprocess.run(['rc-service', 'liuliang', 'stop'], capture_output=True)
+    try:
+        if config.get('backend') == 'nft':
+            reload_nft(config)   # 先把旧端口的计数落盘，再换统计规则
+        CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n')
+    finally:
+        if systemd_running():
+            subprocess.run(['systemctl', 'restart', 'liuliang'], capture_output=True)
+        elif shutil.which('rc-service'):
+            subprocess.run(['rc-service', 'liuliang', 'restart'], capture_output=True)
+    print('已设置统计范围：' + ('整机（端口 ' + ','.join(map(str, selected)) + '，新装的自动并入）' if scope is None
+                          else '只统计端口 ' + ','.join(map(str, selected))))
 
 
 def set_reset_day(value=None):
@@ -2811,6 +2876,10 @@ def install(args):
         if len(detected) > 64:
             print('监听端口超过 64 个，只统计其中 64 个。需要取舍时用 --ports 指定。')
             detected = detected[:64]
+        # 每次安装都问统计范围（直接回车保持现在的）：整机，还是只统计指定的几个端口。
+        scope = ask_scope(existing, detected, service)
+        if scope:
+            args.ports = ','.join(map(str, scope))
     selected, geo, updating = resolve_install(existing, args, detected)
     listed = ','.join(map(str, selected))
     # 网站端口（文件分享网盘等非代理服务）：访客门槛更低，表格里标「网站」。
@@ -2827,9 +2896,9 @@ def install(args):
         else:
             print('已安装 liuliang，更新到 ' + VERSION + '。保留端口 ' + listed + ' 和已有流量。')
     elif updating:
-        print('已安装 liuliang，更新到 ' + VERSION + '。端口改为 ' + listed + '。已有流量保留。')
+        print('已安装 liuliang，更新到 ' + VERSION + '。只统计端口 ' + listed + '。已有流量保留。')
     elif args.ports:
-        print('使用手动指定的端口：' + listed)
+        print('只统计指定的端口：' + listed)
     elif mode == 'proxy':
         print('自动检测到端口：' + listed + '（代理端口 + 其他对外服务端口；NAT VPS 取内部监听端口）')
     elif mode == 'frontend':
@@ -2856,8 +2925,8 @@ def install(args):
             collect({'ports': selected, 'geo': False})
         except Exception as exc:
             print('更新前没能记下最后一次采样，继续更新：' + str(exc), file=sys.stderr)
-    # auto：以后新装的网站/节点端口由后台自动并入；手动 --ports 的不自动加。
-    auto = not args.ports if not updating or args.ports else bool(existing.get('auto', True))
+    # auto：整机 = 以后新装的网站/节点端口由后台自动并入；指定端口（安装时选 2 或 --ports）不自动加。
+    auto = not args.ports
     # realip：网站在 Cloudflare 后面时，从本机反代转发的请求头里认真实访客 IP。
     if getattr(args, 'realip', None) is not None:
         realip = args.realip != 'no'
@@ -2973,6 +3042,7 @@ start_pre() { /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py --once; }
         config['reset_day'] = ask_reset_day(1)
         CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n')
     print('计费方式：' + BILLING.get(config['billing'], '不确定（三种都显示）') + '；每月 %d 号重置' % config['reset_day'] + '（以后改：liuliang --billing / liuliang --reset-day 几号）')
+    print('统计范围：' + ('整机，新装的端口自动并入' if auto else '只统计端口 ' + listed) + '（以后改：liuliang --scope）')
     print('只看网站访客：liuliang --web    排查问题：liuliang --doctor')
     print('查看某个 IP 近7天访问的应用/网站：运行 liuliang 后输入序号，或 liuliang --ip IP')
 
@@ -3096,6 +3166,7 @@ def main():
     parser.add_argument('--billing', nargs='?', const='', choices=['', 'both', 'out', 'max', 'all'], help='设置服务商计费方式：both 进+出 / out 出站 / max 取大 / all 三种都显示')
     parser.add_argument('--small', nargs='?', const='', help='隐藏 800KB 以下的 IP：on 隐藏 / off 不隐藏，不带参数就一步一步问')
     parser.add_argument('--reset-day', nargs='?', const='', help='设置服务商每月几号重置流量（1-31），不带数字就一步一步问')
+    parser.add_argument('--scope', nargs='?', const='', help='统计范围：all 整机（全部节点和网站端口）或 10000,20000 只统计这些端口，不带参数就一步一步问')
     parser.add_argument('--log', choices=['yes','no'], help='高级：安装时是否自动打开代理访问日志（默认打开，内存<48MB 默认不开）')
     parser.add_argument('--enable-log', action='store_true', help='自动打开 Xray / sing-box 的访问日志（看不到访问的网站时用）')
     parser.add_argument('-y', '--yes', action='store_true', help=argparse.SUPPRESS)
@@ -3119,6 +3190,8 @@ def main():
         set_small(args.small); return
     if args.reset_day is not None:
         set_reset_day(args.reset_day or None); return
+    if args.scope is not None:
+        set_scope(args.scope); return
     config = json.loads(CONFIG.read_text())
     if args.once:
         collect(config)
