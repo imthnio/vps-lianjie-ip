@@ -1592,6 +1592,7 @@ class V136Tests(unittest.TestCase):
             with patch.object(m, 'CONFIG', cfg), patch.object(m, 'scan_ports', return_value=([10000, 20000, 30000], 'proxy', [10000])), \
                  patch.object(m, 'systemd_running', return_value=False), patch.object(m.shutil, 'which', return_value='/sbin/rc-service'), \
                  patch.object(m.subprocess, 'run', side_effect=lambda cmd, **kw: calls.append(cmd[-1])), \
+                 patch.object(m, 'port_notes', return_value=[]), \
                  contextlib.redirect_stdout(io.StringIO()) as out:
                 m.set_scope('10000,20000')
             data = json.loads(cfg.read_text())
@@ -1620,5 +1621,29 @@ class V136Tests(unittest.TestCase):
     def test_manual_scope_not_auto_merged(self):
         cfg = {'ports': [10000, 20000], 'auto': False}
         self.assertEqual(m.follow_ports(cfg, {10000, 20000, 30000}), ({10000, 20000, 30000}, False))
+
+class V138Tests(unittest.TestCase):
+    """中转/Docker 转发的端口也要数；手动填的端口本机没人监听时要提醒。"""
+    def test_forward_chain_counts_by_original_port(self):
+        s = m.rules([39837], forward=True)
+        self.assertIn('hook forward', s)
+        self.assertIn('ct status dnat ct direction original ct original proto-dst { 39837 } update @up4 { ip saddr counter }', s)
+        self.assertIn('ct status dnat ct direction reply ct original proto-dst { 39837 } update @down6 { ip6 daddr counter }', s)
+        self.assertNotIn('drop', s); self.assertNotIn('flush', s)
+    def test_nft_rules_falls_back_without_conntrack(self):
+        with patch.object(m, 'nft_works', return_value=(True, '')):
+            self.assertIn('hook forward', m.nft_rules([443]))
+        with patch.object(m, 'nft_works', return_value=(False, 'No such file')):
+            s = m.nft_rules([443])
+        self.assertNotIn('forward', s); self.assertIn('tcp dport { 443 }', s)
+    def test_port_notes(self):
+        table = ('tcp LISTEN 0 4096 *:443 *:* users:(("xray",pid=8,fd=3))\n'
+                 'tcp LISTEN 0 4096 127.0.0.1:10086 *:* users:(("xray",pid=8,fd=4))\n'
+                 'tcp LISTEN 0 128 0.0.0.0:22 *:* users:(("sshd",pid=1,fd=3))\n')
+        self.assertEqual(m.port_notes([443], table), [])
+        notes = m.port_notes([39837], table)
+        self.assertIn('没有程序在监听端口 39837', notes[0]); self.assertIn('其他端口：443', notes[-1])
+        self.assertIn('10086 只监听在 127.0.0.1', m.port_notes([10086], table)[0])
+        self.assertEqual(m.port_notes([39837], ''), [])  # 读不到监听表就不乱报
 
 if __name__=='__main__':unittest.main(verbosity=2)

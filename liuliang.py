@@ -18,7 +18,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.37'
+VERSION = '1.0.38'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -64,8 +64,16 @@ def ports(value):
     return result
 
 
-def rules(selected, web=()):
-    """up/down 四个集合按 IP 数全部端口的字节；web4/web6 只数网站端口（两个方向合计）。"""
+def rules(selected, web=(), forward=False):
+    """up/down 四个集合按 IP 数全部端口的字节；web4/web6 只数网站端口（两个方向合计）。
+
+    forward=True 再加一条 forward 链：中转机用 iptables/nft 把端口转发给别的机器、
+    Docker 用 -p 映射的端口，包不进 input/output，只走 forward，以前一个字节都数不到。
+    转发后目的端口已经被改掉，所以按 conntrack 里客户端最初连的端口（ct original proto-dst）认。
+    本机进程收发的包不走 forward，不会和 input/output 重复。
+    只认做过目的地址转换（ct status dnat）的连接：本机兼做 WireGuard 等网关时，
+    别人借道出去访问外网 443 的流量不会被错算进来。
+    """
     selected = ports(','.join(map(str, selected)))
     portset = '{ ' + ', '.join(map(str, selected)) + ' }'
     web = sorted(set(web) & set(selected))
@@ -84,7 +92,22 @@ def rules(selected, web=()):
             if web:
                 lines.append(f'  meta nfproto ipv{version} tcp {field} {webset} update @web{version} {{ {family} {address} counter }}')
         lines.append(' }')
+    if forward:
+        # 名词小词典：original = 客户端发来的方向（客户端是源地址）；reply = 回给客户端的方向（客户端是目的地址）。
+        lines.append(' chain forward { type filter hook forward priority 11; policy accept;')
+        for version, family in [(4, 'ip'), (6, 'ip6')]:
+            for direction, ct, address in [('up', 'original', 'saddr'), ('down', 'reply', 'daddr')]:
+                lines.append(f'  meta nfproto ipv{version} meta l4proto {{ tcp, udp }} ct status dnat ct direction {ct} ct original proto-dst {portset} update @{direction}{version} {{ {family} {address} counter }}')
+        lines.append(' }')
     return '\n'.join(lines + ['}', ''])
+
+
+def nft_rules(selected, web=()):
+    """优先用带 forward 链的规则；这台的 nft/内核不认 conntrack 表达式时，退回只数本机进出的规则。"""
+    text = rules(selected, web, forward=True)
+    if nft_works(text)[0]:
+        return text
+    return rules(selected, web)
 
 
 def ensure_table():
@@ -619,6 +642,40 @@ def listening_ports(proxy_only=True):
     return detect_ports(proxy_only)[0]
 
 
+def port_notes(selected, text=None):
+    """统计的端口本机有没有在对外监听。返回给人看的提示（空 = 都正常，或读不到监听表）。
+
+    手动填端口最常见的两种填错：NAT 小鸡填了商家给的外网端口（本机监听的是内部端口），
+    或者填了只绑 127.0.0.1 的代理端口（来访全是本机反代，看不到用户 IP）。
+    中转/Docker 转发的端口本机也没人监听，但 forward 链能数到，所以只提醒、不拦。
+    """
+    try:
+        sockets = list(iter_sockets(read_socket_table() if text is None else text))
+    except Exception:
+        return []
+    if not sockets:
+        return []
+    public = {item['port'] for item in sockets if item['scope'] != 'loop'}
+    loop = {item['port'] for item in sockets if item['scope'] == 'loop'} - public
+    local = [p for p in selected if p in loop]
+    gone = [p for p in selected if p not in public and p not in loop]
+    notes = []
+    if local:
+        notes.append('端口 %s 只监听在 127.0.0.1：来访都是本机反代转进来的，看不到用户 IP，'
+                     '要统计前面对外的那个端口（如 443）' % ','.join(map(str, local)))
+    if gone:
+        notes.append('本机没有程序在监听端口 %s：NAT 小鸡要填内部端口（不是商家给的外网端口）；'
+                     '是中转/Docker 转发的端口就不用管这条' % ','.join(map(str, gone)))
+    # UDP 临时端口多半是代理自己往外连的客户端套接字，不列出来。
+    bounds = ephemeral_bounds()
+    others = sorted({item['port'] for item in sockets
+                     if item['scope'] != 'loop' and item['port'] != 22 and item['port'] not in selected
+                     and (item['proto'] == 'tcp' or not in_ephemeral(item['port'], bounds))})
+    if notes and others:
+        notes.append('本机在对外监听的其他端口：' + ','.join(map(str, others[:20])))
+    return notes
+
+
 def saved_config():
     """已安装时读出端口和城市查询开关。读不到就当没装过。"""
     try:
@@ -957,6 +1014,8 @@ def ask_scope(existing=None, detected=(), web=()):
         picked += new
     picked = sorted(picked)[:64]
     print('  只统计：' + ','.join(map(str, picked)))
+    for note in port_notes(picked):
+        print('  注意：' + note)
     return picked
 
 
@@ -993,6 +1052,10 @@ def set_scope(value=None):
             subprocess.run(['rc-service', 'liuliang', 'restart'], capture_output=True)
     print('已设置统计范围：' + ('整机（端口 ' + ','.join(map(str, selected)) + '，新装的自动并入）' if scope is None
                           else '只统计端口 ' + ','.join(map(str, selected))))
+    # 一步一步问的时候 ask_scope 已经提醒过了。
+    if scope is not None and value:
+        for note in port_notes(selected):
+            print('注意：' + note)
 
 
 def set_reset_day(value=None):
@@ -1723,7 +1786,7 @@ def follow_ports(config, seen):
 
 def reload_nft(config):
     """端口变了：先把旧表里的计数落盘，再换表，并清掉基线（新表从 0 数起）。"""
-    text = rules(config['ports'], config.get('web') or [])
+    text = nft_rules(config['ports'], config.get('web') or [])
     collect(dict(config, geo=False))
     with open(LOCK, 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -2908,7 +2971,7 @@ def install(args):
     # 网站端口（文件分享网盘等非代理服务）：访客门槛更低，表格里标「网站」。
     web = sorted((set(service) | set((existing or {}).get('web') or [])) & set(selected))
     # 先探测、再停服务。nft 没权限时改走连接采样，两种都不行才退出。
-    nft_text = rules(selected, web)
+    nft_text = nft_rules(selected, web)
     backend, sources, nft_detail = probe_backend(nft_text)
     if backend == 'diag':
         explain_diag(nft_detail, sources)
@@ -3109,6 +3172,20 @@ def doctor():
     state = service_state()
     print(ok('没在运行' not in state) + ' 后台服务：' + state)
     print('  统计端口：' + ','.join(map(str, config['ports'])))
+    notes = port_notes(config['ports'])
+    for note in notes:
+        print(ok(False) + ' ' + note)
+    if config.get('backend') != 'diag':
+        try:
+            text = Path(CONFIG.parent / 'counters.nft').read_text()
+        except OSError:
+            text = ''
+        try:
+            loaded = table_loaded()
+        except OSError:
+            loaded = False
+        print(ok(loaded) + ' nftables 计数表：' + ('已加载' if loaded else '没加载（后台每分钟会自动重建）')
+              + ('，中转/Docker 转发的端口也统计' if 'hook forward' in text else '，只统计本机收发（重跑一键安装可加上转发端口）'))
     print('  网站端口：' + (','.join(map(str, config.get('web') or [])) or '无'))
     try:
         backends = backend_ports()
@@ -3325,6 +3402,8 @@ def report(config, web_only=False, show_all=False, wide=True):
    if note:print(col(note,D))
    # 没有任何 IP 记录时，说一下最可能的原因。
    if not web_only and not cfhidden and not scanhidden:
+    # 端口填错（NAT 外网端口、只绑 127.0.0.1 的端口）是最常见的原因，查得到就直接说。
+    for t in port_notes(config['ports']):print(col('注意：'+t,Y))
     for t in ('可能的原因：','  1. 还没人用过节点（用一下，2 分钟后再看）','  2. 节点端口没在统计里：liuliang --doctor','  3. 统计没在跑：liuliang --doctor 看后台服务'):print(col(t,D))
    # 网卡用量不依赖 IP 记录，有数据就照样显示。
    for t in billing_lines(config,c,now):print(col(t,D))
