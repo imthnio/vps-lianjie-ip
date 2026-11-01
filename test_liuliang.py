@@ -1708,4 +1708,25 @@ class V139Tests(unittest.TestCase):
         self.assertNotIn('hy2:30133', text); self.assertNotIn('带 *', text)
         self.assertIn('近7天没有流量的节点：端口 39837（英国Hysteria2）', text)
 
+    def test_report_highlights_key_info_on_terminal(self):
+        class Tty(io.StringIO):
+            def isatty(self): return True
+        now = m.time.time()
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db')
+            db.execute('insert into traffic(ts,ip,bytes) values(?,?,?)', (now - 60, 'hy2:30133', 7 * 1024 * 1024))
+            db.execute('insert into clients(ip,last_seen) values(?,?)', ('hy2:30133', now - 60))
+            db.execute('create table nic(ts REAL, rx INTEGER, tx INTEGER)')
+            db.execute('insert into nic values(?,?,?)', (now - 60, 5 << 20, 5 << 20))
+            db.commit(); db.close()
+            out = Tty()
+            with patch.object(m, 'DATA', Path(temp)), patch.object(m, 'hy_names', return_value={30133: 'fanmo'}), \
+                 patch.object(m.sys, 'stdin', io.StringIO()), contextlib.redirect_stdout(out):
+                m.report({'ports': [30133], 'diag': {'udp': 'hysteria'}}, wide=False)
+        text = out.getvalue()
+        self.assertIn(m.B + m.G + '端口 30133', text)          # 24小时内有流量：绿色加粗
+        self.assertIn(m.B + m.Y + '  共 ', text)               # 网卡总用量：黄色加粗
+        self.assertIn(m.B + '合计 1 个节点', text)
+        self.assertIn(m.D + '网卡用量含', text)                 # 次要说明变淡
+
 if __name__=='__main__':unittest.main(verbosity=2)

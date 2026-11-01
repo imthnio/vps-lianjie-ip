@@ -178,7 +178,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.40'
+VERSION = '1.0.41'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -3719,6 +3719,12 @@ def sz(n):
   if v<1024 or q==u[-1]: break
   v/=1024
  return f'{v:.0f} {q}' if q=='B' or v>=10 else f'{v:.1f} {q}'
+def tip(t):
+ # 表格下面的说明：要紧的（网卡总用量、没统计到的时段、没流量的节点）加粗/黄色，其余变淡。
+ s=t.strip()
+ if s.startswith('共 ') or re.match(r'(出站|进\+出|取大) ',s):return col(t,B,Y)
+ if '才开始记' in s or '没有流量的节点' in s:return col(t,B,Y)
+ return col(t,D)
 def ww(s): return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in 'WFA' else 1 for c in str(s))
 def cell(s,n): return str(s)+' '*(n-ww(s))
 def diff(c,ip,a,b,col='bytes'):
@@ -3793,14 +3799,14 @@ def report(config, web_only=False, show_all=False, wide=True):
    note=(note+'\n' if note else '')+'这台是 NAT 小鸡，商家的网关把来访地址\n换成了 %s，看不到用户真实 IP，\n只能显示总流量'%'、'.join(natips[:2])
   if not rows:
    print('(近7天没有网站访客)' if web_only else ('(近7天无达到 %dKB 的流量记录'%(limit//1024) if limit else '(近7天没有流量记录')+('，也没有网站访客' if config.get('web') else '')+')')
-   if note:print(col(note,D))
+   if note:print('\n'.join(tip(t) for t in note.split('\n')))
    # 没有任何 IP 记录时，说一下最可能的原因。
    if not web_only and not cfhidden and not scanhidden:
     # 端口填错（NAT 外网端口、只绑 127.0.0.1 的端口）是最常见的原因，查得到就直接说。
     for t in port_notes(config['ports']):print(col('注意：'+t,Y))
     for t in ('可能的原因：','  1. 还没人用过节点（用一下，2 分钟后再看）','  2. 节点端口没在统计里：liuliang --doctor','  3. 统计没在跑：liuliang --doctor 看后台服务'):print(col(t,D))
    # 网卡用量不依赖 IP 记录，有数据就照样显示。
-   for t in billing_lines(config,c,now):print(col(t,D))
+   for t in billing_lines(config,c,now):print(tip(t))
    if cfhidden and not c.execute("select 1 from metadata where key='realip_last'").fetchone():
     print('只看到 Cloudflare 的 IP、没有真实访客：运行 liuliang --doctor 排查')
    return
@@ -3815,12 +3821,13 @@ def report(config, web_only=False, show_all=False, wide=True):
     v=vals(n,ip,net,pl,d,w,ls,kind,mark);out=[]
     for i,x in enumerate(v):
      st=[D,X] if d<=0 and w<=0 or kind=='CF节点' else ([B,G] if i==1 and d>0 else [])
+     if i==5 and w>0 and not st:st=[B]
      if i==4 and d>=100*1024**2 or i==5 and w>=1024**3:st=[B,Y]
      if i==6:st=[B,G] if age<=3600 else ([D,X] if age>259200 else [])
      out.append(col(cell(x,N[i]),*st))
     print('│ '+' │ '.join(out)+' │')
    real=[r for r in rows if r[7]!='CF节点']
-   print(line('└','┴','┘'));a=sum(1 for r in real if r[3]>0 or r[4]>0);print(('合计：节点数 %d · 有流量节点数 %d' if real and all(r[0].startswith(HY_PREFIX) for r in real) else '合计：IP 数 %d · 有流量 IP 数 %d')%(len(real),a)+' · 近24小时总流量 %s · 近7天总流量 %s'%(sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))))
+   print(line('└','┴','┘'));a=sum(1 for r in real if r[3]>0 or r[4]>0);print(col(('合计：节点数 %d · 有流量节点数 %d' if real and all(r[0].startswith(HY_PREFIX) for r in real) else '合计：IP 数 %d · 有流量 IP 数 %d')%(len(real),a)+' · 近24小时总流量 %s · 近7天总流量 %s'%(sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))),B))
   else:
    real=[r for r in rows if r[7]!='CF节点']
    # 窄表（默认）：只放 序号、IP、7天流量、最后上网、城市，约 45 格宽，手机竖屏也能一行看完。
@@ -3830,15 +3837,19 @@ def report(config, web_only=False, show_all=False, wide=True):
    for n,r in enumerate(rows,1):K=[max(K[i],ww(x)) for i,x in enumerate(cv(n,r))]
    print(col(' '.join(cell(x,K[i]) for i,x in enumerate(hc)).rstrip(),B,C))
    for n,r in enumerate(rows,1):
-    st=[D,X] if r[4]<=0 or r[7]=='CF节点' else []
-    print(col(' '.join(cell(x,K[i]) for i,x in enumerate(cv(n,r))).rstrip(),*st))
-   print('合计 %d %s · 24小时 %s · 7天 %s'%(len(real),'个节点' if real and all(r[0].startswith(HY_PREFIX) for r in real) else '个 IP',sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))))
+    v=cv(n,r)
+    if r[4]<=0 or r[7]=='CF节点':
+     print(col(' '.join(cell(x,K[i]) for i,x in enumerate(v)).rstrip(),D,X));continue
+    # 醒目：24 小时内有流量的 IP 绿色加粗，7天流量加粗（满 1GB 黄色），1 小时内上过网的时间绿色加粗。
+    st=[[],[B,G] if r[3]>0 else [B],[B,Y] if r[4]>=1024**3 else [B],[B,G] if r[6]<=3600 else ([D] if r[6]>259200 else []),[]]
+    print(' '.join(col(cell(x,K[i]) if i<len(v)-1 else x,*st[i]) for i,x in enumerate(v)))
+   print(col('合计 %d %s · 24小时 %s · 7天 %s'%(len(real),'个节点' if real and all(r[0].startswith(HY_PREFIX) for r in real) else '个 IP',sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))),B))
   # 服务商口径：整块网卡的进/出用量，按 config.json 里的 billing 显示。
-  for t in billing_lines(config,c,now):print(col(t,D))
+  for t in billing_lines(config,c,now):print(tip(t))
   if any(r[8] for r in rows) and not wide:print(col('带 * = 没有访问记录，按最后有数据的时间',D))
   if any(r[8] for r in rows) and wide:print(col('最后上网：这个 IP 最后一次打开网站/App 或最后有数据来往的时间（取更晚的，每分钟更新）。带 * 的读不到它打开网站的记录（代理没开日志，或是网站访客），'
    '手机放着不用、后台心跳也算数据，所以可能比实际晚',D))
-  if note:print(col(note,D))
+  if note:print('\n'.join(tip(t) for t in note.split('\n')))
   picks=[r[0] for r in rows]
  finally:
   c.close()
