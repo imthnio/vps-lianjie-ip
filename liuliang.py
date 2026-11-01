@@ -18,7 +18,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.38'
+VERSION = '1.0.39'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -373,7 +373,7 @@ def scan_ips(c, rows, config, opened, now, hasweb=True):
     cand, bad = [], set()
     for r in rows:
         ip, w = r[0], r[4]
-        if opened.get(ip) or (hasweb and diff(c, ip, since, now, 'web') > 0):
+        if opened.get(ip) or ip.startswith(HY_PREFIX) or (hasweb and diff(c, ip, since, now, 'web') > 0):
             continue
         d = dirs.get(ip)
         if (tiny and w < tiny) or (small and w < small and d and min(d) == 0 and max(d) > 0):
@@ -409,7 +409,8 @@ def short(text, width=10):
 
 def collect(config, sniffer=None, sites=None):
     if config.get('backend') == 'diag':
-        diag_tick(config, True, sniffer=sniffer, sites=sites)
+        hy = HyStats(config['ports']) if (config.get('diag') or {}).get('udp') == 'hysteria' else None
+        diag_tick(config, True, sniffer=sniffer, sites=sites, hy=hy)
         if config.get('geo', True):
             geo_resolve()
         return
@@ -445,6 +446,8 @@ def geo_resolve():
     c = open_db()
     try:
         for ip, in c.execute('SELECT ip FROM clients WHERE geo_due<=? ORDER BY last_seen DESC LIMIT 10', (now,)).fetchall():
+            if ip.startswith(HY_PREFIX):   # hy2 按用户记的流量，没有 IP
+                c.execute("UPDATE clients SET country='',city='hy2节点',geo_due=? WHERE ip=?", (now + 30 * 86400, ip)); c.commit(); continue
             if is_nat_ip(ip):   # 内网地址查不到归属地，不浪费网络
                 c.execute("UPDATE clients SET country='',city='内网',geo_due=? WHERE ip=?", (now + 30 * 86400, ip)); c.commit(); continue
             try:
@@ -1106,7 +1109,9 @@ def detect_diag_sources():
     """nft 不可用时还能怎么数字节。TCP 优先 ss（不要 NET_ADMIN），UDP 再看 conntrack / 抓包。"""
     tcp = 'ss' if ss_works() else None
     udp = None
-    if conntrack_text() is not None:
+    # 容器里 /proc/net/nf_conntrack 常常读得到、但一行都没有（这个网络空间里没开连接跟踪），
+    # 以前只看「能不能读」就选了它，UDP 一个字节都数不到。至少有一条连接才算能用。
+    if (conntrack_text() or '').strip():
         udp = 'conntrack'
         if tcp is None:
             tcp = 'conntrack'
@@ -1115,6 +1120,9 @@ def detect_diag_sources():
             tcp = 'raw'
         if udp is None:
             udp = 'raw'
+    # 最后一招：hy2 节点自己的流量统计接口（只有 UDP 代理用得上）。
+    if udp is None and hy_processes():
+        udp = 'hysteria'
     return {'tcp': tcp, 'udp': udp}
 
 
@@ -1143,6 +1151,7 @@ def explain_diag(detail, sources):
     udp_how = {
         'conntrack': 'UDP 读取 conntrack',
         'raw': 'UDP 按网卡计数',
+        'hysteria': 'UDP 读取 hy2 节点自带的流量统计（按用户，看不到来访 IP）',
     }.get(sources.get('udp'), 'UDP 统计不到（纯 UDP 代理如 hy2 这次没有字节数）')
     print('nftables 不可用' + why + '。改用连接采样，安装继续：' + tcp_how + '；' + udp_how + '。')
 
@@ -1336,6 +1345,162 @@ class PacketPump:
             data, web = self.pending, self.pending_web
             self.pending, self.pending_web = {}, {}
             return data, web
+
+
+# ---- Hysteria2 自带的流量统计接口 ----
+# 名词小词典：trafficStats = Hysteria2 配置里的一个开关，打开后它在本机开一个小接口，
+# 报告每个用户收发了多少字节。容器小鸡（LXC 等）里 nftables、抓包都没权限，conntrack 也是空的，
+# 纯 UDP 的 hy2 节点用别的办法一个字节都数不到，只能问它自己。
+# 这个接口只给「用户」的流量，不给来访 IP，所以这类流量在表格里记成 hy2:端口（多用户时 hy2:端口/用户名）。
+HY_PREFIX = 'hy2:'
+
+
+def hy_processes():
+    """正在运行的 hysteria 服务端：[(pid, 命令行, 工作目录)]。"""
+    found = []
+    for d in Path('/proc').glob('[0-9]*'):
+        try:
+            argv = [a.decode(errors='replace') for a in (d / 'cmdline').read_bytes().split(b'\0') if a]
+            cwd = os.readlink(str(d / 'cwd'))
+        except OSError:
+            continue
+        if argv and 'hysteria' in os.path.basename(argv[0]).lower() and 'server' in argv[1:]:
+            found.append((d.name, argv, cwd))
+    return found
+
+
+def hy_config(argv, cwd):
+    """hysteria 用的配置文件：-c / --config，没写时是工作目录下的 config.yaml。"""
+    args = argv[1:]
+    for i, arg in enumerate(args):
+        key, eq, value = arg.partition('=')
+        if key in ('-c', '--config'):
+            value = value if eq else (args[i + 1] if i + 1 < len(args) else '')
+            if value:
+                return Path(cwd, value)
+    return Path(cwd, 'config.yaml')
+
+
+def hy_port(text):
+    """配置里 listen 的端口（顶格的 listen: ":30133"）。"""
+    got = re.search(r'^listen:\s*["\']?[^"\'\s#]*:(\d+)', text, re.M)
+    return int(got.group(1)) if got else None
+
+
+def hy_stats(text):
+    """配置里已经有的 trafficStats：返回 (地址, 密钥)，没有返回 None。"""
+    got = re.search(r'^trafficStats:[ \t]*\n((?:[ \t]+.*\n?|[ \t]*\n)*)', text, re.M)
+    if not got:
+        return None
+    body = got.group(1)
+    listen = re.search(r'^\s+listen:\s*["\']?([^"\'\s#]+)', body, re.M)
+    secret = re.search(r'^\s+secret:\s*["\']?([^"\'\s#]*)', body, re.M)
+    if not listen:
+        return None
+    addr = listen.group(1)
+    # 只写了 :端口 时接口监听全部地址，本机用 127.0.0.1 访问。
+    if addr.startswith(':'):
+        addr = '127.0.0.1' + addr
+    return addr, secret.group(1) if secret else ''
+
+
+def hy_nodes(selected=None):
+    """统计端口上正在跑的 hy2 节点：[(端口, 进程号, 配置文件, (地址, 密钥) 或 None)]。"""
+    nodes = []
+    for pid, argv, cwd in hy_processes():
+        path = hy_config(argv, cwd)
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        port = hy_port(text)
+        if port is None or (selected is not None and port not in selected):
+            continue
+        nodes.append((port, pid, path, hy_stats(text)))
+    return sorted(nodes)
+
+
+def hy_traffic(addr, secret, timeout=2):
+    """读一次接口并清零：{用户: 字节}。读完清零，下一次拿到的就是这之间新增的。"""
+    import urllib.request
+    req = urllib.request.Request('http://' + addr + '/traffic?clear=1', headers={'Authorization': secret})
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        data = json.load(response)
+    out = {}
+    for user, v in (data or {}).items():
+        if isinstance(v, dict):
+            n = int(v.get('tx') or 0) + int(v.get('rx') or 0)
+            if n > 0:
+                out[str(user)] = n
+    return out
+
+
+def hy_label(port, user):
+    # 密码认证时 hysteria 把所有人都叫 user，这时只写端口。
+    return HY_PREFIX + str(port) + ('' if user in ('', 'user') else '/' + ''.join(ch for ch in user if ch.isprintable())[:24])
+
+
+def enable_hy_stats(selected, assume_yes=False):
+    """给统计端口上还没开 trafficStats 的 hy2 节点打开它（先备份配置，再重启节点）。返回打开了几个。"""
+    import secrets
+    todo = [(port, pid, path) for port, pid, path, stats in hy_nodes(set(selected)) if stats is None]
+    if not todo:
+        return 0
+    print('这台机器数不到 UDP 流量（容器里 nftables、抓包都没权限），hy2 节点 '
+          + ','.join(str(p) for p, _pid, _path in todo) + ' 要打开它自带的流量统计才能统计。')
+    print('  只在本机 127.0.0.1 上开一个带密钥的小接口，外面连不上；会先备份配置，节点重启几秒')
+    if not assume_yes:
+        got = ask('  现在打开吗？（推荐，直接回车）[y/n]：', 'y').lower()
+        if got in ('n', 'no'):
+            print('  已跳过，hy2 节点的流量这次统计不到。以后想开：重跑一键安装')
+            return 0
+    done = 0
+    for port, pid, path in todo:
+        try:
+            text = path.read_text()
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('127.0.0.1', 0))
+                free = s.getsockname()[1]
+            backup = path.with_name(path.name + '.liuliang-bak')
+            if not backup.exists():
+                shutil.copy2(str(path), str(backup))
+            block = '\n# liuliang：流量统计接口，只在本机，按用户报告收发字节\ntrafficStats:\n  listen: 127.0.0.1:%d\n  secret: %s\n' % (free, secrets.token_hex(16))
+            path.write_text(text.rstrip('\n') + '\n' + block)
+            why = restart_proxy(pid, 'hysteria', path)
+            if why:
+                print('  hy2 节点 %d：%s' % (port, why))
+            else:
+                print('  hy2 节点 %d：已打开流量统计（原配置备份在 %s）' % (port, backup))
+            done += 1
+        except Exception as exc:
+            print('  hy2 节点 %d 没打开：%s' % (port, exc))
+    return done
+
+
+class HyStats:
+    """后台每次采样时问一遍各个 hy2 节点的流量接口。节点重启、换配置后自动重新找。"""
+
+    def __init__(self, ports):
+        self.ports = set(ports)
+        self.nodes = []
+        self.refresh()
+
+    def refresh(self):
+        try:
+            self.nodes = [(port, stats) for port, _pid, _path, stats in hy_nodes(self.ports) if stats]
+        except Exception:
+            self.nodes = []
+
+    def drain(self):
+        activity = {}
+        for port, (addr, secret) in self.nodes:
+            try:
+                for user, n in hy_traffic(addr, secret).items():
+                    label = hy_label(port, user)
+                    activity[label] = activity.get(label, 0) + n
+            except Exception:
+                continue
+        return activity
 
 
 class ClosedWatcher:
@@ -1700,7 +1865,7 @@ def read_flow_snapshot(ports, sources):
     return flows
 
 
-def diag_tick(config, flush, pump=None, watcher=None, sniffer=None, sites=None):
+def diag_tick(config, flush, pump=None, watcher=None, sniffer=None, sites=None, hy=None):
     ports = config['ports']
     sources = config.get('diag') or {}
     now = time.time()
@@ -1735,6 +1900,10 @@ def diag_tick(config, flush, pump=None, watcher=None, sniffer=None, sites=None):
                 for ip, n in raw_web.items():
                     if n > 0:
                         web[ip] = web.get(ip, 0) + n
+            # hy2 接口读一次就清零，拿到的也全是新增字节。
+            if hy is not None:
+                for label, n in hy.drain().items():
+                    activity[label] = activity.get(label, 0) + n
             save_flows(c, baselines)
             add_pending(c, activity, now, web)
             save_realip(c, sniffer, now)
@@ -1811,6 +1980,7 @@ def diag_daemon(config):
         except OSError as exc:
             print('liuliang: ' + str(exc), file=sys.stderr, flush=True)
             pump = None
+    hy = HyStats(config['ports']) if sources.get('udp') == 'hysteria' else None
     sniffer = start_sniffer(config)
     sites = start_sites(config)
     last = 0
@@ -1822,6 +1992,10 @@ def diag_daemon(config):
                 scanned = now
                 refresh_sniffer(sniffer)
                 seen, changed = follow_ports(config, seen)
+                if hy is not None:
+                    # 节点重启换了进程、改了配置、新加了端口：重新找一遍接口。
+                    hy.ports = set(config['ports'])
+                    hy.refresh()
                 if changed:
                     if watcher is not None:
                         watcher.ports = set(config['ports'])
@@ -1830,7 +2004,7 @@ def diag_daemon(config):
                     if sites is not None:
                         sites.set_ports(config['ports'])
             flush = now - last >= INTERVAL
-            diag_tick(config, flush, pump, watcher, sniffer, sites)
+            diag_tick(config, flush, pump, watcher, sniffer, sites, hy)
             if flush:
                 last = now
                 if config.get('geo', True):
@@ -2066,7 +2240,7 @@ def service_unit(pid):
     return found[-1] if found else None
 
 
-PROXY_NAMES = {'xray': 'Xray', 'v2ray': 'V2Ray', 'sing-box': 'sing-box'}
+PROXY_NAMES = {'xray': 'Xray', 'v2ray': 'V2Ray', 'sing-box': 'sing-box', 'hysteria': 'Hysteria2'}
 PANEL = re.compile(r'(x-ui|3x-ui|s-ui|h-ui|marzban|hiddify|v2board|xrayr|v2bx)', re.I)
 # liuliang --enable-log 打开的访问日志写在这里。文件由 liuliang 读完后定期清空，不会越写越大。
 ACCESS_DIR = Path('/var/log/liuliang-access')
@@ -2975,6 +3149,8 @@ def install(args):
     backend, sources, nft_detail = probe_backend(nft_text)
     if backend == 'diag':
         explain_diag(nft_detail, sources)
+        if sources.get('udp') == 'hysteria':
+            enable_hy_stats(selected)
     if updating and not args.ports:
         added = sorted(set(selected) - set(existing['ports']))
         if added:
@@ -3186,6 +3362,22 @@ def doctor():
             loaded = False
         print(ok(loaded) + ' nftables 计数表：' + ('已加载' if loaded else '没加载（后台每分钟会自动重建）')
               + ('，中转/Docker 转发的端口也统计' if 'hook forward' in text else '，只统计本机收发（重跑一键安装可加上转发端口）'))
+    if config.get('backend') == 'diag':
+        diag = config.get('diag') or {}
+        if diag.get('udp') == 'conntrack' and not (conntrack_text() or '').strip():
+            print(ok(False) + ' conntrack 一条连接都没有，UDP（hy2/tuic）数不到：重跑一键安装会换成别的办法')
+        for port, pid, path, stats in hy_nodes(set(config['ports'])):
+            if diag.get('udp') != 'hysteria':
+                break
+            good = False
+            if stats:
+                try:
+                    with socket.create_connection(tuple(stats[0].rsplit(':', 1)), timeout=2):
+                        good = True
+                except (OSError, ValueError):
+                    pass
+            print(ok(good) + ' hy2 节点 %d 流量统计接口：' % port + ('%s 正常' % stats[0] if good else
+                  ('配置里有但连不上（节点改完配置还没重启？）' if stats else '没打开（%s 里没有 trafficStats），重跑一键安装会自动打开' % path)))
     print('  网站端口：' + (','.join(map(str, config.get('web') or [])) or '无'))
     try:
         backends = backend_ports()
@@ -3394,6 +3586,8 @@ def report(config, web_only=False, show_all=False, wide=True):
   # 打开了「隐藏小流量 IP」时，在表格下面说清楚藏了几个、怎么看、怎么关。
   if smallhidden:note=(note+'\n' if note else '')+'已隐藏 %d 个 %dKB 以下的 IP\n查看：liuliang --all · 关闭：liuliang --small off'%(smallhidden,limit//1024)
   # NAT 小鸡：来访地址全是商家网关的内网地址，看不到真实用户。
+  if any(r[0].startswith(HY_PREFIX) for r in rows):
+   note=(note+'\n' if note else '')+'hy2:端口 = 这个 hy2 节点的流量（读节点自带的统计，\n这台是容器，看不到来访 IP）'
   natips=[r[0] for r in rows if is_nat_ip(r[0])]
   if natips and len(natips)*2>=len(rows):
    note=(note+'\n' if note else '')+'这台是 NAT 小鸡，商家的网关把来访地址\n换成了 %s，看不到用户真实 IP，\n只能显示总流量'%'、'.join(natips[:2])

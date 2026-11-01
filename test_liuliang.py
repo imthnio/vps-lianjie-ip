@@ -274,7 +274,7 @@ class TrafficTests(unittest.TestCase):
                     stderr='netlink: Error: cache initialization failed: Operation not permitted\n')
             return m.subprocess.CompletedProcess(args, 0, stdout='', stderr='')
         with patch.object(m, 'run', side_effect=fake), \
-             patch.object(m, 'conntrack_text', return_value=''), \
+             patch.object(m, 'conntrack_text', return_value='ipv4 2 udp 17 29 src=1.1.1.1 dst=2.2.2.2 sport=1 dport=443 bytes=9\n'), \
              patch.object(m, 'raw_possible', return_value=False), \
              patch.object(m.shutil, 'which', return_value='/sbin/ss'):
             backend, sources, detail = m.probe_backend('table inet liuliang_v1 { }')
@@ -1645,5 +1645,50 @@ class V138Tests(unittest.TestCase):
         self.assertIn('没有程序在监听端口 39837', notes[0]); self.assertIn('其他端口：443', notes[-1])
         self.assertIn('10086 只监听在 127.0.0.1', m.port_notes([10086], table)[0])
         self.assertEqual(m.port_notes([39837], ''), [])  # 读不到监听表就不乱报
+
+class V139Tests(unittest.TestCase):
+    """容器小鸡：conntrack 是空的、不能抓包，hy2 纯 UDP 节点改读它自带的流量统计。"""
+    CFG = 'listen: ":30133"\n\nauth:\n  type: password\n  password: x\n\nquic:\n  maxIncomingStreams: 16\n'
+    def test_empty_conntrack_is_not_a_source(self):
+        with patch.object(m, 'ss_works', return_value=True), patch.object(m, 'conntrack_text', return_value=''), \
+             patch.object(m, 'raw_possible', return_value=False), patch.object(m, 'hy_processes', return_value=[('5', ['hysteria', 'server'], '/')]):
+            self.assertEqual(m.detect_diag_sources(), {'tcp': 'ss', 'udp': 'hysteria'})
+        with patch.object(m, 'ss_works', return_value=True), patch.object(m, 'conntrack_text', return_value=''), \
+             patch.object(m, 'raw_possible', return_value=False), patch.object(m, 'hy_processes', return_value=[]):
+            self.assertEqual(m.detect_diag_sources(), {'tcp': 'ss', 'udp': None})
+    def test_parse_hysteria_config(self):
+        self.assertEqual(m.hy_port(self.CFG), 30133)
+        self.assertIsNone(m.hy_stats(self.CFG))
+        cfg = self.CFG + 'trafficStats:\n  listen: 127.0.0.1:41234\n  secret: abc\n'
+        self.assertEqual(m.hy_stats(cfg), ('127.0.0.1:41234', 'abc'))
+        self.assertEqual(m.hy_stats('trafficStats:\n  listen: ":9999"\n'), ('127.0.0.1:9999', ''))
+        self.assertEqual(m.hy_config(['hysteria', 'server', '-c', 'n/config.yaml'], '/etc'), Path('/etc/n/config.yaml'))
+        self.assertEqual(m.hy_config(['hysteria', 'server'], '/opt/hy'), Path('/opt/hy/config.yaml'))
+    def test_labels(self):
+        self.assertEqual(m.hy_label(30133, 'user'), 'hy2:30133')
+        self.assertEqual(m.hy_label(30133, 'alice'), 'hy2:30133/alice')
+    def test_enable_writes_block_and_restarts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'config.yaml'; path.write_text(self.CFG)
+            with patch.object(m, 'hy_processes', return_value=[('5', ['hysteria', 'server', '-c', str(path)], temp)]), \
+                 patch.object(m, 'restart_proxy', return_value=None) as restart, contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(m.enable_hy_stats([30133], assume_yes=True), 1)
+                self.assertEqual(m.enable_hy_stats([30133], assume_yes=True), 0)   # 已经开了不重复改
+            addr, secret = m.hy_stats(path.read_text())
+            self.assertTrue(addr.startswith('127.0.0.1:')); self.assertEqual(len(secret), 32)
+            self.assertEqual((Path(temp) / 'config.yaml.liuliang-bak').read_text(), self.CFG)
+            restart.assert_called_once()
+    def test_diag_tick_counts_hysteria(self):
+        class FakeHy:
+            def drain(self): return {'hy2:30133': 5000}
+        with tempfile.TemporaryDirectory() as temp:
+            data, lock = Path(temp), Path(temp) / 'lock'
+            with patch.object(m, 'DATA', data), patch.object(m, 'LOCK', lock), \
+                 patch.object(m, 'read_flow_snapshot', return_value={}), patch.object(m, 'save_nic'):
+                m.diag_tick({'ports': [30133], 'diag': {'tcp': 'ss', 'udp': 'hysteria'}}, True, hy=FakeHy())
+            db = m.open_db(data / 'history-v1.db')
+            self.assertEqual(list(db.execute('select ip,bytes from traffic')), [('hy2:30133', 5000)])
+            self.assertEqual(db.execute('select count(*) from clients').fetchone()[0], 1)
+            db.close()
 
 if __name__=='__main__':unittest.main(verbosity=2)
