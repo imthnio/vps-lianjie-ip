@@ -178,7 +178,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.39'
+VERSION = '1.0.40'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -1071,6 +1071,15 @@ def billing_lines(config, c, now):
                '  和服务商后台对一下，对上的就是计费方式',
                '  改计费方式：liuliang --billing']
     out.append('网卡用量含 SSH、系统更新等全部流量')
+    # 表格只算「用户 ↔ 节点」这一段；节点替用户去外网取数据的那一段也走网卡，所以网卡差不多是 2 倍多。
+    out.append('表格只算用户↔节点，网卡还算节点↔外网，约 2 倍多')
+    # 刚装好（或刚修好）时，网卡用量里有一段是统计开始之前的，对不上是正常的。
+    try:
+        first = c.execute('SELECT min(ts) FROM traffic').fetchone()[0]
+    except sqlite3.OperationalError:
+        first = None
+    if first and first > now - 604800 + 3600:
+        out.append('%s 起才开始记，更早的网卡用量没统计到' % datetime.fromtimestamp(first, Z).strftime('%m-%d %H:%M'))
     return out
 
 
@@ -1593,6 +1602,27 @@ def hy_traffic(addr, secret, timeout=2):
             if n > 0:
                 out[str(user)] = n
     return out
+
+
+def hy_names():
+    """{端口: 节点名}。一键脚本把节点名写在配置旁边的 name 文件里（如 /etc/xray-node/nodes/1/name）。"""
+    names = {}
+    try:
+        for port, _pid, path, _stats in hy_nodes():
+            try:
+                name = ''.join(ch for ch in path.with_name('name').read_text().strip() if ch.isprintable())
+            except OSError:
+                name = ''
+            names[port] = name[:20]
+    except Exception:
+        pass
+    return names
+
+
+def hy_show(key):
+    """表格 IP 栏：hy2:30133 → 端口 30133，hy2:30133/alice → 端口 30133/alice；真 IP 原样。"""
+    key = str(key)
+    return '端口 ' + key[len(HY_PREFIX):] if key.startswith(HY_PREFIX) else key
 
 
 def hy_label(port, user):
@@ -3702,7 +3732,7 @@ def report(config, web_only=False, show_all=False, wide=True):
   print('(暂无流量数据库记录)');return
  # 显示门槛：默认 0（全显示），config.json 里 min_kb 可调。
  limit=int(config.get('min_kb',MIN_TRAFFIC_BYTES//1024) or 0)*1024
- c=sqlite3.connect(DB, timeout=30); rows=[]; cfhidden=0; picks=[]; smallhidden=0
+ c=sqlite3.connect(DB, timeout=30); rows=[]; cfhidden=0; picks=[]; smallhidden=0; names=None
  try:
   hasweb='web' in [r[1] for r in c.execute('PRAGMA table_info(traffic)')]
   cols=[r[1] for r in c.execute('PRAGMA table_info(clients)')]
@@ -3734,7 +3764,12 @@ def report(config, web_only=False, show_all=False, wide=True):
    # 最后上网 = 最后打开网站时间 和 最后一个数据包时间 里更晚的那个：
    # 长连接（看视频、下载）一直有数据时，时间也会跟着走，不会停在刚连上那一刻。
    mark='' if web_only or opened.get(ip) else '*';ls=max(float(opened.get(ip) or 0),float(ls))
-   age=max(0,now-float(ls));place=ci or co or ('Cloudflare' if cf else '未解析');rows.append((ip,isp_display(isp),place,d,w,ls,age,kind,mark))
+   age=max(0,now-float(ls));place=ci or co or ('Cloudflare' if cf else '未解析');net=isp_display(isp)
+   # hy2 按节点记的流量：城市栏放节点名，没有 IP 也就没有运营商；「*」是给读不到访问日志的 IP 用的，这里不标。
+   if ip.startswith(HY_PREFIX):
+    if names is None:names=hy_names()
+    port=ip[len(HY_PREFIX):].split('/')[0];place=names.get(int(port)) if port.isdigit() else '';place=place or 'hy2 节点';net='-';mark=''
+   rows.append((ip,net,place,d,w,ls,age,kind,mark))
   rows.sort(key=lambda r:-float(r[5]))
   # 疑似扫描 IP 不显示、不计入合计（规则见 scan_ips；liuliang --all 全显示）。
   scanhidden=0
@@ -3747,7 +3782,12 @@ def report(config, web_only=False, show_all=False, wide=True):
   if smallhidden:note=(note+'\n' if note else '')+'已隐藏 %d 个 %dKB 以下的 IP\n查看：liuliang --all · 关闭：liuliang --small off'%(smallhidden,limit//1024)
   # NAT 小鸡：来访地址全是商家网关的内网地址，看不到真实用户。
   if any(r[0].startswith(HY_PREFIX) for r in rows):
-   note=(note+'\n' if note else '')+'hy2:端口 = 这个 hy2 节点的流量（读节点自带的统计，\n这台是容器，看不到来访 IP）'
+   note=(note+'\n' if note else '')+'端口 X = 这个 hy2 节点的总流量：这台是容器，\n看不到用户 IP，只能按节点统计'
+  # hy2 节点按端口统计，近7天一点流量都没有的也说一声，免得以为漏统计了。
+  if (config.get('diag') or {}).get('udp')=='hysteria' and not web_only:
+   if names is None:names=hy_names()
+   idle=[p for p in config['ports'] if p in names and not c.execute('select 1 from traffic where ts>? and (ip=? or ip like ?) limit 1',(now-604800,HY_PREFIX+str(p),HY_PREFIX+str(p)+'/%')).fetchone()]
+   if idle:note=(note+'\n' if note else '')+'近7天没有流量的节点：'+'、'.join('端口 %d%s'%(p,'（'+names[p]+'）' if names.get(p) else '') for p in idle)
   natips=[r[0] for r in rows if is_nat_ip(r[0])]
   if natips and len(natips)*2>=len(rows):
    note=(note+'\n' if note else '')+'这台是 NAT 小鸡，商家的网关把来访地址\n换成了 %s，看不到用户真实 IP，\n只能显示总流量'%'、'.join(natips[:2])
@@ -3766,7 +3806,7 @@ def report(config, web_only=False, show_all=False, wide=True):
    return
   showkind=web_only is False and any(r[7]!='节点' for r in rows)
   h=['#','IP','运营商','城市','24小时','7天','最后上网' if not web_only else '最近访问']+(['访问'] if showkind else []);N=[2,15,8,6,7,7,11]+([4] if showkind else [])
-  vals=lambda n,ip,net,pl,d,w,ls,kind,mark:[n,ip,short(net),short(pl,10),sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%m-%d %H:%M')+mark]+([kind] if showkind else [])
+  vals=lambda n,ip,net,pl,d,w,ls,kind,mark:[n,hy_show(ip),short(net),short(pl,10),sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%m-%d %H:%M')+mark]+([kind] if showkind else [])
   for n,r in enumerate(rows,1):N=[max(N[i],ww(x)) for i,x in enumerate(vals(n,*r[:6],r[7],r[8]))]
   if wide:
    def line(a,m,b):return a+m.join('─'*(n+2) for n in N)+b
@@ -3780,19 +3820,19 @@ def report(config, web_only=False, show_all=False, wide=True):
      out.append(col(cell(x,N[i]),*st))
     print('│ '+' │ '.join(out)+' │')
    real=[r for r in rows if r[7]!='CF节点']
-   print(line('└','┴','┘'));a=sum(1 for r in real if r[3]>0 or r[4]>0);print('合计：IP 数 %d · 有流量 IP 数 %d · 近24小时总流量 %s · 近7天总流量 %s'%(len(real),a,sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))))
+   print(line('└','┴','┘'));a=sum(1 for r in real if r[3]>0 or r[4]>0);print(('合计：节点数 %d · 有流量节点数 %d' if real and all(r[0].startswith(HY_PREFIX) for r in real) else '合计：IP 数 %d · 有流量 IP 数 %d')%(len(real),a)+' · 近24小时总流量 %s · 近7天总流量 %s'%(sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))))
   else:
    real=[r for r in rows if r[7]!='CF节点']
    # 窄表（默认）：只放 序号、IP、7天流量、最后上网、城市，约 45 格宽，手机竖屏也能一行看完。
    # 运营商、近24小时在 liuliang --wide 里看。
    K=[2,15,7,12,6];hc=['#','IP','7天','最后上网' if not web_only else '最近访问','城市']
-   cv=lambda n,r:[str(n),r[0],sz(r[4]),datetime.fromtimestamp(r[5],Z).strftime('%m-%d %H:%M')+r[8],short(r[2],6)]
+   cv=lambda n,r:[str(n),hy_show(r[0]),sz(r[4]),datetime.fromtimestamp(r[5],Z).strftime('%m-%d %H:%M')+r[8],short(r[2],14 if r[0].startswith(HY_PREFIX) else 6)]
    for n,r in enumerate(rows,1):K=[max(K[i],ww(x)) for i,x in enumerate(cv(n,r))]
    print(col(' '.join(cell(x,K[i]) for i,x in enumerate(hc)).rstrip(),B,C))
    for n,r in enumerate(rows,1):
     st=[D,X] if r[4]<=0 or r[7]=='CF节点' else []
     print(col(' '.join(cell(x,K[i]) for i,x in enumerate(cv(n,r))).rstrip(),*st))
-   print('合计 %d 个 IP · 24小时 %s · 7天 %s'%(len(real),sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))))
+   print('合计 %d %s · 24小时 %s · 7天 %s'%(len(real),'个节点' if real and all(r[0].startswith(HY_PREFIX) for r in real) else '个 IP',sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))))
   # 服务商口径：整块网卡的进/出用量，按 config.json 里的 billing 显示。
   for t in billing_lines(config,c,now):print(col(t,D))
   if any(r[8] for r in rows) and not wide:print(col('带 * = 没有访问记录，按最后有数据的时间',D))

@@ -1691,4 +1691,21 @@ class V139Tests(unittest.TestCase):
             self.assertEqual(db.execute('select count(*) from clients').fetchone()[0], 1)
             db.close()
 
+    def test_report_shows_hy2_nodes_by_name(self):
+        now = m.time.time()
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db')
+            db.execute('insert into traffic(ts,ip,bytes) values(?,?,?)', (now - 60, 'hy2:30133', 7 * 1024 * 1024))
+            db.execute('insert into clients(ip,last_seen,city) values(?,?,?)', ('hy2:30133', now - 60, 'hy2节点'))
+            db.commit(); db.close()
+            cfg = {'ports': [30133, 39837], 'geo': True, 'min_kb': 800, 'diag': {'tcp': 'ss', 'udp': 'hysteria'}}
+            out = io.StringIO()
+            with patch.object(m, 'DATA', Path(temp)), patch.object(m, 'hy_names', return_value={30133: 'fanmo', 39837: '英国Hysteria2'}), \
+                 contextlib.redirect_stdout(out):
+                m.report(cfg, wide=False)
+        text = out.getvalue()
+        self.assertIn('端口 30133', text); self.assertIn('fanmo', text); self.assertIn('合计 1 个节点', text)
+        self.assertNotIn('hy2:30133', text); self.assertNotIn('带 *', text)
+        self.assertIn('近7天没有流量的节点：端口 39837（英国Hysteria2）', text)
+
 if __name__=='__main__':unittest.main(verbosity=2)
