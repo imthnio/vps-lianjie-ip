@@ -178,7 +178,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.41'
+VERSION = '1.0.42'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -309,6 +309,19 @@ def parse_duration(value):
 NAT_NETS = [ipaddress.ip_network(n) for n in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '100.64.0.0/10')]
 
 
+def nat_gateway(route='/proc/net/route'):
+    """本机只有内网地址、默认网关也是内网地址时返回网关（NAT 小鸡，如 10.91.0.1），否则空。"""
+    try:
+        for line in Path(route).read_text().splitlines()[1:]:
+            f = line.split()
+            if len(f) > 2 and f[1] == '00000000' and f[2] != '00000000':
+                gw = str(ipaddress.IPv4Address(struct.pack('<I', int(f[2], 16))))
+                return gw if ipaddress.ip_address(gw).is_private else ''
+    except (OSError, ValueError):
+        pass
+    return ''
+
+
 def is_nat_ip(value):
     try:
         ip = ipaddress.ip_address(str(value))
@@ -394,6 +407,10 @@ def open_db(path=None):
         c.execute("ALTER TABLE clients ADD COLUMN isp TEXT DEFAULT ''")
         # Re-resolve existing rows once so they gain an ISP label.
         c.execute("UPDATE clients SET geo_due=0 WHERE country<>''")
+        c.commit()
+    # 1.0.42 以前国家只存两位代码（GB），表格只显示城市。重新查一次，换成「英国-伦敦」要的中文国家名。
+    if c.execute("SELECT 1 FROM clients WHERE length(country)=2 AND country GLOB '[A-Z][A-Z]' LIMIT 1").fetchone():
+        c.execute("UPDATE clients SET geo_due=0 WHERE length(country)=2 AND country GLOB '[A-Z][A-Z]'")
         c.commit()
     return c
 
@@ -485,7 +502,7 @@ def save_sample(c, current, now, reset=False):
 def geo_lookup(ip):
     # 用到时才加载网络模块，后台常驻时少占几 MB 内存。
     import urllib.parse, urllib.request
-    url = 'https://ipwho.is/' + urllib.parse.quote(ip, safe=':') + '?fields=success,country_code,city,connection.isp&lang=zh-CN'
+    url = 'https://ipwho.is/' + urllib.parse.quote(ip, safe=':') + '?fields=success,country,country_code,city,connection.isp&lang=zh-CN'
     req = urllib.request.Request(url, headers={'User-Agent':'liuliang/' + VERSION})
     with urllib.request.urlopen(req, timeout=3) as response:
         data = json.load(response)
@@ -494,7 +511,16 @@ def geo_lookup(ip):
     # Never render terminal control sequences supplied by an external service.
     clean = lambda s: ''.join(ch for ch in str(s or '') if ch.isprintable())[:60]
     connection = data.get('connection') or {}
-    return clean(data.get('country_code')), clean(data.get('city')), clean(connection.get('isp'))
+    # 存国家中文名（如「英国」），表格里显示成「英国-伦敦」；接口没给中文名时退回两位代码。
+    return clean(data.get('country') or data.get('country_code')), clean(data.get('city')), clean(connection.get('isp'))
+
+
+def place_name(country, city):
+    """表格里的城市栏：国家-城市，如「英国-伦敦」。城市和国家同名（新加坡、香港）只写一个。"""
+    country, city = (country or '').strip(), (city or '').strip()
+    if country and city and city != country and not city.startswith(country):
+        return country + '-' + city
+    return city or country
 
 
 def isp_display(raw):
@@ -1929,14 +1955,23 @@ class RealIPSniffer:
             return data, seen, n
 
 
+# 不是网站的本机服务：DNS（53、853、5353）、邮件、数据库、缓存。它们不会收到反代转来的 HTTP，
+# 以前也被当成「网站后端端口」，自检里误报「监听但没统计：53」，回环口还要白白抓 DNS 包。
+NOT_WEB_PORTS = {25, 53, 110, 143, 465, 587, 853, 993, 995, 3306, 5353, 5432, 6379, 11211, 27017}
+NOT_WEB_PROCESS = {'dnsmasq', 'unbound', 'named', 'systemd-resolve', 'dnscrypt-proxy', 'smartdns', 'mosdns',
+                   'coredns', 'mysqld', 'mariadbd', 'postgres', 'redis-server', 'memcached', 'mongod',
+                   'postfix', 'exim', 'dovecot'}
+
+
 def backend_ports(text=None):
     """本机非代理、非 SSH 进程的 TCP 监听端口（含只绑 127.0.0.1 的）。反代
     就是把请求转给这些端口，在回环口上看这些端口就能读到转发头。"""
     sockets = iter_sockets(read_socket_table() if text is None else text)
     return sorted({
         item['port'] for item in sockets
-        if item['proto'] == 'tcp' and item['port'] != 22
+        if item['proto'] == 'tcp' and item['port'] != 22 and item['port'] not in NOT_WEB_PORTS
         and not item['name'].startswith('sshd') and not PROXY_PROCESS.search(item['line'])
+        and item['name'].lower() not in NOT_WEB_PROCESS
     })
 
 
@@ -3770,7 +3805,7 @@ def report(config, web_only=False, show_all=False, wide=True):
    # 最后上网 = 最后打开网站时间 和 最后一个数据包时间 里更晚的那个：
    # 长连接（看视频、下载）一直有数据时，时间也会跟着走，不会停在刚连上那一刻。
    mark='' if web_only or opened.get(ip) else '*';ls=max(float(opened.get(ip) or 0),float(ls))
-   age=max(0,now-float(ls));place=ci or co or ('Cloudflare' if cf else '未解析');net=isp_display(isp)
+   age=max(0,now-float(ls));place=place_name(co,ci) or ('Cloudflare' if cf else '未解析');net=isp_display(isp)
    # hy2 按节点记的流量：城市栏放节点名，没有 IP 也就没有运营商；「*」是给读不到访问日志的 IP 用的，这里不标。
    if ip.startswith(HY_PREFIX):
     if names is None:names=hy_names()
@@ -3788,7 +3823,9 @@ def report(config, web_only=False, show_all=False, wide=True):
   if smallhidden:note=(note+'\n' if note else '')+'已隐藏 %d 个 %dKB 以下的 IP\n查看：liuliang --all · 关闭：liuliang --small off'%(smallhidden,limit//1024)
   # NAT 小鸡：来访地址全是商家网关的内网地址，看不到真实用户。
   if any(r[0].startswith(HY_PREFIX) for r in rows):
-   note=(note+'\n' if note else '')+'端口 X = 这个 hy2 节点的总流量：这台是容器，\n看不到用户 IP，只能按节点统计'
+   gw=nat_gateway()
+   note=(note+'\n' if note else '')+('端口 X = 这个 hy2 节点的总流量。这台是 NAT 小鸡：\n用户连进来时，商家网关 %s 把来源地址\n换成了它自己，真实 IP 到不了这台机器，\n只能按节点统计（要看真实 IP 得找商家）'%gw if gw else
+    '端口 X = 这个 hy2 节点的总流量：这台是容器，\n看不到用户 IP，只能按节点统计')
   # hy2 节点按端口统计，近7天一点流量都没有的也说一声，免得以为漏统计了。
   if (config.get('diag') or {}).get('udp')=='hysteria' and not web_only:
    if names is None:names=hy_names()
@@ -3811,8 +3848,10 @@ def report(config, web_only=False, show_all=False, wide=True):
     print('只看到 Cloudflare 的 IP、没有真实访客：运行 liuliang --doctor 排查')
    return
   showkind=web_only is False and any(r[7]!='节点' for r in rows)
-  h=['#','IP','运营商','城市','24小时','7天','最后上网' if not web_only else '最近访问']+(['访问'] if showkind else []);N=[2,15,8,6,7,7,11]+([4] if showkind else [])
-  vals=lambda n,ip,net,pl,d,w,ls,kind,mark:[n,hy_show(ip),short(net),short(pl,10),sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%m-%d %H:%M')+mark]+([kind] if showkind else [])
+  # 全是 hy2 节点时没有 IP、也没有城市：表头改成「节点」「名称」，免得把节点名看成城市。
+  hyonly=all(r[0].startswith(HY_PREFIX) for r in rows);hip,hpl=('节点','名称') if hyonly else ('IP','城市')
+  h=['#',hip,'运营商',hpl,'24小时','7天','最后上网' if not web_only else '最近访问']+(['访问'] if showkind else []);N=[2,15,8,6,7,7,11]+([4] if showkind else [])
+  vals=lambda n,ip,net,pl,d,w,ls,kind,mark:[n,hy_show(ip),short(net),short(pl,14),sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%m-%d %H:%M')+mark]+([kind] if showkind else [])
   for n,r in enumerate(rows,1):N=[max(N[i],ww(x)) for i,x in enumerate(vals(n,*r[:6],r[7],r[8]))]
   if wide:
    def line(a,m,b):return a+m.join('─'*(n+2) for n in N)+b
@@ -3832,8 +3871,8 @@ def report(config, web_only=False, show_all=False, wide=True):
    real=[r for r in rows if r[7]!='CF节点']
    # 窄表（默认）：只放 序号、IP、7天流量、最后上网、城市，约 45 格宽，手机竖屏也能一行看完。
    # 运营商、近24小时在 liuliang --wide 里看。
-   K=[2,15,7,12,6];hc=['#','IP','7天','最后上网' if not web_only else '最近访问','城市']
-   cv=lambda n,r:[str(n),hy_show(r[0]),sz(r[4]),datetime.fromtimestamp(r[5],Z).strftime('%m-%d %H:%M')+r[8],short(r[2],14 if r[0].startswith(HY_PREFIX) else 6)]
+   K=[2,15,7,12,6];hc=['#',hip,'7天','最后上网' if not web_only else '最近访问',hpl]
+   cv=lambda n,r:[str(n),hy_show(r[0]),sz(r[4]),datetime.fromtimestamp(r[5],Z).strftime('%m-%d %H:%M')+r[8],short(r[2],14 if r[0].startswith(HY_PREFIX) else 10)]
    for n,r in enumerate(rows,1):K=[max(K[i],ww(x)) for i,x in enumerate(cv(n,r))]
    print(col(' '.join(cell(x,K[i]) for i,x in enumerate(hc)).rstrip(),B,C))
    for n,r in enumerate(rows,1):
@@ -3857,11 +3896,31 @@ def report(config, web_only=False, show_all=False, wide=True):
  if picks and sys.stdin.isatty() and sys.stdout.isatty():choose_ip(config,picks,show_all,wide)
 
 
+# 表格下面等输入序号时，10 分钟没人输入就自动退出。以前会一直等：SSH 断线后终端没被关掉，
+# 留下的 liuliang 一个占 10~20MB 内存，挂好几天，小内存机器被一个个堆满。
+CHOOSE_IDLE = 600
+
+
+def read_line(prompt, timeout=CHOOSE_IDLE):
+    sys.stdout.write(prompt); sys.stdout.flush()
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    except (OSError, ValueError):
+        ready = [sys.stdin]
+    if not ready:
+        print('\n（%d 分钟没有输入，已退出）' % (timeout // 60))
+        raise EOFError
+    line = sys.stdin.readline()
+    if not line:
+        raise EOFError
+    return line
+
+
 def choose_ip(config, picks, show_all=False, wide=False):
     while True:
         try:
-            text = input('\n输入序号或 IP，查看它近7天访问的应用/网站（直接回车退出）：').strip()
-        except (EOFError, KeyboardInterrupt):
+            text = read_line('\n输入序号或 IP，查看它近7天访问的应用/网站（直接回车退出）：').strip()
+        except (EOFError, KeyboardInterrupt, OSError):
             print()
             return
         if not text:
@@ -3898,13 +3957,13 @@ def site_report(ip, config=None, show_all=False, wide=True):
         opened = c.execute('select max(last) from sites where ip=? and ts>? and hits>0', (ip, since)).fetchone()[0] if 'sites' in tables else None
     finally:
         c.close()
-    place = ' '.join(x for x in (isp_display(info.get('isp')) if info.get('isp') else '', info.get('country'), info.get('city')) if x)
+    place = ' '.join(x for x in (isp_display(info.get('isp')) if info.get('isp') else '', place_name(info.get('country'), info.get('city'))) if x)
     seen = max(float(opened or 0), float(info.get('last_seen') or 0))
     if wide:
         print(col(ip + (' · ' + place if place else '') + ' · 近7天访问的应用/网站', B, C))
     else:
         # 窄版开头两行：IP 和城市；7天流量和最后上网。
-        print(col(ip + ' · ' + short(info.get('city') or info.get('country') or '未解析', 12), B, C))
+        print(col(ip + ' · ' + short(place_name(info.get('country'), info.get('city')) or '未解析', 14), B, C))
         print('7天 %s · 最后上网 %s' % (sz(total), datetime.fromtimestamp(seen, Z).strftime('%m-%d %H:%M') if seen else '-'))
     groups = {}
     for host, b, h, last in rows:

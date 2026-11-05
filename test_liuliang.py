@@ -1729,4 +1729,104 @@ class V139Tests(unittest.TestCase):
         self.assertIn(m.B + '合计 1 个节点', text)
         self.assertIn(m.D + '网卡用量含', text)                 # 次要说明变淡
 
+
+class V142Tests(unittest.TestCase):
+    def test_dns_and_databases_are_not_web_backends(self):
+        text = '\n'.join([
+            'tcp LISTEN 0 4096 127.0.0.1:53 0.0.0.0:* users:(("dnsmasq",pid=10,fd=5))',
+            'tcp LISTEN 0 4096 0.0.0.0:53 0.0.0.0:* users:(("busybox",pid=11,fd=5))',
+            'tcp LISTEN 0 4096 127.0.0.1:3306 0.0.0.0:* users:(("mysqld",pid=12,fd=5))',
+            'tcp LISTEN 0 4096 127.0.0.1:6380 0.0.0.0:* users:(("redis-server",pid=13,fd=5))',
+            'tcp LISTEN 0 4096 127.0.0.1:18080 0.0.0.0:* users:(("python3",pid=14,fd=5))',
+            'tcp 0 0 127.0.0.1:5300 0.0.0.0:* LISTEN 15/unbound',
+        ])
+        self.assertEqual(m.backend_ports(text), [18080])
+
+    def test_hy2_only_table_headers_say_node_and_name(self):
+        now = m.time.time()
+        for wide in (False, True):
+            with tempfile.TemporaryDirectory() as temp:
+                db = m.open_db(Path(temp) / 'history-v1.db')
+                db.execute('insert into traffic(ts,ip,bytes) values(?,?,?)', (now - 60, 'hy2:30133', 7 * 1024 * 1024))
+                db.execute('insert into clients(ip,last_seen) values(?,?)', ('hy2:30133', now - 60))
+                db.commit(); db.close()
+                cfg = {'ports': [30133], 'geo': True, 'diag': {'tcp': 'ss', 'udp': 'hysteria'}}
+                out = io.StringIO()
+                with patch.object(m, 'DATA', Path(temp)), patch.object(m, 'hy_names', return_value={30133: 'fanmo'}), \
+                     contextlib.redirect_stdout(out):
+                    m.report(cfg, wide=wide)
+            head = [l for l in out.getvalue().splitlines() if '#' in l][0]
+            self.assertIn('节点', head); self.assertIn('名称', head)
+            self.assertNotIn('城市', head); self.assertNotIn('IP', head)
+
+    def test_ip_table_headers_unchanged(self):
+        now = m.time.time()
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db')
+            db.execute('insert into traffic(ts,ip,bytes) values(?,?,?)', (now - 60, IP, 7 * 1024 * 1024))
+            db.execute('insert into clients(ip,last_seen,city) values(?,?,?)', (IP, now - 60, '东京'))
+            db.commit(); db.close()
+            out = io.StringIO()
+            with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                m.report({'ports': [443], 'geo': True}, wide=False)
+        head = [l for l in out.getvalue().splitlines() if '#' in l][0]
+        self.assertIn('IP', head); self.assertIn('城市', head)
+    def test_place_name_country_city(self):
+        self.assertEqual(m.place_name('英国', '伦敦'), '英国-伦敦')
+        self.assertEqual(m.place_name('新加坡', '新加坡'), '新加坡')
+        self.assertEqual(m.place_name('中国', ''), '中国')
+        self.assertEqual(m.place_name('', '东京'), '东京')
+        self.assertEqual(m.place_name('', ''), '')
+
+    def test_report_shows_country_dash_city(self):
+        now = m.time.time()
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db')
+            db.execute('insert into traffic(ts,ip,bytes) values(?,?,?)', (now - 60, IP, 7 * 1024 * 1024))
+            db.execute('insert into clients(ip,last_seen,country,city) values(?,?,?,?)', (IP, now - 60, '英国', '伦敦'))
+            db.commit(); db.close()
+            for wide in (False, True):
+                out = io.StringIO()
+                with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                    m.report({'ports': [443], 'geo': True}, wide=wide)
+                self.assertIn('英国-伦敦', out.getvalue())
+
+    def test_old_country_codes_are_looked_up_again(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'h.db')
+            db.execute("insert into clients(ip,last_seen,country,city,geo_due) values('1.1.1.1',1,'GB','伦敦',9e12)")
+            db.execute("insert into clients(ip,last_seen,country,city,geo_due) values('2.2.2.2',1,'英国','伦敦',9e12)")
+            db.commit(); db.close()
+            db = m.open_db(Path(temp) / 'h.db')
+            due = dict(db.execute('select ip,geo_due from clients'))
+            db.close()
+        self.assertEqual(due['1.1.1.1'], 0); self.assertEqual(due['2.2.2.2'], 9e12)
+
+    def test_nat_gateway(self):
+        with tempfile.TemporaryDirectory() as temp:
+            r = Path(temp) / 'route'
+            head = 'Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\n'
+            r.write_text(head + 'eth0\t00000000\t01005B0A\t0003\t0\t0\t100\t00000000\n')
+            self.assertEqual(m.nat_gateway(str(r)), '10.91.0.1')
+            r.write_text(head + 'eth0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\n')
+            self.assertEqual(m.nat_gateway(str(r)), '192.168.1.1')
+            r.write_text(head + 'eth0\t00000000\t01020305\t0003\t0\t0\t0\t00000000\n')
+            self.assertEqual(m.nat_gateway(str(r)), '')
+
+    def test_choose_ip_gives_up_after_idle(self):
+        out = io.StringIO()
+        with patch.object(m.select, 'select', return_value=([], [], [])), patch.object(m.sys, 'stdin', io.StringIO()), \
+             contextlib.redirect_stdout(out):
+            m.choose_ip({}, ['8.8.8.8'])
+        self.assertIn('没有输入，已退出', out.getvalue())
+
+    def test_choose_ip_reads_line_when_ready(self):
+        seen = []
+        with patch.object(m.select, 'select', side_effect=lambda r, w, x, t: (r, [], [])), \
+             patch.object(m.sys, 'stdin', io.StringIO('1\n\n')), patch.object(m, 'site_report', side_effect=lambda ip, *a: seen.append(ip)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            m.choose_ip({}, ['8.8.8.8'])
+        self.assertEqual(seen, ['8.8.8.8'])
+
+
 if __name__=='__main__':unittest.main(verbosity=2)
