@@ -18,7 +18,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.42'
+VERSION = '1.0.43'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -249,8 +249,11 @@ def open_db(path=None):
         c.execute("UPDATE clients SET geo_due=0 WHERE country<>''")
         c.commit()
     # 1.0.42 以前国家只存两位代码（GB），表格只显示城市。重新查一次，换成「英国-伦敦」要的中文国家名。
-    if c.execute("SELECT 1 FROM clients WHERE length(country)=2 AND country GLOB '[A-Z][A-Z]' LIMIT 1").fetchone():
+    # 只做一次（记在 metadata 的 geo_cn）：接口偶尔只给两位代码、不给中文名，以前每次打开数据库
+    # 都会把这些 IP 重新排进查询队列，每分钟查一遍、永远查不完，还把别的 IP 挤在后面。
+    if c.execute("SELECT 1 FROM metadata WHERE key='geo_cn'").fetchone() is None:
         c.execute("UPDATE clients SET geo_due=0 WHERE length(country)=2 AND country GLOB '[A-Z][A-Z]'")
+        c.execute("INSERT OR REPLACE INTO metadata VALUES('geo_cn','1')")
         c.commit()
     return c
 
@@ -463,7 +466,7 @@ def collect(config, sniffer=None, sites=None):
     # Geo lookups run outside the lock: each one is a network round trip
     # (up to 10 per cycle), and holding the lock that long would stall any
     # concurrent `liuliang --once`. The DB itself is safe via WAL + busy timeout.
-    if config['geo']:
+    if config.get('geo', True):
         geo_resolve()
 
 
@@ -587,7 +590,9 @@ def server_ports(group, bounds):
     """一个进程真正在对外服务的端口。
 
     ss -lu 会把 UDP 客户端的临时端口也列出来。代理若已有 TCP 监听，
-    只保留同端口的 UDP；纯 UDP 进程则丢掉临时端口，除非它只监听临时端口
+    只保留同端口的 UDP，以及临时端口区间之外的 UDP（sing-box 一个进程里
+    vless 走 TCP 443、hy2/tuic 走 UDP 8443 很常见，以前 8443 会漏掉）；
+    纯 UDP 进程则丢掉临时端口，除非它只监听临时端口
     （NAT VPS 经常把内部端口分在这个区间里）。
     """
     tcp = {item['port'] for item in group if item['proto'] == 'tcp'}
@@ -595,7 +600,7 @@ def server_ports(group, bounds):
     udp_open = [item for item in udp if item['scope'] != 'loop']
     if tcp:
         ports = set(tcp)
-        ports.update(item['port'] for item in udp_open if item['port'] in tcp)
+        ports.update(item['port'] for item in udp_open if item['port'] in tcp or not in_ephemeral(item['port'], bounds))
         return ports
     chosen = udp_open or udp
     outside = {item['port'] for item in chosen if not in_ephemeral(item['port'], bounds)}
@@ -705,6 +710,30 @@ def port_notes(selected, text=None):
     return notes
 
 
+def load_config():
+    """读配置给各个命令用；读不到时说人话，不甩一行 Errno。"""
+    try:
+        data = json.loads(CONFIG.read_text())
+    except FileNotFoundError:
+        raise RuntimeError('还没有安装 liuliang（找不到 %s），请先运行一键安装' % CONFIG)
+    except PermissionError:
+        raise RuntimeError('请使用 root 运行 liuliang')
+    except ValueError:
+        raise RuntimeError('配置文件 %s 损坏了，重跑一键安装即可修复（流量记录会保留）' % CONFIG)
+    if not isinstance(data, dict) or not data.get('ports'):
+        raise RuntimeError('配置文件 %s 里没有端口，重跑一键安装即可修复（流量记录会保留）' % CONFIG)
+    return data
+
+
+def write_config(config):
+    """先写临时文件再改名。直接覆盖写的那一瞬间文件是空的/半截的，
+    后台或另一个 liuliang 命令正好在读就会报错；写到一半断电还会把配置弄丢。"""
+    tmp = CONFIG.with_name(CONFIG.name + '.tmp')
+    tmp.write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n')
+    tmp.chmod(0o600)
+    os.replace(str(tmp), str(CONFIG))
+
+
 def saved_config():
     """已安装时读出端口和城市查询开关。读不到就当没装过。"""
     try:
@@ -714,6 +743,16 @@ def saved_config():
     if not isinstance(data, dict) or not data.get('ports'):
         return None
     return data
+
+
+def merge_ports(saved, detected, cap=64):
+    """原有端口一个不删，新检测到的从小到大往里加，总数不超过 cap。
+
+    以前是合并后排序再截前 64 个：原有端口号大、新端口号小时，原有端口反而被挤掉。
+    """
+    saved = sorted(set(saved))
+    extra = sorted(set(detected or []) - set(saved))[:max(cap - len(saved), 0)]
+    return sorted(saved + extra)
 
 
 def resolve_install(existing, args, detected=None):
@@ -729,7 +768,7 @@ def resolve_install(existing, args, detected=None):
         selected = ports(args.ports)
     elif updating:
         saved = ports(','.join(str(port) for port in existing['ports']))
-        new_ports = sorted(set(saved) | set(detected or []))[:64]
+        new_ports = merge_ports(saved, detected)
         selected = ports(','.join(str(port) for port in new_ports))
     elif detected:
         selected = ports(','.join(str(port) for port in detected))
@@ -784,6 +823,37 @@ def nft_works(nft_text):
         return False, (lines[-1] if lines else '')
 
 
+# 名词小词典：本机地址 = 这台机器网卡上配的 IP。
+# conntrack 和抓包看到的是「所有经过的连接」，不只是连进来的：节点替用户去访问外面网站的 443，
+# 目的端口也是 443。统计端口里正好有 443 时，以前这些往外连的流量会被记到本机自己的 IP 头上
+# （表格里多出一行本机 IP，流量巨大）。用本机地址把「自己发起的」排除掉。
+_LOCAL_IPS = [0.0, frozenset()]
+
+
+def parse_local_ips(text):
+    """ip -o addr 的输出里取出全部本机地址。"""
+    out = set()
+    for found in re.finditer(r'\binet6?\s+([0-9A-Fa-f:.]+)', text or ''):
+        try:
+            out.add(str(ipaddress.ip_address(found.group(1))))
+        except ValueError:
+            continue
+    return frozenset(out)
+
+
+def local_ips(ttl=60):
+    """本机地址，每分钟重读一次。读不到就是空集合（等于不排除，和以前一样）。"""
+    now = time.monotonic()
+    if not _LOCAL_IPS[0] or now - _LOCAL_IPS[0] > ttl:
+        try:
+            found = parse_local_ips(subprocess.run(['ip', '-o', 'addr', 'show'], capture_output=True, text=True, timeout=5).stdout)
+        except (OSError, subprocess.SubprocessError):
+            found = frozenset()
+        # 这次没读到就沿用上次的，不要因为一次失败把本机流量又算进来。
+        _LOCAL_IPS[:] = [now, found or _LOCAL_IPS[1]]
+    return _LOCAL_IPS[1]
+
+
 def read_ss():
     """先试 -H。老版 iproute2 不认识 -H 时退回带表头的输出，解析时会跳过表头。"""
     for cmd in (['ss', '-H', '-tin'], ['ss', '-tin']):
@@ -833,6 +903,14 @@ def capture_devices():
 BILLING = {'both': '进+出', 'out': '出站', 'max': '取大'}
 
 
+def boot_id():
+    """这次开机的编号，每次开机都不一样；读不到返回空。"""
+    try:
+        return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    except OSError:
+        return ''
+
+
 def nic_bytes(dev, text=None):
     """读 /proc/net/dev，返回这块网卡的 (收, 发) 累计字节；读不到返回 None。"""
     try:
@@ -869,21 +947,25 @@ def save_nic(c, now, dev=None, counts=None):
         old = json.loads(row[0]) if row else None
     except ValueError:
         old = None
+    booted = boot_id()
     if old and old.get('dev') == dev:
         since = last_sample(c)
-        if rx < old['rx'] or tx < old['tx']:
-            # 计数变小 = 重启过，读到的是开机以来的字节，最早只能从开机摊起。
+        # 重启过：计数从 0 重新数。只看「计数变小」不够，重启后流量大、后台又停了一阵，
+        # 新计数可能已经超过旧值，这时相减会少算，所以再对一下开机编号。
+        rebooted = bool(booted and old.get('boot') and old['boot'] != booted)
+        if rebooted or rx < old['rx'] or tx < old['tx']:
+            # 读到的是开机以来的字节，最早只能从开机摊起。
             boot = boot_time(now)
             since = max(since, boot) if since is not None and boot is not None else None
-        drx = rx - old['rx'] if rx >= old['rx'] else rx
-        dtx = tx - old['tx'] if tx >= old['tx'] else tx
+        drx = rx if rebooted or rx < old['rx'] else rx - old['rx']
+        dtx = tx if rebooted or tx < old['tx'] else tx - old['tx']
         if drx > 0 or dtx > 0:
             # 后台停过一阵：攒下的用量按时间摊开，不全算进采到的这一刻（以免跨重置日算错周期）。
             start = since if since is not None and now - since > GAP else None
             for (ts, prx), (_t, ptx) in zip(spread(drx, start, now, now - 40 * 86400), spread(dtx, start, now, now - 40 * 86400)):
                 if prx > 0 or ptx > 0:
                     c.execute('INSERT INTO nic(ts,rx,tx) VALUES(?,?,?)', (ts, prx, ptx))
-    c.execute("INSERT OR REPLACE INTO metadata VALUES('nic',?)", (json.dumps({'dev': dev, 'rx': rx, 'tx': tx}),))
+    c.execute("INSERT OR REPLACE INTO metadata VALUES('nic',?)", (json.dumps({'dev': dev, 'rx': rx, 'tx': tx, 'boot': booted}),))
     # 网卡数据很小，留 40 天，够覆盖一整个月的计费周期。
     c.execute('DELETE FROM nic WHERE ts<?', (now - 40 * 86400,))
 
@@ -951,11 +1033,11 @@ def billing_lines(config, c, now):
 
 def set_billing(value=None):
     """liuliang --billing：改服务商计费方式。不带值时一步一步问。"""
-    config = json.loads(CONFIG.read_text())
+    config = load_config()
     if value is None:
         value = ask_billing(config.get('billing', 'both'))
     config['billing'] = value
-    CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n')
+    write_config(config)
     print('已设置计费方式：' + BILLING.get(value, '不确定（三种都显示）'))
 
 
@@ -998,7 +1080,7 @@ def ask_small(current=0):
 
 def set_small(value=None):
     """liuliang --small on|off：打开/关闭隐藏小流量 IP；不带参数就一步一步问。"""
-    config = json.loads(CONFIG.read_text())
+    config = load_config()
     cur = int(config.get('min_kb') or 0)
     if value is None or value == '':
         kb = ask_small(cur)
@@ -1009,7 +1091,7 @@ def set_small(value=None):
     else:
         raise ValueError('用法：liuliang --small on（隐藏）或 liuliang --small off（不隐藏）')
     config['min_kb'] = kb
-    CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n')
+    write_config(config)
     print('已设置：' + ('隐藏 800KB 以下的 IP' if kb else '不隐藏小流量 IP'))
 
 
@@ -1059,7 +1141,7 @@ def ask_scope(existing=None, detected=(), web=()):
 
 def set_scope(value=None):
     """liuliang --scope：改统计范围。all = 整机，10000,20000 = 只统计这些端口，不带参数就一步一步问。"""
-    config = json.loads(CONFIG.read_text())
+    config = load_config()
     try:
         detected, _mode, service = scan_ports(True)
     except Exception:
@@ -1071,7 +1153,7 @@ def set_scope(value=None):
     else:
         scope = ports(value)
     # 整机：原来的端口一个不删（代理重启的瞬间可能检测不到），加上现在检测到的。
-    selected = scope or sorted(set(config['ports']) | set(detected))[:64]
+    selected = scope or merge_ports(config['ports'], detected)
     web = sorted((set(service) | set(config.get('web') or [])) & set(selected))
     config.update(ports=selected, web=web, auto=scope is None)
     # 先停后台再改：后台内存里还是旧端口，改完重启才会用新的。
@@ -1082,7 +1164,7 @@ def set_scope(value=None):
     try:
         if config.get('backend') == 'nft':
             reload_nft(config)   # 先把旧端口的计数落盘，再换统计规则
-        CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n')
+        write_config(config)
     finally:
         if systemd_running():
             subprocess.run(['systemctl', 'restart', 'liuliang'], capture_output=True)
@@ -1098,7 +1180,7 @@ def set_scope(value=None):
 
 def set_reset_day(value=None):
     """liuliang --reset-day N：改每月重置日；不带数字时一步一步问。"""
-    config = json.loads(CONFIG.read_text())
+    config = load_config()
     if value is None:
         day = ask_reset_day(int(config.get('reset_day') or 1))
     else:
@@ -1106,7 +1188,7 @@ def set_reset_day(value=None):
         if not day:
             raise ValueError('重置日要是 1 到 31 之间的数字')
     config['reset_day'] = day
-    CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n')
+    write_config(config)
     print('已设置：每月 %d 号重置流量' % day)
 
 
@@ -1239,7 +1321,8 @@ CT_FLOW = re.compile(
 )
 
 
-def parse_conntrack(text, selected, tcp=False, udp=False):
+def parse_conntrack(text, selected, tcp=False, udp=False, local=()):
+    """local：本机地址。源地址是本机的连接是本机自己往外连的，不是用户。"""
     flows = {}
     if not text or (not tcp and not udp):
         return flows
@@ -1259,7 +1342,7 @@ def parse_conntrack(text, selected, tcp=False, udp=False):
         if dport not in selected:
             continue
         ip = normalize_ip(src)
-        if ip is None:
+        if ip is None or str(ip) in local:
             continue
         down = 0
         reply = CT_FLOW.search(line[found.end():])
@@ -1304,7 +1387,7 @@ def parse_ip_packet(pkt):
     return nxt, src, dst, pkt[off:], total
 
 
-def account_packet(pkt, ports, count_tcp, count_udp):
+def account_packet(pkt, ports, count_tcp, count_udp, local=()):
     parsed = parse_ip_packet(pkt)
     if not parsed:
         return None, 0
@@ -1316,9 +1399,11 @@ def account_packet(pkt, ports, count_tcp, count_udp):
     if proto not in (6, 17) or len(l4) < 4:
         return None, 0
     sport, dport = struct.unpack('!HH', l4[:4])
-    if dport in ports:
+    # 用户在哪一头：对着统计端口的那一头的对面，而且不能是本机自己
+    # （本机往外连别人的 443 时，两头都不是用户）。
+    if dport in ports and src not in local:
         ip = normalize_ip(src)
-    elif sport in ports:
+    elif sport in ports and dst not in local:
         ip = normalize_ip(dst)
     else:
         return None, 0
@@ -1364,9 +1449,10 @@ class PacketPump:
                     pkt = sock.recv(65535)
                 except OSError:
                     continue
-                ip, n = account_packet(pkt, self.ports, self.count_tcp, self.count_udp)
+                local = local_ips()
+                ip, n = account_packet(pkt, self.ports, self.count_tcp, self.count_udp, local)
                 if ip and n > 0:
-                    wip, wn = account_packet(pkt, self.web, self.count_tcp, False) if self.web else (None, 0)
+                    wip, wn = account_packet(pkt, self.web, self.count_tcp, False, local) if self.web else (None, 0)
                     with self.lock:
                         self.pending[ip] = self.pending.get(ip, 0) + n
                         if wip and wn > 0:
@@ -1926,7 +2012,7 @@ def read_flow_snapshot(ports, sources):
     want_tcp = sources.get('tcp') == 'conntrack'
     want_udp = sources.get('udp') == 'conntrack'
     if want_tcp or want_udp:
-        flows.update(parse_conntrack(conntrack_text() or '', ports, tcp=want_tcp, udp=want_udp))
+        flows.update(parse_conntrack(conntrack_text() or '', ports, tcp=want_tcp, udp=want_udp, local=local_ips()))
     return flows
 
 
@@ -2012,8 +2098,7 @@ def follow_ports(config, seen):
                 config[key] = disk[key]
     except (OSError, ValueError):
         pass
-    CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n')
-    CONFIG.chmod(0o600)
+    write_config(config)
     print('liuliang: 新检测到端口 ' + ','.join(map(str, fresh or web_fresh)) + '，已并入统计', file=sys.stderr, flush=True)
     return now, True
 
@@ -2351,8 +2436,8 @@ def ask(prompt, default=''):
     except OSError:
         print(prompt + '（没有终端可以输入，用默认值）')
         return default
-    except KeyboardInterrupt:
-        return default
+    # Ctrl+C 不在这里接：以前当成「直接回车」，想取消安装的人按了 Ctrl+C，
+    # 安装反而用默认值一路装下去（还会去改代理配置、重启代理）。现在交给 main 统一退出。
 
 
 def mem_mb():
@@ -3286,8 +3371,7 @@ def install(args):
     for folder in [CONFIG.parent, PROGRAM.parent, DATA]:
         folder.mkdir(parents=True, exist_ok=True)
     DATA.chmod(0o700)
-    CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n')
-    CONFIG.chmod(0o600)
+    write_config(config)
     if backend == 'nft' and apply_nft(nft_text):
         clear_counters()
     PROGRAM.write_bytes(Path(__file__).read_bytes()); PROGRAM.chmod(0o755)
@@ -3353,21 +3437,21 @@ start_pre() { /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py --once; }
                 if got in ('y', 'yes', 'n', 'no'):
                     answer = got[0]
                     config['log'] = 'yes' if answer == 'y' else 'no'
-                    CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n')
+                    write_config(config)
             if answer == 'y':
                 enable_log(assume_yes=True)
             else:
                 print('  ' + SITE_HELP)
     if not config.get('billing'):
         config['billing'] = ask_billing('both')
-        CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n')
+        write_config(config)
     # 每次运行安装都问一次（显示现在的设置，直接回车不变）。
     config['min_kb'] = ask_small(config.get('min_kb', 0))
-    CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n')
+    write_config(config)
     print('小流量 IP：' + ('隐藏 800KB 以下' if config['min_kb'] else '不隐藏') + '（以后改：liuliang --small on/off）')
     if not config.get('reset_day'):
         config['reset_day'] = ask_reset_day(1)
-        CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2)+'\n')
+        write_config(config)
     print('计费方式：' + BILLING.get(config['billing'], '不确定（三种都显示）') + '；每月 %d 号重置' % config['reset_day'] + '（以后改：liuliang --billing / liuliang --reset-day 几号）')
     print('统计范围：' + ('整机，新装的端口自动并入' if auto else '只统计端口 ' + listed) + '（以后改：liuliang --scope）')
     print('只看网站访客：liuliang --web    排查问题：liuliang --doctor')
@@ -3549,7 +3633,7 @@ def main():
         set_reset_day(args.reset_day or None); return
     if args.scope is not None:
         set_scope(args.scope); return
-    config = json.loads(CONFIG.read_text())
+    config = load_config()
     if args.once:
         collect(config)
     elif args.daemon:
@@ -3889,7 +3973,10 @@ def site_compact(ip, groups, total, show_all=False):
 if __name__ == '__main__':
     try:
         main()
-    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+    except KeyboardInterrupt:
+        print('\n已取消', file=sys.stderr)
+        sys.exit(130)
+    except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.CalledProcessError) as exc:
         print('错误：'+str(exc), file=sys.stderr)
         if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
             print(exc.stderr, file=sys.stderr)

@@ -1796,6 +1796,7 @@ class V142Tests(unittest.TestCase):
             db = m.open_db(Path(temp) / 'h.db')
             db.execute("insert into clients(ip,last_seen,country,city,geo_due) values('1.1.1.1',1,'GB','伦敦',9e12)")
             db.execute("insert into clients(ip,last_seen,country,city,geo_due) values('2.2.2.2',1,'英国','伦敦',9e12)")
+            db.execute("delete from metadata where key='geo_cn'")    # 1.0.42 以前的库没有这个记号
             db.commit(); db.close()
             db = m.open_db(Path(temp) / 'h.db')
             due = dict(db.execute('select ip,geo_due from clients'))
@@ -1827,6 +1828,137 @@ class V142Tests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             m.choose_ip({}, ['8.8.8.8'])
         self.assertEqual(seen, ['8.8.8.8'])
+
+
+class V143Tests(unittest.TestCase):
+    """1.0.43：全面检查后修的逻辑问题。"""
+
+    def _packet(self, src, dst, sport, dport):
+        udp = struct.pack('!HHHH', sport, dport, 11, 0) + b'abc'
+        return struct.pack('!BBHHHBBH4s4s', 0x45, 0, 20 + len(udp), 0, 0, 64, 17, 0, socket.inet_aton(src), socket.inet_aton(dst)) + udp
+
+    def test_own_outbound_is_not_a_client_in_capture(self):
+        # 本机 5.5.5.5 上的节点替用户去连外面网站的 443：两个方向都不是「用户流量」
+        local = {'5.5.5.5'}
+        self.assertEqual(m.account_packet(self._packet('5.5.5.5', '8.8.8.8', 40000, 443), {443}, False, True, local), (None, 0))
+        self.assertEqual(m.account_packet(self._packet('8.8.8.8', '5.5.5.5', 443, 40000), {443}, False, True, local), (None, 0))
+        # 真用户连进来、回给真用户，照常算
+        self.assertEqual(m.account_packet(self._packet('8.8.8.8', '5.5.5.5', 1111, 443), {443}, False, True, local), ('8.8.8.8', 31))
+        self.assertEqual(m.account_packet(self._packet('5.5.5.5', '8.8.8.8', 443, 1111), {443}, False, True, local), ('8.8.8.8', 31))
+        # 用户自己的源端口碰巧也是统计端口：回包不能记到本机头上
+        self.assertEqual(m.account_packet(self._packet('5.5.5.5', '8.8.8.8', 8443, 443), {443, 8443}, False, True, local), ('8.8.8.8', 31))
+
+    def test_own_outbound_is_not_a_client_in_conntrack(self):
+        text = '\n'.join([
+            'ipv4 2 udp 17 20 src=5.5.5.5 dst=9.9.9.9 sport=40000 dport=443 packets=2 bytes=7000 src=9.9.9.9 dst=5.5.5.5 sport=443 dport=40000 packets=1 bytes=9000 mark=0 use=1',
+            'ipv4 2 udp 17 20 src=8.8.8.8 dst=5.5.5.5 sport=1111 dport=443 packets=2 bytes=300 src=5.5.5.5 dst=8.8.8.8 sport=443 dport=1111 packets=1 bytes=100 mark=0 use=1',
+        ])
+        flows = m.parse_conntrack(text, [443], udp=True, local={'5.5.5.5'})
+        self.assertEqual(list(flows.values()), [('8.8.8.8', 300, 100)])
+        self.assertEqual(len(m.parse_conntrack(text, [443], udp=True)), 2)     # 读不到本机地址时和以前一样
+
+    def test_parse_local_ips(self):
+        text = ('1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever\n'
+                '2: eth0    inet 5.5.5.5/24 brd 5.5.5.255 scope global eth0\n'
+                '2: eth0    inet6 2001:db8:0:0::1/64 scope global\n'
+                '3: wg0    inet 10.0.0.1 peer 10.0.0.2/32 scope global wg0\n')
+        self.assertEqual(m.parse_local_ips(text), {'127.0.0.1', '5.5.5.5', '2001:db8::1', '10.0.0.1'})
+
+    def test_local_ips_keeps_last_good_answer(self):
+        class R: stdout = '2: eth0    inet 5.5.5.5/24 scope global eth0\n'
+        with patch.object(m, '_LOCAL_IPS', [0.0, frozenset()]):
+            with patch.object(m.subprocess, 'run', return_value=R()):
+                self.assertEqual(m.local_ips(), {'5.5.5.5'})
+            with patch.object(m.subprocess, 'run', side_effect=OSError('no ip')):
+                self.assertEqual(m.local_ips(ttl=-1), {'5.5.5.5'})
+
+    def test_proxy_udp_port_next_to_tcp_port_is_detected(self):
+        # sing-box 一个进程：vless TCP 443 + hy2 UDP 8443，再加一个往外连的 UDP 临时端口
+        output = ('tcp LISTEN 0 4096 *:443 *:* users:(("sing-box",pid=1,fd=3))\n'
+                  'udp UNCONN 0 0 *:8443 *:* users:(("sing-box",pid=1,fd=4))\n'
+                  'udp UNCONN 0 0 *:54321 *:* users:(("sing-box",pid=1,fd=8))\n')
+        with patch.object(m.shutil, 'which', return_value='/bin/ss'), patch.object(m, 'run') as run, \
+             patch.object(m, 'ephemeral_bounds', return_value=(32768, 60999)):
+            run.return_value.stdout = output
+            self.assertEqual(m.detect_ports(True), ([443, 8443], 'proxy'))
+
+    def test_saved_ports_survive_the_64_cap(self):
+        saved = list(range(60001, 60061))                                  # 已有 60 个，端口号都很大
+        merged = m.merge_ports(saved, range(1000, 1010))
+        self.assertEqual(len(merged), 64)
+        self.assertTrue(set(saved) <= set(merged))                         # 原有的一个不少
+        self.assertEqual(sorted(set(merged) - set(saved)), [1000, 1001, 1002, 1003])
+        args = argparse.Namespace(ports=None, geo=None)
+        selected, _, _ = m.resolve_install({'ports': saved, 'geo': True}, args, list(range(1000, 1010)))
+        self.assertTrue(set(saved) <= set(selected))
+
+    def test_geo_migration_runs_only_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'h.db')
+            # 接口只给了两位代码的 IP：查过一次就按正常的 30 天再查，不能每次打开数据库都重排
+            db.execute("insert into clients(ip,last_seen,country,city,geo_due) values('1.1.1.1',1,'GB','',9e12)")
+            db.commit(); db.close()
+            db = m.open_db(Path(temp) / 'h.db')
+            due = db.execute("select geo_due from clients").fetchone()[0]
+            db.close()
+        self.assertEqual(due, 9e12)
+
+    def test_config_written_atomically_and_private(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = Path(temp) / 'config.json'
+            with patch.object(m, 'CONFIG', cfg):
+                m.write_config({'ports': [443], 'geo': True})
+                self.assertEqual(m.load_config(), {'ports': [443], 'geo': True})
+            self.assertEqual(cfg.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(sorted(p.name for p in Path(temp).iterdir()), ['config.json'])   # 临时文件不留
+
+    def test_missing_or_broken_config_says_what_to_do(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = Path(temp) / 'config.json'
+            with patch.object(m, 'CONFIG', cfg):
+                with self.assertRaisesRegex(RuntimeError, '还没有安装'):
+                    m.load_config()
+                cfg.write_text('{"ports": [44')
+                with self.assertRaisesRegex(RuntimeError, '损坏'):
+                    m.load_config()
+
+    def test_ctrl_c_cancels_instead_of_answering_default(self):
+        class Tty(io.StringIO):
+            def fileno(self): raise OSError
+            def readline(self): raise KeyboardInterrupt
+        with patch('builtins.open', side_effect=lambda *a, **k: Tty()):
+            with self.assertRaises(KeyboardInterrupt):
+                m.ask('继续吗？', 'y')
+
+    def test_nic_reboot_detected_even_when_counter_is_bigger(self):
+        db = m.open_db(':memory:'); now = m.time.time()
+        with patch.object(m, 'boot_id', return_value='boot-a'):
+            m.save_nic(db, now - 120, 'eth0', (1000, 1000))
+        db.execute("INSERT OR REPLACE INTO metadata VALUES('sample',?)", (str(now - 120),))
+        # 重启后流量很大，新计数已经超过旧值：要整笔算（5000），不是只算差额（4000）
+        with patch.object(m, 'boot_id', return_value='boot-b'):
+            m.save_nic(db, now - 60, 'eth0', (5000, 5000))
+        self.assertEqual(m.nic_usage(db, now - 3600, now), (5000, 5000))
+        # 没重启：照常算差额
+        with patch.object(m, 'boot_id', return_value='boot-b'):
+            m.save_nic(db, now, 'eth0', (5600, 5700))
+        self.assertEqual(m.nic_usage(db, now - 3600, now), (5600, 5700))
+        db.close()
+
+    def test_apt_install_failure_is_reported(self):
+        import subprocess
+        s = Path(__file__).with_name('install.sh').read_text()
+        func = s[s.index('apt_install() {'):s.index('# 只抽出「Ubuntu 归档本身」失效的主机名')]
+        self.assertNotIn('/tmp/liuliang-apt.log', s.replace('固定名字的 /tmp/liuliang-apt.log', ''))   # 不再用固定名字的临时文件
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / 'apt-get').write_text('#!/bin/sh\nexit 100\n'); (Path(temp) / 'apt-get').chmod(0o755)
+            # python3 没有、apt 又失败：必须报失败（以前被最后一句 || true 盖成成功）
+            out = subprocess.run(['/bin/sh', '-c', func + 'apt_install'], env={'PATH': temp}, capture_output=True, text=True, timeout=30)
+            self.assertEqual(out.returncode, 1, out.stderr)
+            # python3 本来就有：apt 的其他毛病不拦安装
+            (Path(temp) / 'python3').write_text('#!/bin/sh\n'); (Path(temp) / 'python3').chmod(0o755)
+            out = subprocess.run(['/bin/sh', '-c', func + 'apt_install'], env={'PATH': temp}, capture_output=True, text=True, timeout=30)
+            self.assertEqual(out.returncode, 0, out.stderr)
 
 
 if __name__=='__main__':unittest.main(verbosity=2)
