@@ -2124,8 +2124,12 @@ class V145Tests(unittest.TestCase):
         self.assertEqual(m.normalize_block('1.2.3.9/24'), '1.2.3.0/24')   # 主机位清掉
         self.assertEqual(m.normalize_block('8.8.8.8/32'), '8.8.8.8')
         self.assertEqual(m.normalize_block('2606:4700:4700::1111'), '2606:4700:4700::1111')
-        for bad in ('10.1.2.3', '192.168.1.1', '100.64.0.1', '127.0.0.1', '::1', 'fe80::1',
-                    '224.0.0.1', '0.0.0.0', '0.0.0.0/0', '2001:db8::1', 'not-an-ip', '', '1.2.3.4/33'):
+        # 1.0.46 起屏蔽只隐藏显示、不拦连接，内网地址也能屏蔽（比如 NAT 小鸡的网关）。
+        self.assertEqual(m.normalize_block('10.1.2.3'), '10.1.2.3')
+        self.assertEqual(m.normalize_block('192.168.1.1'), '192.168.1.1')
+        self.assertEqual(m.normalize_block('100.64.0.1'), '100.64.0.1')
+        for bad in ('127.0.0.1', '::1', 'fe80::1',
+                    '224.0.0.1', '0.0.0.0', '0.0.0.0/0', 'not-an-ip', '', '1.2.3.4/33'):
             self.assertIsNone(m.normalize_block(bad), bad)
 
     def test_blocked_match(self):
@@ -2136,21 +2140,6 @@ class V145Tests(unittest.TestCase):
         self.assertFalse(m.blocked_match('2606:4700:4700::2222', nets))
         self.assertFalse(m.blocked_match('hy2:46099', nets))
 
-    def test_block_rules(self):
-        text = m.block_rules(['1.2.3.4', '2606:4700:4700::1111', '10.0.0.1', 'bad'], [46099, 46762])
-        self.assertIn('table inet liuliang_block', text)
-        self.assertIn('1.2.3.4', text)
-        self.assertIn('2606:4700:4700::1111', text)
-        self.assertNotIn('10.0.0.1', text)   # 内网条目被过滤，不进 nft 文件
-        self.assertNotIn('bad', text)
-        self.assertIn('type inet_service; elements = { 46099, 46762 }', text)
-        self.assertIn('ip saddr @blocked4 tcp dport @bports drop', text)
-        self.assertIn('ip6 saddr @blocked6 udp dport @bports drop', text)
-        self.assertIn('priority -100', text)   # 比计数链早，屏蔽掉的流量不计入统计
-        self.assertNotIn('hook forward', text)
-        text2 = m.block_rules(['1.2.3.4'], [443], forward=True)
-        self.assertIn('hook forward', text2)
-        self.assertIn('ct original proto-dst @bports', text2)
 
     def test_port_text(self):
         self.assertEqual(m.port_text([]), '-')
@@ -2171,7 +2160,7 @@ class V145Tests(unittest.TestCase):
         self.assertEqual(c.execute('select count(*) from ip_ports').fetchone()[0], 0)
         c.close()
 
-    def _report(self, samples, config=None, wide=True, ports=None):
+    def _report(self, samples, config=None, wide=True, ports=None, show_all=False):
         with tempfile.TemporaryDirectory() as temp:
             db = m.open_db(Path(temp) / 'history-v1.db')
             now = m.time.time()
@@ -2182,7 +2171,7 @@ class V145Tests(unittest.TestCase):
             db.commit(); db.close()
             out = io.StringIO()
             with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
-                m.report(config or {'ports': [46099, 46762], 'geo': True}, wide=wide)
+                m.report(config or {'ports': [46099, 46762], 'geo': True}, wide=wide, show_all=show_all)
             return out.getvalue()
 
     def test_report_shows_port_column(self):
@@ -2201,10 +2190,17 @@ class V145Tests(unittest.TestCase):
             self.assertLessEqual(m.ww(line), 50, line)
 
     def test_report_marks_blocked(self):
-        text = self._report([{('up4', '1.1.1.1'): (900 * 1024, None)}],
-                            config={'ports': [46099], 'geo': True, 'blocked': ['1.1.1.0/24']})
-        self.assertIn('1.1.1.1 [封]', text)
+        # 1.0.46 起屏蔽只隐藏显示：默认不显示，--all 才显示并标 [封]。
+        cfg = {'ports': [46099], 'geo': True, 'blocked': ['1.1.1.0/24']}
+        sample = [{('up4', '1.1.1.1'): (900 * 1024, None), ('up4', '2.2.2.2'): (900 * 1024, None)}]
+        text = self._report(sample, config=cfg)
+        self.assertNotIn('1.1.1.1', text)
+        self.assertIn('2.2.2.2', text)
+        self.assertIn('已隐藏 1 个已屏蔽的 IP', text)
         self.assertIn('liuliang --unblock IP', text)
+        shown = self._report(sample, config=cfg, show_all=True)
+        self.assertIn('1.1.1.1 [封]', shown)
+        self.assertIn('2.2.2.2', shown)
 
     def test_site_report_shows_ports_and_blocked(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2230,74 +2226,24 @@ class V145Tests(unittest.TestCase):
     def test_set_block_roundtrip(self):
         with tempfile.TemporaryDirectory() as temp:
             cfg = self._block_config(temp)
-            applied = []
             with patch.object(m, 'CONFIG', cfg), patch.object(m.os, 'geteuid', return_value=0), \
-                 patch.object(m, 'local_ips', return_value=frozenset()), patch.object(m, 'has_tty', return_value=False), \
-                 patch.object(m, 'apply_blocked', side_effect=lambda b, p: applied.append((list(b), p))), \
+                 patch.object(m, 'has_tty', return_value=False), \
                  contextlib.redirect_stdout(io.StringIO()) as out:
                 m.set_block('1.2.3.4')
                 self.assertEqual(json.loads(cfg.read_text())['blocked'], ['1.2.3.4'])
-                self.assertEqual(applied, [(['1.2.3.4'], [443])])
-                m.set_block('1.2.3.4')   # 重复屏蔽不再写内核
-                self.assertEqual(len(applied), 1)
+                self.assertIn('实际连接不受影响', out.getvalue())
+                m.set_block('1.2.3.4')   # 重复屏蔽
                 self.assertIn('已经屏蔽了', out.getvalue())
                 m.set_block('1.2.3.0/24')
                 self.assertEqual(json.loads(cfg.read_text())['blocked'], ['1.2.3.0/24', '1.2.3.4'])
                 m.set_block('1.2.3.4', unblock=True)
                 self.assertEqual(json.loads(cfg.read_text())['blocked'], ['1.2.3.0/24'])
-                self.assertEqual(applied[-1], (['1.2.3.0/24'], [443]))
                 m.set_block('9.9.9.9', unblock=True)   # 没屏蔽过
                 self.assertIn('没有屏蔽过', out.getvalue())
             with self.assertRaises(ValueError):
-                with patch.object(m, 'CONFIG', cfg), patch.object(m.os, 'geteuid', return_value=0), \
-                     patch.object(m, 'local_ips', return_value=frozenset()):
-                    m.set_block('10.0.0.1')
+                with patch.object(m, 'CONFIG', cfg), patch.object(m.os, 'geteuid', return_value=0):
+                    m.set_block('127.0.0.1')
 
-    def test_set_block_refuses_own_ip(self):
-        with tempfile.TemporaryDirectory() as temp:
-            cfg = self._block_config(temp)
-            with patch.object(m, 'CONFIG', cfg), patch.object(m.os, 'geteuid', return_value=0), \
-                 patch.object(m, 'local_ips', return_value=frozenset({'1.2.3.4'})), \
-                 contextlib.redirect_stdout(io.StringIO()):
-                with self.assertRaises(ValueError):
-                    m.set_block('1.2.3.4')
-
-    def test_set_block_on_diag_backend_only_records(self):
-        with tempfile.TemporaryDirectory() as temp:
-            cfg = self._block_config(temp, backend='diag', diag={'tcp': 'ss'})
-            with patch.object(m, 'CONFIG', cfg), patch.object(m.os, 'geteuid', return_value=0), \
-                 patch.object(m, 'local_ips', return_value=frozenset()), patch.object(m, 'has_tty', return_value=False), \
-                 patch.object(m, 'apply_blocked') as applied, contextlib.redirect_stdout(io.StringIO()) as out:
-                m.set_block('1.2.3.4')
-                applied.assert_not_called()
-                self.assertIn('不会生效', out.getvalue())
-                self.assertEqual(json.loads(cfg.read_text())['blocked'], ['1.2.3.4'])
-
-    def test_apply_blocked_writes_file_and_loads(self):
-        with tempfile.TemporaryDirectory() as temp:
-            cfg = Path(temp) / 'config.json'; cfg.write_text('{}')
-            calls = []
-            with patch.object(m, 'CONFIG', cfg), patch.object(m, 'nft_works', return_value=(True, '')), \
-                 patch.object(m, 'block_loaded', return_value=False), \
-                 patch.object(m, 'run', side_effect=lambda a, **k: calls.append(a)):
-                m.apply_blocked(['1.2.3.4', '2606:4700:4700::1111'], [443])
-            text = (Path(temp) / 'blocked.nft').read_text()
-            self.assertIn('1.2.3.4', text); self.assertIn('2606:4700:4700::1111', text)
-            self.assertIn('hook forward', text)
-            self.assertIn(['nft', '-f', str(Path(temp) / 'blocked.nft')], calls)
-            with patch.object(m, 'CONFIG', cfg), patch.object(m, 'block_loaded', return_value=True), \
-                 patch.object(m, 'run', side_effect=lambda a, **k: calls.append(a)):
-                m.apply_blocked([], [443])   # 名单空了，表删掉
-            self.assertIn(['nft', 'delete', 'table', 'inet', 'liuliang_block'], calls)
-            self.assertFalse((Path(temp) / 'blocked.nft').exists())
-
-    def test_apply_blocked_falls_back_without_forward(self):
-        with tempfile.TemporaryDirectory() as temp:
-            cfg = Path(temp) / 'config.json'; cfg.write_text('{}')
-            with patch.object(m, 'CONFIG', cfg), patch.object(m, 'nft_works', return_value=(False, 'no conntrack')), \
-                 patch.object(m, 'block_loaded', return_value=False), patch.object(m, 'run'):
-                m.apply_blocked(['1.2.3.4'], [443])
-            self.assertNotIn('hook forward', (Path(temp) / 'blocked.nft').read_text())
 
     def test_follow_ports_keeps_blocked_from_disk(self):
         # 后台运行期间用户用命令屏蔽了 IP，后台检测到新端口写配置时不能把名单盖回去。
@@ -2331,6 +2277,52 @@ class V145Tests(unittest.TestCase):
         self.assertEqual(calls, [('1.1.1.1', False), ('2.2.2.2', True),
                                  ('1.1.1.1', False), ('2.2.2.2', True)])
         sites.assert_not_called()   # b::1 不是命令，也不是有效公网 IP，不进查看
+
+
+class V146Tests(unittest.TestCase):
+    """1.0.46：屏蔽改成只隐藏显示（不再拦连接），表格默认不显示已屏蔽 IP。"""
+
+    def _report(self, samples, config=None, wide=True, show_all=False):
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db')
+            now = m.time.time()
+            for sample in samples:
+                m.save_sample(db, sample, now)
+            db.commit(); db.close()
+            out = io.StringIO()
+            with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                m.report(config or {'ports': [46099], 'geo': True}, wide=wide, show_all=show_all)
+            return out.getvalue()
+
+    def test_all_blocked_shows_empty_message(self):
+        text = self._report([{('up4', '1.1.1.1'): (900 * 1024, None)}],
+                            config={'ports': [46099], 'geo': True, 'blocked': ['1.1.1.1']})
+        self.assertIn('都已屏蔽', text)
+        self.assertIn('liuliang --all', text)
+        self.assertNotIn('可能的原因', text)   # 不是没流量，是全屏蔽了，别误导
+        self.assertNotIn('1.1.1.1', text)
+
+    def test_blocked_hidden_note_fits_phone(self):
+        text = self._report([{('up4', '1.1.1.1'): (900 * 1024, None), ('up4', '2.2.2.2'): (900 * 1024, None)}],
+                            config={'ports': [46099], 'geo': True, 'blocked': ['1.1.1.1']}, wide=False)
+        self.assertIn('已隐藏 1 个已屏蔽的 IP', text)
+        for line in text.splitlines():
+            self.assertLessEqual(m.ww(line), 50, line)
+
+    def test_clear_legacy_block_table(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = Path(temp) / 'config.json'; cfg.write_text('{}')
+            nft_file = Path(temp) / 'blocked.nft'; nft_file.write_text('table inet liuliang_block {}')
+            calls = []
+            with patch.object(m, 'CONFIG', cfg), patch.object(m, 'block_loaded', return_value=True), \
+                 patch.object(m, 'run', side_effect=lambda a, **k: calls.append(a)):
+                self.assertTrue(m.clear_legacy_block_table())
+            self.assertIn(['nft', 'delete', 'table', 'inet', 'liuliang_block'], calls)
+            self.assertFalse(nft_file.exists())
+            with patch.object(m, 'CONFIG', cfg), patch.object(m, 'block_loaded', return_value=False), \
+                 patch.object(m, 'run', side_effect=lambda a, **k: calls.append(a)):
+                self.assertFalse(m.clear_legacy_block_table())
+            self.assertEqual(len(calls), 1)   # 没旧表就不动 nft
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

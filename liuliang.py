@@ -18,11 +18,11 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.45'
+VERSION = '1.0.46'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
-# 屏蔽用的表（和计数表分开：改屏蔽名单时不碰计数器）。
+# 1.0.45 屏蔽用的 nft 表名，只用来在更新时清掉旧表（1.0.46 起屏蔽只隐藏显示，不再写内核）。
 BLOCK_TABLE = 'liuliang_block'
 PROGRAM = Path('/usr/local/lib/liuliang/liuliang.py')
 # 每隔多少秒把计数写进数据库一次。60 秒：最后上网时间误差不超过 1 分钟。
@@ -459,7 +459,6 @@ def collect(config, sniffer=None, sites=None):
     with open(LOCK, 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         recreated = ensure_table()
-        ensure_block_table(config)
         doc = json.loads(run(['nft','-j','list','table','inet',TABLE], capture_output=True).stdout)
         current = parse_counters(doc)
         # 表格「端口」栏：这一分钟的连接快照里，这个 IP 连的是哪个本机端口。
@@ -1196,19 +1195,15 @@ def set_scope(value=None):
 
 
 def set_block(value, unblock=False, assume_yes=False):
-    """liuliang --block IP[/前缀] / --unblock IP[/前缀]：屏蔽或解除屏蔽。只拦节点端口，SSH 不受影响。"""
+    """liuliang --block IP[/前缀] / --unblock IP[/前缀]：屏蔽或解除屏蔽。
+    屏蔽只管显示：以后 liuliang 表格里不再显示它，实际连接不受影响。"""
     if os.geteuid() != 0:
         raise RuntimeError('请使用 root 运行 liuliang --block')
     config = load_config()
     target = normalize_block(value)
     if target is None:
-        raise ValueError('屏蔽目标要是公网 IP 或网段，如 1.2.3.4 或 1.2.3.0/24（内网、回环地址不能屏蔽）')
+        raise ValueError('屏蔽目标要是 IP 或网段，如 1.2.3.4 或 1.2.3.0/24')
     net = ipaddress.ip_network(target, strict=False)
-    # 屏蔽本机地址等于把自己的服务全掐了，拒绝。
-    for local in local_ips():
-        addr = normalize_ip(local)
-        if addr is not None and addr.version == net.version and addr in net:
-            raise ValueError('不能屏蔽本机地址 ' + local)
     blocked = list(config.get('blocked') or [])
     if unblock:
         if target not in blocked:
@@ -1224,10 +1219,7 @@ def set_block(value, unblock=False, assume_yes=False):
             raise ValueError('屏蔽名单已满（1024 个），先解除几个再加')
         if not assume_yes and has_tty():
             scope = '' if net.prefixlen == net.max_prefixlen else '（整个网段，约 %d 个地址）' % net.num_addresses
-            mine = ssh_client_ip()
-            if mine is not None and mine.version == net.version and mine in net:
-                scope += '（注意：这是你现在 SSH 连进来的地址，屏蔽后你自己的设备也连不上节点，SSH 还能用）'
-            got = ask('确定屏蔽 %s 吗？屏蔽后它连不上你的节点%s [y/n]：' % (target, scope))
+            got = ask('确定屏蔽 %s 吗？以后 liuliang 表格里不再显示它%s [y/n]：' % (target, scope))
             if got.lower() not in ('y', 'yes'):
                 print('已取消')
                 return
@@ -1235,16 +1227,7 @@ def set_block(value, unblock=False, assume_yes=False):
         action = '已屏蔽：'
     config['blocked'] = sorted(blocked)
     write_config(config)
-    if config.get('backend') == 'diag':
-        print(action + target + '（已记下，但这台机器用不了 nft，屏蔽不会生效）')
-        return
-    try:
-        apply_blocked(config['blocked'], config['ports'])
-    except (OSError, subprocess.CalledProcessError) as exc:
-        detail = (getattr(exc, 'stderr', '') or '').strip().splitlines()
-        print(action + target + '（已记下，但写进内核失败' + ('：' + detail[-1] if detail else '') + '，后台每分钟会再试）')
-        return
-    print(action + target + '（只拦节点端口，SSH 不受影响）')
+    print(action + target + ('（下次打开 liuliang 就能看到它）' if unblock else '（以后 liuliang 表格里不再显示，实际连接不受影响）'))
 
 
 def list_blocked():
@@ -1254,7 +1237,7 @@ def list_blocked():
     if not blocked:
         print('(没有屏蔽任何 IP，屏蔽：liuliang --block IP)')
         return
-    print(col('已屏蔽 %d 个' % len(blocked), B, C))
+    print(col('已屏蔽 %d 个（表格里不显示，liuliang --all 可以查看）' % len(blocked), B, C))
     info = {}
     try:
         c = sqlite3.connect(str(DATA / 'history-v1.db'), timeout=30)
@@ -1267,15 +1250,7 @@ def list_blocked():
     for item in blocked:
         place = place_name(*info[item]) if item in info else ''
         print('  ' + item + (' · ' + place if place else ''))
-    if config.get('backend') == 'diag':
-        print(col('这台机器用不了 nft，屏蔽不会生效', D))
-        return
-    try:
-        loaded = block_loaded()
-    except OSError:
-        loaded = False
-    if not loaded:
-        print(col('屏蔽表还没加载进内核，后台每分钟会自动重建', D))
+    print(col('解除：liuliang --unblock IP', D))
 
 
 def set_reset_day(value=None):
@@ -2245,12 +2220,6 @@ def reload_nft(config):
         fcntl.flock(lock, fcntl.LOCK_EX)
         if apply_nft(text):
             clear_counters()
-    # 端口变了，屏蔽表里的端口集合也要跟着变，不然新端口拦不住。
-    if config.get('blocked'):
-        try:
-            apply_blocked(config['blocked'], config['ports'])
-        except (OSError, subprocess.CalledProcessError, ValueError):
-            pass
 
 
 def diag_daemon(config):
@@ -3591,13 +3560,14 @@ def clear_counters():
 
 
 # ---- 屏蔽某个 IP ----
-# 名单存在 config.json 的 blocked 里，内核里是单独一张表 liuliang_block（和计数表分开，
-# 改名单时不碰计数器）。只拦统计端口上的 TCP/UDP：被屏蔽的 IP 连不上节点，但 SSH 照常，
-# 免得把自己的 IP 屏蔽了就登不上机器。优先级 -100，比计数链（11）早，屏蔽掉的流量不计入统计。
-# 重启机器后表就没了，后台每分钟看一眼，没了就按配置重建。
+# 屏蔽只管显示：名单存在 config.json 的 blocked 里，表格默认不显示这些 IP、不计入合计，
+# liuliang --all 才显示（标 [封]）。不拦连接、不动防火墙——自己的服务器、监控探针的 IP
+# 屏蔽了也照常用，只是表格里看不到。1.0.45 曾用 nft 真拦过连接，1.0.46 起改成只隐藏，
+# 更新时把旧版留在内核里的屏蔽表清掉（clear_legacy_block_table）。
 def normalize_block(value):
-    """屏蔽目标：单个公网 IP 或 CIDR 网段（如 1.2.3.0/24）。返回规范写法，不合法返回 None。
-    内网、回环、本机地址不能屏蔽：NAT 小鸡上屏蔽网关等于屏蔽所有用户。"""
+    """屏蔽目标：单个 IP 或 CIDR 网段（如 1.2.3.0/24）。返回规范写法，不合法返回 None。
+    只隐藏显示，不拦连接，所以内网地址也能屏蔽（比如 NAT 小鸡的网关）；回环、组播、
+    未指定这些表格里根本不会出现的地址才拒绝。"""
     text = str(value or '').strip().strip('[]')
     if not text:
         return None
@@ -3607,8 +3577,6 @@ def normalize_block(value):
         return None
     addr = net.network_address
     if addr.is_multicast or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_unspecified:
-        return None
-    if addr.is_private or is_nat_ip(addr):
         return None
     if net.prefixlen == net.max_prefixlen:
         return str(addr)
@@ -3635,88 +3603,25 @@ def blocked_match(ip, networks):
     return any(addr.version == net.version and addr in net for net in networks)
 
 
-def ssh_client_ip():
-    """现在这条 SSH 连进来的客户端 IP（没有就是 None）。屏蔽它之前要提醒用户。"""
-    for var in ('SSH_CLIENT', 'SSH_CONNECTION'):
-        parts = os.environ.get(var, '').split()
-        if not parts:
-            continue
-        try:
-            return ipaddress.ip_address(parts[0])
-        except ValueError:
-            continue
-    return None
-
-
-def block_rules(blocked, selected, forward=False):
-    """屏蔽表的 nft 规则。blocked 里非法条目先过滤掉：配置是 root 手写也能写坏的，
-    非法内容绝不能原样写进 nft 文件。forward=True 再加转发链：Docker -p、中转机转发的
-    端口，包不进 input，只走 forward，转发后目的端口已被改掉，按 conntrack 里客户端
-    最初连的端口（ct original proto-dst）认，和计数表的 forward 链同一个办法。"""
-    selected = ports(','.join(map(str, selected)))
-    portset = '{ ' + ', '.join(map(str, selected)) + ' }'
-    clean = sorted({b for b in (normalize_block(item) for item in blocked) if b})
-    v4 = [b for b in clean if ':' not in b]
-    v6 = [b for b in clean if ':' in b]
-    elements = lambda items: ' elements = { ' + ', '.join(items) + ' }' if items else ''
-    lines = ['table inet ' + BLOCK_TABLE + ' {']
-    lines.append(' set blocked4 { type ipv4_addr; flags interval; size 4096;' + elements(v4) + ' }')
-    lines.append(' set blocked6 { type ipv6_addr; flags interval; size 4096;' + elements(v6) + ' }')
-    lines.append(' set bports { type inet_service; elements = ' + portset + ' }')
-    lines.append(' chain input { type filter hook input priority -100; policy accept;')
-    for version, family in [(4, 'ip'), (6, 'ip6')]:
-        for protocol in ('tcp', 'udp'):
-            lines.append(f'  {family} saddr @blocked{version} {protocol} dport @bports drop')
-    lines.append(' }')
-    if forward:
-        lines.append(' chain forward { type filter hook forward priority -100; policy accept;')
-        for version, family in [(4, 'ip'), (6, 'ip6')]:
-            lines.append(f'  meta nfproto ipv{version} meta l4proto {{ tcp, udp }} ct status dnat ct original proto-dst @bports {family} saddr @blocked{version} drop')
-        lines.append(' }')
-    return '\n'.join(lines + ['}', ''])
-
-
 def block_loaded():
     probe = subprocess.run(['nft', 'list', 'table', 'inet', BLOCK_TABLE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return probe.returncode == 0
 
 
-def apply_blocked(blocked, selected):
-    """把屏蔽名单写进内核。名单空了就把表删掉。返回 True = 已生效。"""
-    blocked = sorted({b for b in (normalize_block(item) for item in blocked) if b})
-    path = CONFIG.parent / 'blocked.nft'
-    if not blocked:
-        if block_loaded():
-            run(['nft', 'delete', 'table', 'inet', BLOCK_TABLE])
-        try:
-            path.unlink()
-        except OSError:
-            pass
-        return True
-    text = block_rules(blocked, selected, forward=True)
-    if not nft_works(text)[0]:
-        text = block_rules(blocked, selected)
-    previous = path.read_text() if path.exists() else None
-    path.write_text(text)
-    if previous == text and block_loaded():
-        return True
-    if block_loaded():
-        run(['nft', 'delete', 'table', 'inet', BLOCK_TABLE])
-    run(['nft', '-f', str(path)], capture_output=True)
-    return True
-
-
-def ensure_block_table(config):
-    """后台每分钟看一眼：重启后屏蔽表没了就按配置重建。失败不吵（diag 机器本来就用不了 nft）。"""
-    blocked = config.get('blocked') or []
-    if not blocked or config.get('backend') == 'diag':
-        return False
+def clear_legacy_block_table():
+    """1.0.45 的屏蔽是防火墙拦截，1.0.46 起只隐藏显示：把旧版留在内核里的屏蔽表清掉，
+    不然之前屏蔽过的 IP 还是连不上节点。返回 True = 清掉了一张旧表。"""
     try:
-        if block_loaded():
-            return False
-        return apply_blocked(blocked, config['ports'])
-    except (OSError, subprocess.CalledProcessError, ValueError):
-        return False
+        loaded = block_loaded()
+    except OSError:
+        loaded = False
+    if loaded:
+        run(['nft', 'delete', 'table', 'inet', BLOCK_TABLE])
+    try:
+        (CONFIG.parent / 'blocked.nft').unlink()
+    except OSError:
+        pass
+    return loaded
 
 
 def install(args):
@@ -3881,14 +3786,14 @@ start_pre() { /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py --once; }
     print('\n'+done+'。以后输入：liuliang\n端口：'+','.join(map(str,selected))+'；城市查询：'+('已启用' if geo else '关闭')+'；统计：'+how
           +'；Cloudflare 后的真实访客 IP：'+('已开启' if config['realip'] else '关闭'))
     if config.get('blocked'):
-        if backend == 'diag':
-            print('屏蔽名单：%d 个（这台机器用不了 nft，屏蔽不会生效）' % len(config['blocked']))
-        else:
-            try:
-                live = block_loaded()
-            except OSError:
-                live = False
-            print('屏蔽名单：%d 个%s（查看：liuliang --blocked）' % (len(config['blocked']), '已恢复' if live else '，后台每分钟会自动恢复'))
+        print('屏蔽名单：%d 个（表格里隐藏，查看：liuliang --blocked）' % len(config['blocked']))
+    # 1.0.45 的屏蔽是防火墙拦截：更新到 1.0.46 后屏蔽只隐藏显示，把旧表清掉，
+    # 不然之前屏蔽过的 IP 还是连不上节点。
+    try:
+        if clear_legacy_block_table():
+            print('已清理旧版的防火墙屏蔽规则（屏蔽现在只隐藏显示，不拦连接）')
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print('旧版防火墙屏蔽规则没清掉，手动清一下：nft delete table inet ' + BLOCK_TABLE, file=sys.stderr)
     if sites:
         sources, notes = site_sources(access_logs)
         print('访问的应用/网站：已开启（读代理访问日志，只记域名和流量，不记网址和内容；--sites no 关闭）')
@@ -3980,14 +3885,7 @@ def doctor():
         print(ok(loaded) + ' nftables 计数表：' + ('已加载' if loaded else '没加载（后台每分钟会自动重建）')
               + ('，中转/Docker 转发的端口也统计' if 'hook forward' in text else '，只统计本机收发（重跑一键安装可加上转发端口）'))
     if config.get('blocked'):
-        if config.get('backend') == 'diag':
-            print(ok(False) + ' 已屏蔽 %d 个 IP，但这台机器用不了 nft，屏蔽不会生效' % len(config['blocked']))
-        else:
-            try:
-                live = block_loaded()
-            except OSError:
-                live = False
-            print(ok(live) + ' 已屏蔽 %d 个 IP：' % len(config['blocked']) + ('屏蔽表已加载' if live else '屏蔽表没加载（后台每分钟会自动重建）'))
+        print('  已屏蔽 %d 个 IP（表格里隐藏，查看：liuliang --blocked）' % len(config['blocked']))
     if config.get('backend') == 'diag':
         diag = config.get('diag') or {}
         if diag.get('udp') == 'conntrack' and not (conntrack_text() or '').strip():
@@ -4086,7 +3984,7 @@ def main():
     parser.add_argument('--small', nargs='?', const='', help='隐藏 800KB 以下的 IP：on 隐藏 / off 不隐藏，不带参数就一步一步问')
     parser.add_argument('--reset-day', nargs='?', const='', help='设置服务商每月几号重置流量（1-31），不带数字就一步一步问')
     parser.add_argument('--scope', nargs='?', const='', help='统计范围：all 整机（全部节点和网站端口）或 10000,20000 只统计这些端口，不带参数就一步一步问')
-    parser.add_argument('--block', help='屏蔽一个 IP 或网段，如 1.2.3.4 或 1.2.3.0/24（只拦节点端口，SSH 不受影响）')
+    parser.add_argument('--block', help='屏蔽一个 IP 或网段，如 1.2.3.4 或 1.2.3.0/24（以后表格里不再显示，不影响实际连接）')
     parser.add_argument('--unblock', help='解除屏蔽：liuliang --unblock IP')
     parser.add_argument('--blocked', action='store_true', help='列出已屏蔽的 IP')
     parser.add_argument('--log', choices=['yes','no'], help='高级：安装时是否自动打开代理访问日志（默认打开，内存<48MB 默认不开）')
@@ -4238,8 +4136,13 @@ def report(config, web_only=False, show_all=False, wide=True):
   if not show_all and not web_only:
    bad=scan_ips(c,[r for r in rows if r[7]!='CF节点'],config,opened,now,hasweb)
    scanhidden=len(bad);rows=[r for r in rows if r[0] not in bad]
+  # 已屏蔽的 IP 默认也不显示、不计入合计（liuliang --all 才显示，标 [封]）。
+  blockedhidden=0
+  if not show_all:
+   blockedhidden=len([r for r in rows if r[0] in bset]);rows=[r for r in rows if r[0] not in bset]
   note=('已隐藏 %d 个 Cloudflare 节点 IP（橙色云/Tunnel）\n真实访客已单独列出，查看：liuliang --all'%cfhidden) if cfhidden else ''
   if scanhidden:note=(note+'\n' if note else '')+'已隐藏 %d 个疑似扫描 IP，查看：liuliang --all'%scanhidden
+  if blockedhidden:note=(note+'\n' if note else '')+'已隐藏 %d 个已屏蔽的 IP，查看：liuliang --all\n解除屏蔽：liuliang --unblock IP'%blockedhidden
   # 打开了「隐藏小流量 IP」时，在表格下面说清楚藏了几个、怎么看、怎么关。
   if smallhidden:note=(note+'\n' if note else '')+'已隐藏 %d 个 %dKB 以下的 IP\n查看：liuliang --all · 关闭：liuliang --small off'%(smallhidden,limit//1024)
   # NAT 小鸡：来访地址全是商家网关的内网地址，看不到真实用户。
@@ -4258,13 +4161,16 @@ def report(config, web_only=False, show_all=False, wide=True):
   # 端口栏全是空：后台还没更新到 1.0.45，或者 ss/conntrack 都读不到，端口记不下来。
   if rows and not any(r[9] for r in rows):
    note=(note+'\n' if note else '')+'还看不到端口：后台更新到 '+VERSION+' 后，\n从新产生的连接开始记（TCP 靠 ss，\nUDP 靠 conntrack；短连接可能错过采样）'
-  if bset:
-   note=(note+'\n' if note else '')+'带 [封] 的 IP 已屏蔽，连不上节点端口\n（SSH 不受影响）解除：liuliang --unblock IP'
+  if bset and show_all:
+   note=(note+'\n' if note else '')+'带 [封] 的 IP 已屏蔽，平时不显示\n解除：liuliang --unblock IP'
   if not rows:
-   print('(近7天没有网站访客)' if web_only else ('(近7天无达到 %dKB 的流量记录'%(limit//1024) if limit else '(近7天没有流量记录')+('，也没有网站访客' if config.get('web') else '')+')')
+   if blockedhidden:
+    print('(近7天有流量的 IP 都已屏蔽，查看：liuliang --all)')
+   else:
+    print('(近7天没有网站访客)' if web_only else ('(近7天无达到 %dKB 的流量记录'%(limit//1024) if limit else '(近7天没有流量记录')+('，也没有网站访客' if config.get('web') else '')+')')
    if note:print('\n'.join(tip(t) for t in note.split('\n')))
    # 没有任何 IP 记录时，说一下最可能的原因。
-   if not web_only and not cfhidden and not scanhidden:
+   if not web_only and not cfhidden and not scanhidden and not blockedhidden:
     # 端口填错（NAT 外网端口、只绑 127.0.0.1 的端口）是最常见的原因，查得到就直接说。
     for t in port_notes(config['ports']):print(col('注意：'+t,Y))
     for t in ('可能的原因：','  1. 还没人用过节点（用一下，2 分钟后再看）','  2. 节点端口没在统计里：liuliang --doctor','  3. 统计没在跑：liuliang --doctor 看后台服务'):print(col(t,D))
