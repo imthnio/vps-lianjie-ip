@@ -1961,4 +1961,159 @@ class V143Tests(unittest.TestCase):
             self.assertEqual(out.returncode, 0, out.stderr)
 
 
+class V144Tests(unittest.TestCase):
+    """1.0.44：Hysteria2 节点也能看每个 IP 访问了哪些网站。"""
+    HY_REQ = '2026-11-15T16:18:00+08:00 DEBUG TCP request {"addr": "39.144.137.92:63275", "id": "user", "reqAddr": "mtalk.google.com:5228"}'
+    HY_ERR = '2026-11-15T16:18:00+08:00 WARN TCP error {"addr": "39.144.137.92:63275", "id": "user", "reqAddr": "mtalk.google.com:5228", "error": "readfrom tcp4 10.10.1.57:42414->142.250.157.188:5228: timeout: no recent network activity"}'
+
+    def test_parse_hysteria_logs(self):
+        p = m.AccessParser()
+        self.assertEqual(p.feed(self.HY_REQ), ('39.144.137.92', 63275, 'mtalk.google.com'))
+        self.assertEqual(p.feed('2026-11-15T16:09:39+08:00 WARN TCP error {"addr": "39.144.137.92:62555", "id": "user", "reqAddr": "android.googleapis.com:443", "error": "timeout"}'),
+                         ('39.144.137.92', 62555, 'android.googleapis.com'))
+        self.assertEqual(p.feed('2026-11-15T16:18:00+08:00 DEBUG UDP request {"addr": "1.2.3.4:5678", "id": "user", "sessionID": 1, "reqAddr": "dns.google:443"}'),
+                         ('1.2.3.4', 5678, 'dns.google'))
+        self.assertEqual(p.feed('2026-11-15T16:18:00+08:00 DEBUG TCP request {"addr": "[2606:4700:4700::1111]:5678", "id": "user", "reqAddr": "Chat.OpenAI.com.:443"}'),
+                         ('2606:4700:4700::1111', 5678, 'chat.openai.com'))
+        self.assertIsNone(p.feed('2026-11-15T16:18:00+08:00 DEBUG TCP request {"addr": "1.2.3.4:5678", "id": "user", "reqAddr": "8.8.8.8:53"}'))
+        self.assertIsNone(p.feed('2026-11-15T16:18:00+08:00 INFO client connected {"addr": "1.2.3.4:5678", "id": "user"}'))
+        self.assertIsNone(p.feed('2026-11-15T16:18:00+08:00 DEBUG TCP closed {"addr": "1.2.3.4:5678", "id": "user", "reqAddr": "x.com:443"}'))
+        self.assertIsNone(p.feed('2026-11-15T16:18:00+08:00 WARN UDP error {"addr": "1.2.3.4:5678", "id": "user", "sessionID": 1, "error": "timeout"}'))
+        self.assertIsNone(p.feed('2026-11-15T16:18:00+08:00 DEBUG TCP request {"addr": "*", "id": "user", "reqAddr": "x.com:443"}'))
+
+    def test_hysteria_error_after_request_counts_once(self):
+        p = m.AccessParser()
+        self.assertEqual(p.feed(self.HY_REQ), ('39.144.137.92', 63275, 'mtalk.google.com'))
+        self.assertIsNone(p.feed(self.HY_ERR))   # 同一条连接的 error 行不再重复算一次访问
+        q = m.AccessParser()
+        self.assertEqual(q.feed(self.HY_ERR), ('39.144.137.92', 63275, 'mtalk.google.com'))   # warn 级别没有 request 行，error 行照常算
+
+    def test_hy_level(self):
+        self.assertEqual(m.hy_level('1', ['hysteria', '-l', 'debug', 'server']), 'debug')
+        self.assertEqual(m.hy_level('1', ['hysteria', 'server', '--log-level=error']), 'error')
+        with tempfile.TemporaryDirectory() as temp:
+            proc = Path(temp) / '5'; proc.mkdir()
+            (proc / 'environ').write_bytes(b'HYSTERIA_LOG_LEVEL=warn\x00PATH=/usr/bin\x00')
+            self.assertEqual(m.hy_level('5', ['hysteria', 'server'], proc=Path(temp)), 'warn')
+            self.assertEqual(m.hy_level('9', ['hysteria', 'server'], proc=Path(temp)), 'info')   # 没写就是默认 info
+
+    def _hy_log(self, out, level, temp):
+        argv = ['hysteria', 'server', '-c', str(Path(temp) / 'config.yaml')]
+        with patch.object(m, 'output_target', return_value=out), patch.object(m, 'hy_level', return_value=level), \
+             patch.object(m, 'docker_log', return_value=None), patch.object(m, 'service_unit', return_value=None), \
+             patch.object(m, 'panel_name', return_value=None), patch.object(m, 'systemd_running', return_value=False):
+            return m.hy_log('5', argv, temp)
+
+    def test_hy_log_finds_stdout_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / 'xray-node-1.log'; log.write_text('')
+            source, note, _path, level = self._hy_log(str(log), 'warn', temp)
+            self.assertEqual(source, ('file', str(log)))
+            self.assertIn('warn', note); self.assertIn('debug', note)
+            source, note, _path, level = self._hy_log(str(log), 'debug', temp)
+            self.assertEqual(source, ('file', str(log))); self.assertEqual(note, '')
+            source, note, _p, _l = self._hy_log('/dev/null', 'warn', temp)
+            self.assertIsNone(source); self.assertIn('/dev/null', note)
+            source, note, _p, _l = self._hy_log('pipe:[1]', 'warn', temp)
+            self.assertIsNone(source); self.assertIn('没有把访问记录保存下来', note)
+
+    def test_site_sources_includes_hysteria(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / 'xray-node-1.log'; log.write_text('')
+            argv = ['hysteria', 'server', '-c', str(Path(temp) / 'config.yaml')]
+            with patch.object(m, 'proxy_processes', return_value=[]), \
+                 patch.object(m, 'hy_processes', return_value=[('5', argv, temp)]), \
+                 patch.object(m, 'output_target', return_value=str(log)), \
+                 patch.object(m, 'hy_level', return_value='warn'), \
+                 patch.object(m, 'ACCESS_LOG', Path(temp) / 'nope.log'):
+                sources, notes = m.site_sources([])
+            self.assertIn(('file', str(log)), sources)
+            self.assertTrue(any('warn' in n for n in notes))
+
+    def test_missing_logs_includes_hysteria(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / 'xray-node-1.log'; log.write_text('')
+            argv = ['hysteria', 'server', '-c', str(Path(temp) / 'config.yaml')]
+            common = [patch.object(m, 'proxy_processes', return_value=[]),
+                      patch.object(m, 'hy_processes', return_value=[('5', argv, temp)]),
+                      patch.object(m, 'output_target', return_value=str(log)),
+                      patch.object(m, 'panel_name', return_value=None)]
+            with contextlib.ExitStack() as stack:
+                for c in common: stack.enter_context(c)
+                stack.enter_context(patch.object(m, 'hy_level', return_value='warn'))
+                missing = m.missing_logs()
+            self.assertEqual(len(missing), 1)
+            self.assertEqual(missing[0][:2], ('5', 'hysteria'))
+            with contextlib.ExitStack() as stack:
+                for c in common: stack.enter_context(c)
+                stack.enter_context(patch.object(m, 'hy_level', return_value='debug'))
+                self.assertEqual(m.missing_logs(), [])   # 已经是 debug 就不用开
+
+    def _service_file(self, temp, body):
+        initd = Path(temp) / 'init.d'; initd.mkdir(exist_ok=True)
+        svc = initd / 'xray-node-1'; svc.write_text(body)
+        return initd, svc
+
+    def test_enable_hy_openrc_rewrites_level(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _initd, svc = self._service_file(temp, '#!/sbin/openrc-run\nexport HYSTERIA_DISABLE_UPDATE_CHECK=1\nexport HYSTERIA_LOG_LEVEL=warn\nname="xray-node-1"\n')
+            with patch.object(m, 'restart_proxy', return_value=None), contextlib.redirect_stdout(io.StringIO()):
+                m._enable_hy_openrc('5', 'xray-node-1', svc, Path(temp) / 'config.yaml')
+            self.assertIn('export HYSTERIA_LOG_LEVEL=debug', svc.read_text())
+            self.assertNotIn('warn', svc.read_text())
+            backups = list(Path(temp).glob('init.d/xray-node-1.liuliang-bak-*'))
+            self.assertEqual(len(backups), 1)
+            self.assertIn('HYSTERIA_LOG_LEVEL=warn', backups[0].read_text())
+
+    def test_enable_hy_openrc_inserts_export(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _initd, svc = self._service_file(temp, '#!/sbin/openrc-run\nname="xray-node-1"\ncommand="/usr/local/bin/hysteria"\n')
+            with patch.object(m, 'restart_proxy', return_value=None), contextlib.redirect_stdout(io.StringIO()):
+                m._enable_hy_openrc('5', 'xray-node-1', svc, Path(temp) / 'config.yaml')
+            lines = svc.read_text().split('\n')
+            self.assertEqual(lines[1], 'export HYSTERIA_LOG_LEVEL=debug')   # 插在 #! 后面
+
+    def test_enable_hy_systemd_writes_dropin(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(m.subprocess, 'run'), patch.object(m, 'restart_proxy', return_value=None), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                m._enable_hy_systemd('5', 'xray-node-1.service', Path(temp) / 'config.yaml', systemd_dir=temp)
+            drop = Path(temp) / 'xray-node-1.service.d' / 'liuliang-debug.conf'
+            self.assertIn('Environment=HYSTERIA_LOG_LEVEL=debug', drop.read_text())
+
+    def test_enable_log_opens_hysteria_debug(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / 'xray-node-1.log'; log.write_text('')
+            argv = ['hysteria', 'server', '-c', str(Path(temp) / 'config.yaml')]
+            with patch.object(m, 'proxy_processes', return_value=[]), \
+                 patch.object(m, 'hy_processes', return_value=[('5', argv, temp)]), \
+                 patch.object(m, 'output_target', return_value=str(log)), \
+                 patch.object(m, 'hy_level', return_value='warn'), \
+                 patch.object(m, 'panel_name', return_value=None), \
+                 patch.object(m.os, 'geteuid', return_value=0), \
+                 patch.object(m, '_enable_hy') as en, \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                m.enable_log(assume_yes=True)
+            en.assert_called_once_with('5', argv, temp, Path(temp) / 'config.yaml')
+            self.assertIn('日志级别改成 debug', out.getvalue())
+
+    def test_enable_hy_routes_to_openrc(self):
+        with tempfile.TemporaryDirectory() as temp:
+            initd, svc = self._service_file(temp, '#!/sbin/openrc-run\nexport HYSTERIA_LOG_LEVEL=warn\n')
+            argv = ['hysteria', 'server', '-c', str(Path(temp) / 'config.yaml')]
+            with patch.object(m, 'services_for_pid', return_value=[('openrc', 'xray-node-1')]), \
+                 patch.object(m, 'services_for_config', return_value=[]), \
+                 patch.object(m, 'restart_proxy', return_value=None), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                m._enable_hy('5', argv, temp, Path(temp) / 'config.yaml', initd=str(initd))
+            self.assertIn('export HYSTERIA_LOG_LEVEL=debug', svc.read_text())
+            self.assertIn('已打开', out.getvalue())
+
+    def test_tracker_counts_hysteria_hits(self):
+        t = m.SiteTracker([51773])
+        t.tick(100, [self.HY_REQ], {}, {})
+        data, _ = t.drain()
+        self.assertEqual(data[('39.144.137.92', 'mtalk.google.com')][:2], [0, 1])   # UDP 记次数、不记流量
+
+
 if __name__=='__main__':unittest.main(verbosity=2)

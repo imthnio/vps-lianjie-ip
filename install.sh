@@ -190,7 +190,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.43'
+VERSION = '1.0.44'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -2356,7 +2356,8 @@ SITE_GRACE = 15      # 连接关了、日志还没读到时，关闭时的字节
 SITE_RESCAN = 300    # 每隔这么久重新找一次代理的访问日志（代理重启、换了配置）
 SITE_PROCESS = re.compile(r'(xray|v2ray|sing-box)', re.I)
 SITE_MANUAL = ('Xray/V2Ray 配置里写 "log": {"access": "/var/log/xray/access.log"}（不能是 none），'
-               'sing-box 配置里 "log": {"level": "info"}，改完重启代理。')
+               'sing-box 配置里 "log": {"level": "info"}，'
+               'Hysteria2 在启动它的服务文件里写 export HYSTERIA_LOG_LEVEL=debug，改完重启代理。')
 SITE_HELP = ('解决办法：在 VPS 上运行 liuliang --enable-log，自动打开代理的访问记录（会先备份原配置，代理重启几秒），'
              '过几分钟再来看。想自己改的话：' + SITE_MANUAL)
 
@@ -2449,25 +2450,51 @@ def split_target(token):
 ANSI = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 XRAY_ACCEPT = re.compile(r'(\S+)\s+accepted\s+(\S+)')
 SINGBOX_CONN = re.compile(r'\[(\d+)[^\]]*\]\s+inbound/[^:]*:\s+inbound (?:packet )?connection (from|to) (\S+)')
+# Hysteria2 的日志是一行一条，末尾是 JSON，里面有客户端地址 addr 和目标地址 reqAddr。
+# debug 级别每条请求都记（TCP request / UDP request），warn 级别只记出错的（TCP error）。
+HY_EVENT = re.compile(r'\b(?:TCP|UDP) (request|error)\b')
+HY_ADDR = re.compile(r'"addr":\s*"([^"]+)"')
+HY_REQ = re.compile(r'"reqAddr":\s*"([^"]+)"')
 
 
 class AccessParser:
-    """读 Xray/V2Ray 和 sing-box 的访问日志，认出 (客户端 IP, 客户端端口, 目标域名)。
+    """读 Xray/V2Ray、sing-box 和 Hysteria2 的访问日志，认出 (客户端 IP, 客户端端口, 目标域名)。
 
     Xray：2024/05/01 12:00:00 from 1.2.3.4:5678 accepted tcp:www.youtube.com:443 [in -> out]
     sing-box 分两行，用连接编号对上：
       [3856612376 0ms] inbound/vless[in]: inbound connection from 1.2.3.4:5678
       [3856612376 0ms] inbound/vless[in]: inbound connection to www.youtube.com:443
+    Hysteria2：2026-11-15T16:18:00+08:00 DEBUG TCP request {"addr": "1.2.3.4:5678", "id": "user", "reqAddr": "www.youtube.com:443"}
     """
 
     def __init__(self):
         self.pending = {}
+        # debug 级别下，一条连接失败时会先记 request、再记 error：error 行不再重复算一次访问。
+        # warn 级别没有 request 行，error 行照常算（只能看到出错的请求）。
+        self.hy_seen = set()
 
     def feed(self, line):
         line = ANSI.sub('', line)
         found = XRAY_ACCEPT.search(line)
         if found:
             return self._event(found.group(1), found.group(2))
+        found = HY_EVENT.search(line)
+        if found:
+            addr = HY_ADDR.search(line)
+            req = HY_REQ.search(line)
+            if not addr or not req:
+                return None
+            event = self._event(addr.group(1), req.group(1))
+            if event is None:
+                return None
+            if found.group(1) == 'error':
+                if event in self.hy_seen:
+                    return None
+            else:
+                if len(self.hy_seen) >= 4096:
+                    self.hy_seen.pop(next(iter(self.hy_seen)))
+                self.hy_seen.add(event)
+            return event
         found = SINGBOX_CONN.search(line)
         if not found:
             return None
@@ -2765,6 +2792,64 @@ def proxy_log(pid, kind, argv):
     return None, name + ' 没有把访问记录保存下来（没写进文件，也没有 systemd 日志）', files, cwd, log
 
 
+def hy_level(pid, argv, proc='/proc'):
+    """这个 hysteria 进程的日志级别：命令行 -l/--log-level 优先，再看环境变量
+    HYSTERIA_LOG_LEVEL（一键脚本写在启动文件里），都没有就是默认的 info。
+    只有 debug 级别才记每条请求，info/warn 只记出错的请求。"""
+    args = argv[1:]
+    for i, arg in enumerate(args):
+        key, eq, value = arg.partition('=')
+        if key in ('-l', '--log-level'):
+            value = value if eq else (args[i + 1] if i + 1 < len(args) else '')
+            if value:
+                return value.lower()
+    try:
+        env = Path(proc, str(pid), 'environ').read_bytes().split(b'\0')
+    except OSError:
+        return 'info'
+    for item in env:
+        key, _eq, value = item.decode(errors='replace').partition('=')
+        if key == 'HYSTERIA_LOG_LEVEL' and value:
+            return value.lower()
+    return 'info'
+
+
+def hy_log(pid, argv, cwd):
+    """一个 hysteria 进程的访问日志在哪。返回 (来源或 None, 说明, 配置文件, 日志级别)。
+    日志默认输出到终端：看标准输出/错误最后写进了哪个文件；systemd 管的看 journal。"""
+    path = hy_config(argv, cwd)
+    level = hy_level(pid, argv)
+    out = (output_target(pid, 1) or output_target(pid, 2)).replace(' (deleted)', '')
+    if out.startswith('/') and not out.startswith('/dev/') and os.path.isfile(out):
+        source = ('file', out)
+    elif out == '/dev/null':
+        return None, 'Hysteria2 的访问记录直接被丢掉了（输出到 /dev/null），没有保存', path, level
+    elif docker_log(pid):
+        source = ('file', docker_log(pid))
+    else:
+        panel = panel_name(pid, argv)
+        if panel:
+            return None, ('Hysteria2 由 ' + panel + ' 面板启动，访问记录被面板接走了。请在面板里把日志级别改成 debug 再重启节点'), path, level
+        unit = service_unit(pid)
+        if unit and shutil.which('journalctl') and systemd_running():
+            source = ('journal', unit)
+        else:
+            return None, 'Hysteria2 没有把访问记录保存下来（没写进文件，也没有 systemd 日志）', path, level
+    note = '' if level == 'debug' else 'Hysteria2 日志级别是 ' + level + '，只能看到出错的请求（要 debug 才能看到全部访问）'
+    return source, note, path, level
+
+
+def hy_log_ok(pid, argv, cwd):
+    """返回 (是否已开好 debug, 大白话原因, 日志位置或 None)。"""
+    source, note, _path, level = hy_log(pid, argv, cwd)
+    if source is None:
+        return False, note, None
+    where = source[1] if source[0] == 'file' else 'systemd 日志（' + source[1] + '）'
+    if level != 'debug':
+        return False, note, where
+    return True, '', where
+
+
 def has_access_lines(source, kind=None):
     """日志里真的有访问记录才算能读到：文件要存在且最近 256KB 里有访问行；
     systemd 日志看最近 300 行。只配了路径、或者只有 warning 报错行，都不算。"""
@@ -2809,6 +2894,12 @@ def site_sources(extra=()):
         if source:
             sources.append(source)
         elif note:
+            notes.append(note)
+    for pid, argv, cwd in hy_processes():
+        source, note, _path, _level = hy_log(pid, argv, cwd)
+        if source:
+            sources.append(source)
+        if note:
             notes.append(note)
     seen = set()
     sources = [s for s in sources if not (s in seen or seen.add(s))]
@@ -2861,6 +2952,10 @@ def missing_logs():
         good, why, _p = config_log_ok(pid, kind, argv)
         if not good and not panel_name(pid, argv):
             out.append((pid, kind, argv, why))
+    for pid, argv, cwd in hy_processes():
+        good, why, _p = hy_log_ok(pid, argv, cwd)
+        if not good and not panel_name(pid, argv):
+            out.append((pid, 'hysteria', argv, why))
     return out
 
 
@@ -3017,12 +3112,14 @@ def restart_proxy(pid, kind, config=None):
 
 
 def enable_log(assume_yes=False):
-    """给没有访问日志的 Xray / V2Ray / sing-box 打开访问日志：先备份配置，改完自检，再重启代理。"""
+    """给没有访问日志的代理打开访问日志：Xray/V2Ray/sing-box 改配置写到 liuliang 的日志文件，
+    Hysteria2 把日志级别改成 debug。都先备份，改完自检，再重启代理。"""
     if os.geteuid() != 0:
         raise RuntimeError('请使用 root 运行：liuliang --enable-log')
     procs = proxy_processes()
-    if not procs:
-        print('没找到正在运行的 Xray / V2Ray / sing-box。代理装好并运行后再试。')
+    hyps = hy_processes()
+    if not procs and not hyps:
+        print('没找到正在运行的 Xray / V2Ray / sing-box / Hysteria2。代理装好并运行后再试。')
         return
     todo = []
     for pid, kind, argv in procs:
@@ -3043,10 +3140,26 @@ def enable_log(assume_yes=False):
             print('✘ ' + name + ' 的配置文件 ' + str(target) + ' 不是 JSON 格式，没法自动改。请自己改：' + SITE_MANUAL)
             continue
         todo.append((pid, kind, argv, cwd, Path(target)))
+    for pid, argv, cwd in hyps:
+        source, note, config, level = hy_log(pid, argv, cwd)
+        if source is None:
+            print('✘ ' + note)
+            continue
+        if level == 'debug':
+            where = source[1] if source[0] == 'file' else 'systemd 日志（' + source[1] + '）'
+            print('✔ Hysteria2（进程 ' + str(pid) + '）的访问日志已经开着（' + where + '），不用改。')
+            continue
+        if panel_name(pid, argv):
+            print('✘ Hysteria2 由面板管理，请在面板里把日志级别改成 debug 再重启节点')
+            continue
+        todo.append((pid, 'hysteria', argv, cwd, config))
     if not todo:
         return
     for _pid, kind, _argv, _cwd, target in todo:
-        print('将修改 ' + PROXY_NAMES[kind] + ' 的配置 ' + str(target) + '：打开访问日志，写到 ' + str(ACCESS_LOG) + '（会先备份原配置）')
+        if kind == 'hysteria':
+            print('将修改 Hysteria2 的启动设置：日志级别改成 debug（会先备份启动文件），日志还是写到原来的地方')
+        else:
+            print('将修改 ' + PROXY_NAMES[kind] + ' 的配置 ' + str(target) + '：打开访问日志，写到 ' + str(ACCESS_LOG) + '（会先备份原配置）')
     print('改完要重启一下代理：正在使用的人会断开几秒钟，然后自动重连。')
     if not assume_yes and has_tty():
         answer = ask('确定要继续吗？输入 y 回车继续：').lower()
@@ -3073,6 +3186,9 @@ def enable_log(assume_yes=False):
 
 def _enable_each(todo):
     for pid, kind, argv, cwd, target in todo:
+        if kind == 'hysteria':
+            _enable_hy(pid, argv, cwd, target)
+            continue
         name = PROXY_NAMES[kind]
         uid = int((proc_status(pid).get('Uid', '0').split() or ['0'])[0])
         ACCESS_DIR.mkdir(parents=True, exist_ok=True)
@@ -3130,6 +3246,78 @@ def _enable_each(todo):
         print('✔ ' + name + ' 访问日志已打开（原配置备份在 ' + str(backup) + '）')
         if todo_msg:
             print('  还差一步：' + todo_msg)
+
+
+def _enable_hy(pid, argv, cwd, config, initd='/etc/init.d'):
+    """把 Hysteria2 的日志级别改成 debug：OpenRC 改启动文件里的 HYSTERIA_LOG_LEVEL，
+    systemd 加一个 drop-in。都先备份，改完重启节点。"""
+    owners = services_for_pid(pid, config, initd=initd)
+    owners += [x for x in (services_for_config(config) if config else []) if x not in owners]
+    for init, name in owners:
+        if init == 'openrc':
+            _enable_hy_openrc(pid, name, Path(initd, name), config)
+            return
+    for init, name in owners:
+        if init == 'systemd' and systemd_running():
+            _enable_hy_systemd(pid, name, config)
+            return
+    unit = service_unit(pid)
+    if unit and systemd_running():
+        _enable_hy_systemd(pid, unit, config)
+        return
+    print('✘ 没找到 Hysteria2 的服务，没法自动改。请自己改：启动它的地方加上 HYSTERIA_LOG_LEVEL=debug 再重启节点')
+
+
+def _enable_hy_openrc(pid, name, path, config):
+    try:
+        original = path.read_bytes()
+    except OSError as exc:
+        print('✘ 读不到启动文件 ' + str(path) + '：' + str(exc))
+        return
+    backup = path.with_name(path.name + '.liuliang-bak-' + time.strftime('%Y%m%d%H%M%S'))
+    backup.write_bytes(original)
+    text = original.decode(errors='replace')
+    new, n = re.subn(r'^(export\s+)?HYSTERIA_LOG_LEVEL\s*=\s*\S+.*$', 'export HYSTERIA_LOG_LEVEL=debug', text, flags=re.M)
+    if not n:
+        lines = text.split('\n')
+        at = 1 if lines and lines[0].startswith('#!') else 0
+        lines.insert(at, 'export HYSTERIA_LOG_LEVEL=debug')
+        new = '\n'.join(lines)
+    path.write_text(new)
+    try:
+        todo_msg = restart_proxy(pid, 'hysteria', config)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        path.write_bytes(original)
+        try:
+            restart_proxy(pid, 'hysteria', config)
+        except (OSError, subprocess.CalledProcessError):
+            pass
+        print('✘ Hysteria2 重启失败，已还原启动文件：' + str(getattr(exc, 'stderr', '') or exc).strip())
+        return
+    print('✔ Hysteria2 访问日志已打开（启动文件备份在 ' + str(backup) + '）')
+    if todo_msg:
+        print('  还差一步：' + todo_msg)
+
+
+def _enable_hy_systemd(pid, unit, config, systemd_dir='/etc/systemd/system'):
+    drop = Path(systemd_dir, unit + '.d', 'liuliang-debug.conf')
+    drop.parent.mkdir(parents=True, exist_ok=True)
+    drop.write_text('# liuliang：打开 Hysteria2 的访问记录（debug 级别才能看到每个 IP 访问了哪些网站）\n'
+                    '[Service]\nEnvironment=HYSTERIA_LOG_LEVEL=debug\n')
+    try:
+        subprocess.run(['systemctl', 'daemon-reload'], check=True, capture_output=True, text=True)
+        todo_msg = restart_proxy(pid, 'hysteria', config)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        try:
+            drop.unlink()
+        except OSError:
+            pass
+        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
+        print('✘ Hysteria2 重启失败，已删掉刚加的设置：' + str(getattr(exc, 'stderr', '') or exc).strip())
+        return
+    print('✔ Hysteria2 访问日志已打开（设置在 ' + str(drop) + '，删掉它再重启节点就关掉）')
+    if todo_msg:
+        print('  还差一步：' + todo_msg)
 
 
 class FileFollower:
@@ -3725,10 +3913,11 @@ def doctor():
         names = [('日志文件 ' if kind == 'file' else 'systemd 日志 ') + p for kind, p in sources]
         # 先逐个节点检查，总的一行要和下面每个节点一致：全部 ✔ 才 ✔，否则写明几个没开。
         checks = [(pid, kind, config_log_ok(pid, kind, argv)) for pid, kind, argv in proxy_processes()]
+        checks += [(pid, 'hysteria', hy_log_ok(pid, argv, cwd)) for pid, argv, cwd in hy_processes()]
         nbad = sum(1 for _p, _k, r in checks if not r[0])
         if not checks and not sources:
             # 只跑网站、没有节点的机器：没有代理就没有访问日志，这是正常的，不打 ✘。
-            print('  代理访问日志：本机没有运行 Xray / V2Ray / sing-box，不需要（只统计网站访客）')
+            print('  代理访问日志：本机没有运行 Xray / V2Ray / sing-box / Hysteria2，不需要（只统计网站访客）')
         else:
             print(log_summary(bool(sources), nbad, ok) + ' 代理访问日志：' + ('、'.join(names) or '没找到') + ('（%d 个节点没开）' % nbad if nbad else ''))
         for note in notes:
@@ -3781,7 +3970,7 @@ def main():
     parser.add_argument('--reset-day', nargs='?', const='', help='设置服务商每月几号重置流量（1-31），不带数字就一步一步问')
     parser.add_argument('--scope', nargs='?', const='', help='统计范围：all 整机（全部节点和网站端口）或 10000,20000 只统计这些端口，不带参数就一步一步问')
     parser.add_argument('--log', choices=['yes','no'], help='高级：安装时是否自动打开代理访问日志（默认打开，内存<48MB 默认不开）')
-    parser.add_argument('--enable-log', action='store_true', help='自动打开 Xray / sing-box 的访问日志（看不到访问的网站时用）')
+    parser.add_argument('--enable-log', action='store_true', help='自动打开 Xray / sing-box / Hysteria2 的访问日志（看不到访问的网站时用）')
     parser.add_argument('-y', '--yes', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--daemon', action='store_true')
     parser.add_argument('--once', action='store_true')
@@ -4077,13 +4266,15 @@ def site_report(ip, config=None, show_all=False, wide=True):
             print('还没有记录：后台更新到 ' + VERSION + ' 后，从新产生的连接开始记，等两分钟再看')
         elif not status.get('sources'):
             notes = status.get('notes') or []
-            print('看不到这个 IP 访问了哪些网站：liuliang 要读代理（Xray/sing-box）自己的访问记录，现在读不到。')
+            print('看不到这个 IP 访问了哪些网站：liuliang 要读代理（Xray/sing-box/Hysteria2）自己的访问记录，现在读不到。')
             for note in notes:
                 print('  原因：' + note)
             if can_enable([], notes):
                 print('  ' + SITE_HELP)
         else:
             print('(近7天这个 IP 没有访问记录' + ('，总流量 ' + sz(total) if total else '') + ')')
+            for note in status.get('notes') or []:
+                print('  原因：' + note)
         return
     if not wide:
         return site_compact(ip, groups, total, show_all)
