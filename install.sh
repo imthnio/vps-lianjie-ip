@@ -190,10 +190,12 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.44'
+VERSION = '1.0.45'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
+# 屏蔽用的表（和计数表分开：改屏蔽名单时不碰计数器）。
+BLOCK_TABLE = 'liuliang_block'
 PROGRAM = Path('/usr/local/lib/liuliang/liuliang.py')
 # 每隔多少秒把计数写进数据库一次。60 秒：最后上网时间误差不超过 1 分钟。
 INTERVAL = 60
@@ -408,6 +410,7 @@ def open_db(path=None):
         CREATE TABLE IF NOT EXISTS sites(ts REAL NOT NULL, ip TEXT NOT NULL, host TEXT NOT NULL, bytes INTEGER NOT NULL, hits INTEGER NOT NULL, last REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS sites_ip_ts ON sites(ip,ts);
         CREATE INDEX IF NOT EXISTS sites_ts ON sites(ts);
+        CREATE TABLE IF NOT EXISTS ip_ports(ip TEXT NOT NULL, port INTEGER NOT NULL, last_seen REAL NOT NULL, PRIMARY KEY(ip, port));
     ''')
     # web：这一笔字节里走网站端口的部分（不另算，web <= bytes）。老库自动加列。
     for table in ('traffic', 'pending'):
@@ -608,6 +611,16 @@ def short(text, width=10):
     return out
 
 
+def port_text(ports):
+    """表格「端口」栏：46099，或 46099,46762；超过 2 个只显示前两个加数量（46099,46762+1），表格不被撑宽。"""
+    ports = sorted(set(ports or []))
+    if not ports:
+        return '-'
+    if len(ports) <= 2:
+        return ','.join(map(str, ports))
+    return ','.join(map(str, ports[:2])) + '+%d' % (len(ports) - 2)
+
+
 def collect(config, sniffer=None, sites=None):
     if config.get('backend') == 'diag':
         hy = HyStats(config['ports']) if (config.get('diag') or {}).get('udp') == 'hysteria' else None
@@ -618,14 +631,18 @@ def collect(config, sniffer=None, sites=None):
     with open(LOCK, 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         recreated = ensure_table()
+        ensure_block_table(config)
         doc = json.loads(run(['nft','-j','list','table','inet',TABLE], capture_output=True).stdout)
         current = parse_counters(doc)
+        # 表格「端口」栏：这一分钟的连接快照里，这个 IP 连的是哪个本机端口。
+        flows = read_flow_snapshot(config['ports'], port_sources())
         now = time.time()
         c = open_db()
         try:
             boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
             last_boot = c.execute("SELECT value FROM metadata WHERE key='boot'").fetchone()
             save_sample(c, current, now, recreated or not last_boot or last_boot[0] != boot)
+            record_ports(c, flows, now)
             save_realip(c, sniffer, now)
             take_pending(c, now)
             save_sites(c, sites, now)
@@ -1350,6 +1367,89 @@ def set_scope(value=None):
             print('注意：' + note)
 
 
+def set_block(value, unblock=False, assume_yes=False):
+    """liuliang --block IP[/前缀] / --unblock IP[/前缀]：屏蔽或解除屏蔽。只拦节点端口，SSH 不受影响。"""
+    if os.geteuid() != 0:
+        raise RuntimeError('请使用 root 运行 liuliang --block')
+    config = load_config()
+    target = normalize_block(value)
+    if target is None:
+        raise ValueError('屏蔽目标要是公网 IP 或网段，如 1.2.3.4 或 1.2.3.0/24（内网、回环地址不能屏蔽）')
+    net = ipaddress.ip_network(target, strict=False)
+    # 屏蔽本机地址等于把自己的服务全掐了，拒绝。
+    for local in local_ips():
+        addr = normalize_ip(local)
+        if addr is not None and addr.version == net.version and addr in net:
+            raise ValueError('不能屏蔽本机地址 ' + local)
+    blocked = list(config.get('blocked') or [])
+    if unblock:
+        if target not in blocked:
+            print('没有屏蔽过 ' + target)
+            return
+        blocked.remove(target)
+        action = '已解除屏蔽：'
+    else:
+        if target in blocked:
+            print('已经屏蔽了 ' + target)
+            return
+        if len(blocked) >= 1024:
+            raise ValueError('屏蔽名单已满（1024 个），先解除几个再加')
+        if not assume_yes and has_tty():
+            scope = '' if net.prefixlen == net.max_prefixlen else '（整个网段，约 %d 个地址）' % net.num_addresses
+            mine = ssh_client_ip()
+            if mine is not None and mine.version == net.version and mine in net:
+                scope += '（注意：这是你现在 SSH 连进来的地址，屏蔽后你自己的设备也连不上节点，SSH 还能用）'
+            got = ask('确定屏蔽 %s 吗？屏蔽后它连不上你的节点%s [y/n]：' % (target, scope))
+            if got.lower() not in ('y', 'yes'):
+                print('已取消')
+                return
+        blocked.append(target)
+        action = '已屏蔽：'
+    config['blocked'] = sorted(blocked)
+    write_config(config)
+    if config.get('backend') == 'diag':
+        print(action + target + '（已记下，但这台机器用不了 nft，屏蔽不会生效）')
+        return
+    try:
+        apply_blocked(config['blocked'], config['ports'])
+    except (OSError, subprocess.CalledProcessError) as exc:
+        detail = (getattr(exc, 'stderr', '') or '').strip().splitlines()
+        print(action + target + '（已记下，但写进内核失败' + ('：' + detail[-1] if detail else '') + '，后台每分钟会再试）')
+        return
+    print(action + target + '（只拦节点端口，SSH 不受影响）')
+
+
+def list_blocked():
+    """liuliang --blocked：列出屏蔽名单。"""
+    config = load_config()
+    blocked = config.get('blocked') or []
+    if not blocked:
+        print('(没有屏蔽任何 IP，屏蔽：liuliang --block IP)')
+        return
+    print(col('已屏蔽 %d 个' % len(blocked), B, C))
+    info = {}
+    try:
+        c = sqlite3.connect(str(DATA / 'history-v1.db'), timeout=30)
+        try:
+            info = {ip: (country, city) for ip, country, city in c.execute('select ip,country,city from clients')}
+        finally:
+            c.close()
+    except sqlite3.Error:
+        pass
+    for item in blocked:
+        place = place_name(*info[item]) if item in info else ''
+        print('  ' + item + (' · ' + place if place else ''))
+    if config.get('backend') == 'diag':
+        print(col('这台机器用不了 nft，屏蔽不会生效', D))
+        return
+    try:
+        loaded = block_loaded()
+    except OSError:
+        loaded = False
+    if not loaded:
+        print(col('屏蔽表还没加载进内核，后台每分钟会自动重建', D))
+
+
 def set_reset_day(value=None):
     """liuliang --reset-day N：改每月重置日；不带数字时一步一步问。"""
     config = load_config()
@@ -1413,6 +1513,24 @@ def detect_diag_sources():
     if udp is None and hy_processes():
         udp = 'hysteria'
     return {'tcp': tcp, 'udp': udp}
+
+
+_PORT_SOURCES = [0.0, {}]
+
+
+def port_sources(ttl=3600):
+    """表格「端口」栏的数据来源：TCP 看 ss，UDP 看 conntrack。每小时重测一次（ss 刚装上也能用上）。
+    nft 机器也用这个：nft 只按 IP 计数，不记端口，端口只能从连接快照里看。"""
+    now = time.monotonic()
+    if not _PORT_SOURCES[0] or now - _PORT_SOURCES[0] > ttl:
+        sources = {}
+        if ss_works():
+            sources['tcp'] = 'ss'
+        if (conntrack_text() or '').strip():
+            sources['udp'] = 'conntrack'
+            sources.setdefault('tcp', 'conntrack')
+        _PORT_SOURCES[:] = [now, sources]
+    return _PORT_SOURCES[1]
 
 
 def probe_backend(nft_text):
@@ -2106,6 +2224,21 @@ def flow_port(key):
         return None
 
 
+def record_ports(c, flows, now):
+    """连接快照里（IP，本机端口）记下来，表格里的「端口」栏就从这里取。只记「连过哪个端口」，不记流量：
+    nft 按 IP 计数时端口信息已经丢了，ss/conntrack 快照是唯一的来源。短连接可能正好错过采样，
+    看不到不代表没连过；代理连接一般都长，基本都能采到。"""
+    for key, value in (flows or {}).items():
+        port = flow_port(key)
+        ip = value[0] if value else None
+        if port is None or not ip or str(ip).startswith(HY_PREFIX):
+            continue
+        c.execute('INSERT INTO ip_ports(ip,port,last_seen) VALUES(?,?,?) '
+                  'ON CONFLICT(ip,port) DO UPDATE SET last_seen=max(ip_ports.last_seen, excluded.last_seen)',
+                  (str(ip), port, now))
+    c.execute('DELETE FROM ip_ports WHERE last_seen<?', (now - 8 * 86400,))
+
+
 def web_activity(previous, current, web, now):
     """只看网站端口上的流，算出每个 IP 的网站字节（已包含在总字节里）。"""
     if not web:
@@ -2232,6 +2365,7 @@ def diag_tick(config, flush, pump=None, watcher=None, sniffer=None, sites=None, 
             save_realip(c, sniffer, now)
             if flush:
                 take_pending(c, now)
+                record_ports(c, current, now)
                 save_sites(c, sites, now)
                 save_nic(c, now)
                 c.execute("INSERT OR REPLACE INTO metadata VALUES('sample',?)", (str(now),))
@@ -2265,7 +2399,7 @@ def follow_ports(config, seen):
     try:
         disk = json.loads(CONFIG.read_text())
         # min_kb 也要同步：用户可能刚用 liuliang --small 改过，不能被旧内存值盖回去。
-        for key in ('billing', 'log', 'reset_day', 'min_kb'):
+        for key in ('billing', 'log', 'reset_day', 'min_kb', 'blocked'):
             if key in disk:
                 config[key] = disk[key]
     except (OSError, ValueError):
@@ -2283,6 +2417,12 @@ def reload_nft(config):
         fcntl.flock(lock, fcntl.LOCK_EX)
         if apply_nft(text):
             clear_counters()
+    # 端口变了，屏蔽表里的端口集合也要跟着变，不然新端口拦不住。
+    if config.get('blocked'):
+        try:
+            apply_blocked(config['blocked'], config['ports'])
+        except (OSError, subprocess.CalledProcessError, ValueError):
+            pass
 
 
 def diag_daemon(config):
@@ -3622,6 +3762,135 @@ def clear_counters():
         c.close()
 
 
+# ---- 屏蔽某个 IP ----
+# 名单存在 config.json 的 blocked 里，内核里是单独一张表 liuliang_block（和计数表分开，
+# 改名单时不碰计数器）。只拦统计端口上的 TCP/UDP：被屏蔽的 IP 连不上节点，但 SSH 照常，
+# 免得把自己的 IP 屏蔽了就登不上机器。优先级 -100，比计数链（11）早，屏蔽掉的流量不计入统计。
+# 重启机器后表就没了，后台每分钟看一眼，没了就按配置重建。
+def normalize_block(value):
+    """屏蔽目标：单个公网 IP 或 CIDR 网段（如 1.2.3.0/24）。返回规范写法，不合法返回 None。
+    内网、回环、本机地址不能屏蔽：NAT 小鸡上屏蔽网关等于屏蔽所有用户。"""
+    text = str(value or '').strip().strip('[]')
+    if not text:
+        return None
+    try:
+        net = ipaddress.ip_network(text, strict=False)
+    except ValueError:
+        return None
+    addr = net.network_address
+    if addr.is_multicast or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_unspecified:
+        return None
+    if addr.is_private or is_nat_ip(addr):
+        return None
+    if net.prefixlen == net.max_prefixlen:
+        return str(addr)
+    return str(net)
+
+
+def blocked_networks(blocked):
+    """屏蔽名单转成 ip_network 列表，非法条目跳过。"""
+    nets = []
+    for item in blocked or []:
+        try:
+            nets.append(ipaddress.ip_network(str(item), strict=False))
+        except ValueError:
+            continue
+    return nets
+
+
+def blocked_match(ip, networks):
+    """这个 IP 在不在屏蔽名单里（单个 IP 或网段都算）。"""
+    try:
+        addr = ipaddress.ip_address(str(ip))
+    except ValueError:
+        return False
+    return any(addr.version == net.version and addr in net for net in networks)
+
+
+def ssh_client_ip():
+    """现在这条 SSH 连进来的客户端 IP（没有就是 None）。屏蔽它之前要提醒用户。"""
+    for var in ('SSH_CLIENT', 'SSH_CONNECTION'):
+        parts = os.environ.get(var, '').split()
+        if not parts:
+            continue
+        try:
+            return ipaddress.ip_address(parts[0])
+        except ValueError:
+            continue
+    return None
+
+
+def block_rules(blocked, selected, forward=False):
+    """屏蔽表的 nft 规则。blocked 里非法条目先过滤掉：配置是 root 手写也能写坏的，
+    非法内容绝不能原样写进 nft 文件。forward=True 再加转发链：Docker -p、中转机转发的
+    端口，包不进 input，只走 forward，转发后目的端口已被改掉，按 conntrack 里客户端
+    最初连的端口（ct original proto-dst）认，和计数表的 forward 链同一个办法。"""
+    selected = ports(','.join(map(str, selected)))
+    portset = '{ ' + ', '.join(map(str, selected)) + ' }'
+    clean = sorted({b for b in (normalize_block(item) for item in blocked) if b})
+    v4 = [b for b in clean if ':' not in b]
+    v6 = [b for b in clean if ':' in b]
+    elements = lambda items: ' elements = { ' + ', '.join(items) + ' }' if items else ''
+    lines = ['table inet ' + BLOCK_TABLE + ' {']
+    lines.append(' set blocked4 { type ipv4_addr; flags interval; size 4096;' + elements(v4) + ' }')
+    lines.append(' set blocked6 { type ipv6_addr; flags interval; size 4096;' + elements(v6) + ' }')
+    lines.append(' set bports { type inet_service; elements = ' + portset + ' }')
+    lines.append(' chain input { type filter hook input priority -100; policy accept;')
+    for version, family in [(4, 'ip'), (6, 'ip6')]:
+        for protocol in ('tcp', 'udp'):
+            lines.append(f'  {family} saddr @blocked{version} {protocol} dport @bports drop')
+    lines.append(' }')
+    if forward:
+        lines.append(' chain forward { type filter hook forward priority -100; policy accept;')
+        for version, family in [(4, 'ip'), (6, 'ip6')]:
+            lines.append(f'  meta nfproto ipv{version} meta l4proto {{ tcp, udp }} ct status dnat ct original proto-dst @bports {family} saddr @blocked{version} drop')
+        lines.append(' }')
+    return '\n'.join(lines + ['}', ''])
+
+
+def block_loaded():
+    probe = subprocess.run(['nft', 'list', 'table', 'inet', BLOCK_TABLE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return probe.returncode == 0
+
+
+def apply_blocked(blocked, selected):
+    """把屏蔽名单写进内核。名单空了就把表删掉。返回 True = 已生效。"""
+    blocked = sorted({b for b in (normalize_block(item) for item in blocked) if b})
+    path = CONFIG.parent / 'blocked.nft'
+    if not blocked:
+        if block_loaded():
+            run(['nft', 'delete', 'table', 'inet', BLOCK_TABLE])
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return True
+    text = block_rules(blocked, selected, forward=True)
+    if not nft_works(text)[0]:
+        text = block_rules(blocked, selected)
+    previous = path.read_text() if path.exists() else None
+    path.write_text(text)
+    if previous == text and block_loaded():
+        return True
+    if block_loaded():
+        run(['nft', 'delete', 'table', 'inet', BLOCK_TABLE])
+    run(['nft', '-f', str(path)], capture_output=True)
+    return True
+
+
+def ensure_block_table(config):
+    """后台每分钟看一眼：重启后屏蔽表没了就按配置重建。失败不吵（diag 机器本来就用不了 nft）。"""
+    blocked = config.get('blocked') or []
+    if not blocked or config.get('backend') == 'diag':
+        return False
+    try:
+        if block_loaded():
+            return False
+        return apply_blocked(blocked, config['ports'])
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return False
+
+
 def install(args):
     if os.geteuid() != 0:
         raise RuntimeError('请使用 root 用户运行安装')
@@ -3726,6 +3995,8 @@ def install(args):
     config['reset_day'] = (existing or {}).get('reset_day') or 0
     # min_kb：隐藏小流量 IP 的门槛，更新时保留原来的设置（新装默认 0 = 不隐藏），下面每次安装都会再问一次。
     config['min_kb'] = int((existing or {}).get('min_kb') or 0)
+    # blocked：屏蔽名单，更新时保留（新装默认空）。
+    config['blocked'] = sorted({b for b in (normalize_block(item) for item in (existing or {}).get('blocked') or []) if b})
     if backend == 'diag':
         config['diag'] = sources
     for folder in [CONFIG.parent, PROGRAM.parent, DATA]:
@@ -3781,6 +4052,15 @@ start_pre() { /usr/bin/python3 /usr/local/lib/liuliang/liuliang.py --once; }
     how = 'nftables' if backend == 'nft' else '连接采样'
     print('\n'+done+'。以后输入：liuliang\n端口：'+','.join(map(str,selected))+'；城市查询：'+('已启用' if geo else '关闭')+'；统计：'+how
           +'；Cloudflare 后的真实访客 IP：'+('已开启' if config['realip'] else '关闭'))
+    if config.get('blocked'):
+        if backend == 'diag':
+            print('屏蔽名单：%d 个（这台机器用不了 nft，屏蔽不会生效）' % len(config['blocked']))
+        else:
+            try:
+                live = block_loaded()
+            except OSError:
+                live = False
+            print('屏蔽名单：%d 个%s（查看：liuliang --blocked）' % (len(config['blocked']), '已恢复' if live else '，后台每分钟会自动恢复'))
     if sites:
         sources, notes = site_sources(access_logs)
         print('访问的应用/网站：已开启（读代理访问日志，只记域名和流量，不记网址和内容；--sites no 关闭）')
@@ -3871,6 +4151,15 @@ def doctor():
             loaded = False
         print(ok(loaded) + ' nftables 计数表：' + ('已加载' if loaded else '没加载（后台每分钟会自动重建）')
               + ('，中转/Docker 转发的端口也统计' if 'hook forward' in text else '，只统计本机收发（重跑一键安装可加上转发端口）'))
+    if config.get('blocked'):
+        if config.get('backend') == 'diag':
+            print(ok(False) + ' 已屏蔽 %d 个 IP，但这台机器用不了 nft，屏蔽不会生效' % len(config['blocked']))
+        else:
+            try:
+                live = block_loaded()
+            except OSError:
+                live = False
+            print(ok(live) + ' 已屏蔽 %d 个 IP：' % len(config['blocked']) + ('屏蔽表已加载' if live else '屏蔽表没加载（后台每分钟会自动重建）'))
     if config.get('backend') == 'diag':
         diag = config.get('diag') or {}
         if diag.get('udp') == 'conntrack' and not (conntrack_text() or '').strip():
@@ -3969,6 +4258,9 @@ def main():
     parser.add_argument('--small', nargs='?', const='', help='隐藏 800KB 以下的 IP：on 隐藏 / off 不隐藏，不带参数就一步一步问')
     parser.add_argument('--reset-day', nargs='?', const='', help='设置服务商每月几号重置流量（1-31），不带数字就一步一步问')
     parser.add_argument('--scope', nargs='?', const='', help='统计范围：all 整机（全部节点和网站端口）或 10000,20000 只统计这些端口，不带参数就一步一步问')
+    parser.add_argument('--block', help='屏蔽一个 IP 或网段，如 1.2.3.4 或 1.2.3.0/24（只拦节点端口，SSH 不受影响）')
+    parser.add_argument('--unblock', help='解除屏蔽：liuliang --unblock IP')
+    parser.add_argument('--blocked', action='store_true', help='列出已屏蔽的 IP')
     parser.add_argument('--log', choices=['yes','no'], help='高级：安装时是否自动打开代理访问日志（默认打开，内存<48MB 默认不开）')
     parser.add_argument('--enable-log', action='store_true', help='自动打开 Xray / sing-box / Hysteria2 的访问日志（看不到访问的网站时用）')
     parser.add_argument('-y', '--yes', action='store_true', help=argparse.SUPPRESS)
@@ -3994,6 +4286,12 @@ def main():
         set_reset_day(args.reset_day or None); return
     if args.scope is not None:
         set_scope(args.scope); return
+    if args.block is not None:
+        set_block(args.block, assume_yes=args.yes); return
+    if args.unblock is not None:
+        set_block(args.unblock, unblock=True, assume_yes=args.yes); return
+    if args.blocked:
+        list_blocked(); return
     config = load_config()
     if args.once:
         collect(config)
@@ -4067,6 +4365,12 @@ def report(config, web_only=False, show_all=False, wide=True):
   # 读不到访问日志的 IP 退回到最后一个数据包的时间，标 *（手机后台心跳也算，会偏晚）。
   hassites='sites' in {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
   opened=dict(c.execute('select ip,max(last) from sites where ts>? and hits>0 group by ip',(now-604800,))) if hassites and not web_only else {}
+  # 「端口」栏：这个 IP 近7天连过哪些本机端口。老数据库没有 ip_ports 表（后台还没更新到 1.0.45），没有就先空着。
+  portmap={}
+  if 'ip_ports' in {r[0] for r in c.execute("select name from sqlite_master where type='table'")}:
+   for pip,pport in c.execute('select ip,port from ip_ports where last_seen>?',(now-604800,)):
+    portmap.setdefault(pip,set()).add(pport)
+  bnets=blocked_networks(config.get('blocked') or []);bset=set()
   for rec in c.execute(f'select {sel} from clients where last_seen>=? order by last_seen desc',(now-604800,)):
    ip,co,ci=rec[0],rec[1],rec[2]; isp,ls=(rec[3],rec[4]) if len(rec)==5 else ('',rec[3])
    d=diff(c,ip,now-86400,now);w=diff(c,ip,now-604800,now);wb=diff(c,ip,now-604800,now,'web') if hasweb else 0
@@ -4092,10 +4396,14 @@ def report(config, web_only=False, show_all=False, wide=True):
    mark='' if web_only or opened.get(ip) else '*';ls=max(float(opened.get(ip) or 0),float(ls))
    age=max(0,now-float(ls));place=place_name(co,ci) or ('Cloudflare' if cf else '未解析');net=isp_display(isp)
    # hy2 按节点记的流量：城市栏放节点名，没有 IP 也就没有运营商；「*」是给读不到访问日志的 IP 用的，这里不标。
+   # 端口栏：hy2 按节点记，端口就是节点端口；普通 IP 取连接快照里采到的端口。
+   plist=sorted(portmap.get(ip,()))
    if ip.startswith(HY_PREFIX):
     if names is None:names=hy_names()
     port=ip[len(HY_PREFIX):].split('/')[0];place=names.get(int(port)) if port.isdigit() else '';place=place or 'hy2 节点';net='-';mark=''
-   rows.append((ip,net,place,d,w,ls,age,kind,mark))
+    plist=[int(port)] if port.isdigit() else []
+   if bnets and blocked_match(ip,bnets):bset.add(ip)
+   rows.append((ip,net,place,d,w,ls,age,kind,mark,plist))
   rows.sort(key=lambda r:-float(r[5]))
   # 疑似扫描 IP 不显示、不计入合计（规则见 scan_ips；liuliang --all 全显示）。
   scanhidden=0
@@ -4119,6 +4427,11 @@ def report(config, web_only=False, show_all=False, wide=True):
   natips=[r[0] for r in rows if is_nat_ip(r[0])]
   if natips and len(natips)*2>=len(rows):
    note=(note+'\n' if note else '')+'这台是 NAT 小鸡，商家的网关把来访地址\n换成了 %s，看不到用户真实 IP，\n只能显示总流量'%'、'.join(natips[:2])
+  # 端口栏全是空：后台还没更新到 1.0.45，或者 ss/conntrack 都读不到，端口记不下来。
+  if rows and not any(r[9] for r in rows):
+   note=(note+'\n' if note else '')+'还看不到端口：后台更新到 '+VERSION+' 后，\n从新产生的连接开始记（TCP 靠 ss，\nUDP 靠 conntrack；短连接可能错过采样）'
+  if bset:
+   note=(note+'\n' if note else '')+'带 [封] 的 IP 已屏蔽，连不上节点端口\n（SSH 不受影响）解除：liuliang --unblock IP'
   if not rows:
    print('(近7天没有网站访客)' if web_only else ('(近7天无达到 %dKB 的流量记录'%(limit//1024) if limit else '(近7天没有流量记录')+('，也没有网站访客' if config.get('web') else '')+')')
    if note:print('\n'.join(tip(t) for t in note.split('\n')))
@@ -4135,29 +4448,30 @@ def report(config, web_only=False, show_all=False, wide=True):
   showkind=web_only is False and any(r[7]!='节点' for r in rows)
   # 全是 hy2 节点时没有 IP、也没有城市：表头改成「节点」「名称」，免得把节点名看成城市。
   hyonly=all(r[0].startswith(HY_PREFIX) for r in rows);hip,hpl=('节点','名称') if hyonly else ('IP','城市')
-  h=['#',hip,'运营商',hpl,'24小时','7天','最后上网' if not web_only else '最近访问']+(['访问'] if showkind else []);N=[2,15,8,6,7,7,11]+([4] if showkind else [])
-  vals=lambda n,ip,net,pl,d,w,ls,kind,mark:[n,hy_show(ip),short(net),short(pl,14),sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%m-%d %H:%M')+mark]+([kind] if showkind else [])
-  for n,r in enumerate(rows,1):N=[max(N[i],ww(x)) for i,x in enumerate(vals(n,*r[:6],r[7],r[8]))]
+  h=['#',hip,'端口','运营商',hpl,'24小时','7天','最后上网' if not web_only else '最近访问']+(['访问'] if showkind else []);N=[2,15,5,8,6,7,7,11]+([4] if showkind else [])
+  vals=lambda n,ip,net,pl,d,w,ls,kind,mark,ports:[n,hy_show(ip)+(' [封]' if ip in bset else ''),port_text(ports),short(net),short(pl,14),sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%m-%d %H:%M')+mark]+([kind] if showkind else [])
+  for n,r in enumerate(rows,1):N=[max(N[i],ww(x)) for i,x in enumerate(vals(n,*r[:6],r[7],r[8],r[9]))]
   if wide:
    def line(a,m,b):return a+m.join('─'*(n+2) for n in N)+b
    print(line('┌','┬','┐'));print(col('│ '+' │ '.join(cell(x,N[i]) for i,x in enumerate(h))+' │',B,C));print(line('├','┼','┤'))
-   for n,(ip,net,pl,d,w,ls,age,kind,mark) in enumerate(rows,1):
-    v=vals(n,ip,net,pl,d,w,ls,kind,mark);out=[]
+   for n,(ip,net,pl,d,w,ls,age,kind,mark,ports) in enumerate(rows,1):
+    v=vals(n,ip,net,pl,d,w,ls,kind,mark,ports);out=[]
     for i,x in enumerate(v):
      st=[D,X] if d<=0 and w<=0 or kind=='CF节点' else ([B,G] if i==1 and d>0 else [])
-     if i==5 and w>0 and not st:st=[B]
-     if i==4 and d>=100*1024**2 or i==5 and w>=1024**3:st=[B,Y]
-     if i==6:st=[B,G] if age<=3600 else ([D,X] if age>259200 else [])
+     if i==6 and w>0 and not st:st=[B]
+     if i==5 and d>=100*1024**2 or i==6 and w>=1024**3:st=[B,Y]
+     if i==7:st=[B,G] if age<=3600 else ([D,X] if age>259200 else [])
      out.append(col(cell(x,N[i]),*st))
     print('│ '+' │ '.join(out)+' │')
    real=[r for r in rows if r[7]!='CF节点']
    print(line('└','┴','┘'));a=sum(1 for r in real if r[3]>0 or r[4]>0);print(col(('合计：节点数 %d · 有流量节点数 %d' if real and all(r[0].startswith(HY_PREFIX) for r in real) else '合计：IP 数 %d · 有流量 IP 数 %d')%(len(real),a)+' · 近24小时总流量 %s · 近7天总流量 %s'%(sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))),B))
   else:
    real=[r for r in rows if r[7]!='CF节点']
-   # 窄表（默认）：只放 序号、IP、7天流量、最后上网、城市，约 45 格宽，手机竖屏也能一行看完。
+   # 窄表（默认）：只放 序号、IP、7天流量、最后上网、城市，手机竖屏也能一行看完。
+   # 端口直接跟在 IP 后面（1.2.3.4 46099），不另开一栏：多一栏就超过 50 格，手机上得左右滑。
    # 运营商、近24小时在 liuliang --wide 里看。
-   K=[2,15,7,12,6];hc=['#',hip,'7天','最后上网' if not web_only else '最近访问',hpl]
-   cv=lambda n,r:[str(n),hy_show(r[0]),sz(r[4]),datetime.fromtimestamp(r[5],Z).strftime('%m-%d %H:%M')+r[8],short(r[2],14 if r[0].startswith(HY_PREFIX) else 10)]
+   K=[2,15,7,12,6];hc=['#','节点' if hyonly else 'IP 端口','7天','最后上网' if not web_only else '最近访问',hpl]
+   cv=lambda n,r:[str(n),hy_show(r[0])+(' '+port_text(r[9]) if r[9] and not r[0].startswith(HY_PREFIX) else '')+(' [封]' if r[0] in bset else ''),sz(r[4]),datetime.fromtimestamp(r[5],Z).strftime('%m-%d %H:%M')+r[8],short(r[2],14 if r[0].startswith(HY_PREFIX) else 10)]
    for n,r in enumerate(rows,1):K=[max(K[i],ww(x)) for i,x in enumerate(cv(n,r))]
    print(col(' '.join(cell(x,K[i]) for i,x in enumerate(hc)).rstrip(),B,C))
    for n,r in enumerate(rows,1):
@@ -4204,12 +4518,36 @@ def read_line(prompt, timeout=CHOOSE_IDLE):
 def choose_ip(config, picks, show_all=False, wide=False):
     while True:
         try:
-            text = read_line('\n输入序号或 IP，查看它近7天访问的应用/网站（直接回车退出）：').strip()
+            text = read_line('\n输入序号或 IP 看访问记录，b+序号 屏蔽，u+序号 解除屏蔽（直接回车退出）：').strip()
         except (EOFError, KeyboardInterrupt, OSError):
             print()
             return
         if not text:
             return
+        # b3 / b 3 / 封3 = 屏蔽，u3 / u 3 / 解3 = 解除屏蔽。b/u 后面必须是数字或空格：
+        # IPv6 地址里也有字母 b（如 b::1），不能误当成命令。
+        low = text.lower()
+        action = None
+        rest = ''
+        if low[:1] in ('b', 'u') and len(low) > 1 and (low[1].isdigit() or low[1] == ' '):
+            action, rest = low[0], low[1:].strip()
+        elif text[:1] in ('封', '解') and len(text) > 1:
+            action, rest = ('b' if text[0] == '封' else 'u'), text[1:].strip()
+        if action:
+            target = None
+            if rest.isdigit() and 1 <= int(rest) <= len(picks):
+                target = picks[int(rest) - 1]
+            else:
+                found = normalize_ip(rest)
+                target = str(found) if found is not None else None
+            if target is None or target.startswith(HY_PREFIX):
+                print('没有这个序号，也不是有效的公网 IP')
+                continue
+            try:
+                set_block(target, unblock=(action == 'u'))
+            except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+                print('错误：' + str(exc))
+            continue
         if text.isdigit() and 1 <= int(text) <= len(picks):
             ip = picks[int(text) - 1]
         else:
@@ -4240,15 +4578,17 @@ def site_report(ip, config=None, show_all=False, wide=True):
         status = c.execute("select value from metadata where key='sites'").fetchone()
         # 最后上网：和主表一样，取最后打开网站时间和最后一个数据包时间里更晚的。
         opened = c.execute('select max(last) from sites where ip=? and ts>? and hits>0', (ip, since)).fetchone()[0] if 'sites' in tables else None
+        iports = sorted(p for (p,) in c.execute('select port from ip_ports where ip=? and last_seen>?', (ip, since))) if 'ip_ports' in tables else []
     finally:
         c.close()
     place = ' '.join(x for x in (isp_display(info.get('isp')) if info.get('isp') else '', place_name(info.get('country'), info.get('city'))) if x)
     seen = max(float(opened or 0), float(info.get('last_seen') or 0))
+    extra = (' · 端口 ' + port_text(iports) if iports else '') + (' · 已屏蔽' if config is not None and blocked_match(ip, blocked_networks(config.get('blocked') or [])) else '')
     if wide:
-        print(col(ip + (' · ' + place if place else '') + ' · 近7天访问的应用/网站', B, C))
+        print(col(ip + (' · ' + place if place else '') + extra + ' · 近7天访问的应用/网站', B, C))
     else:
         # 窄版开头两行：IP 和城市；7天流量和最后上网。
-        print(col(ip + ' · ' + short(place_name(info.get('country'), info.get('city')) or '未解析', 14), B, C))
+        print(col(ip + ' · ' + short(place_name(info.get('country'), info.get('city')) or '未解析', 14) + extra, B, C))
         print('7天 %s · 最后上网 %s' % (sz(total), datetime.fromtimestamp(seen, Z).strftime('%m-%d %H:%M') if seen else '-'))
     groups = {}
     for host, b, h, last in rows:
