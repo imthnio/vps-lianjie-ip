@@ -18,7 +18,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.46'
+VERSION = '1.0.47'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -1323,13 +1323,15 @@ _PORT_SOURCES = [0.0, {}]
 
 def port_sources(ttl=3600):
     """表格「端口」栏的数据来源：TCP 看 ss，UDP 看 conntrack。每小时重测一次（ss 刚装上也能用上）。
-    nft 机器也用这个：nft 只按 IP 计数，不记端口，端口只能从连接快照里看。"""
+    nft 机器也用这个：nft 只按 IP 计数，不记端口，端口只能从连接快照里看。
+    conntrack 只要文件能读就算可用：机器上正好没连接的那一刻文件是空的，
+    不能因此断定它没开（和 diag 后端不同，那里选了 conntrack 就会跳过别的办法，这里没有别的办法）。"""
     now = time.monotonic()
     if not _PORT_SOURCES[0] or now - _PORT_SOURCES[0] > ttl:
         sources = {}
         if ss_works():
             sources['tcp'] = 'ss'
-        if (conntrack_text() or '').strip():
+        if conntrack_text() is not None:
             sources['udp'] = 'conntrack'
             sources.setdefault('tcp', 'conntrack')
         _PORT_SOURCES[:] = [now, sources]
@@ -1409,9 +1411,11 @@ def parse_ss(text, selected):
     return flows
 
 
-CT_FLOW = re.compile(
-    r'\bsrc=(\S+)\s+dst=(\S+)\s+sport=(\d+)\s+dport=(\d+)(?:\s+\S+=\S+)*?\s+bytes=(\d+)'
-)
+# 名词小词典：nf_conntrack_acct = 内核「要不要给每条连接记字节数」的开关，默认关。
+# 关着时 /proc/net/nf_conntrack 里只有五元组、没有 packets=/bytes=。端口栏只用五元组，
+# 所以字节数可有可无：有就记下来（diag 后端数 UDP 字节用），没有就当 0。
+CT_FLOW = re.compile(r'\bsrc=(\S+)\s+dst=(\S+)\s+sport=(\d+)\s+dport=(\d+)')
+CT_BYTES = re.compile(r'\bbytes=(\d+)')
 
 
 def parse_conntrack(text, selected, tcp=False, udp=False, local=()):
@@ -1430,20 +1434,21 @@ def parse_conntrack(text, selected, tcp=False, udp=False, local=()):
         found = CT_FLOW.search(line)
         if not found:
             continue
-        src, dst, sport, dport, nbytes = found.groups()
-        sport, dport, up = int(sport), int(dport), int(nbytes)
+        src, dst, sport, dport = found.groups()
+        sport, dport = int(sport), int(dport)
         if dport not in selected:
             continue
         ip = normalize_ip(src)
         if ip is None or str(ip) in local:
             continue
-        down = 0
-        reply = CT_FLOW.search(line[found.end():])
-        if reply:
-            down = int(reply.group(5))
+        # 每个方向的 bytes=（如果有）跟在它自己的五元组后面、下一个五元组前面。
+        reply = CT_FLOW.search(line, found.end())
+        end = reply.start() if reply else len(line)
+        up = CT_BYTES.search(line, found.end(), end)
+        down = CT_BYTES.search(line, reply.end()) if reply else None
         prefix = 'ctcp' if proto == 'tcp' else 'udp'
         key = '%s|%s|%s|%s|%s' % (prefix, src, sport, dst, dport)
-        flows[key] = (str(ip), up, down)
+        flows[key] = (str(ip), int(up.group(1)) if up else 0, int(down.group(1)) if down else 0)
     return flows
 
 
@@ -2902,6 +2907,12 @@ def can_enable(sources, notes):
     return not any(has_access_lines(x) for x in sources) and (not notes or any('面板' not in n for n in notes))
 
 
+def notes_can_fix(notes):
+    """说明里有没有 liuliang --enable-log 能修的问题（面板管的代理要在面板里改，不算）。
+    日志来源找得到、但某个代理的级别太高时用：比如 Hysteria2 的 warn 只记出错的请求。"""
+    return bool(notes) and any('面板' not in n for n in notes)
+
+
 def check_config(kind, exe, argv, cwd):
     """改完配置先让代理自己检查一遍，不通过就还原，避免代理起不来。"""
     args = list(argv[1:])
@@ -4250,6 +4261,7 @@ def read_line(prompt, timeout=CHOOSE_IDLE):
 
 
 def choose_ip(config, picks, show_all=False, wide=False):
+    offered = False   # 打开访问记录的提示，一次表格里只问一回
     while True:
         try:
             text = read_line('\n输入序号或 IP 看访问记录，b+序号 屏蔽，u+序号 解除屏蔽（直接回车退出）：').strip()
@@ -4290,11 +4302,24 @@ def choose_ip(config, picks, show_all=False, wide=False):
                 print('没有这个序号，也不是有效的公网 IP')
                 continue
         print()
-        site_report(str(ip), config, show_all, wide)
+        fixable = site_report(str(ip), config, show_all, wide)
+        if fixable and not offered:
+            offered = True
+            try:
+                answer = read_line('现在就打开访问记录吗？输入 y 回车打开（代理会重启几秒），直接回车跳过：').strip().lower()
+            except (EOFError, KeyboardInterrupt, OSError):
+                print()
+                return
+            if answer in ('y', 'yes'):
+                try:
+                    enable_log(assume_yes=True)
+                except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+                    print('错误：' + str(exc))
 
 
 def site_report(ip, config=None, show_all=False, wide=True):
-    """一个 IP 近7天访问的应用/网站：按应用归类，显示流量、访问次数和最近访问时间。"""
+    """一个 IP 近7天访问的应用/网站：按应用归类，显示流量、访问次数和最近访问时间。
+    没记录、且原因是 --enable-log 能修的日志问题时返回 True（表格里可以接着问要不要现在打开），其他情况返回 False。"""
     DB = str(DATA / 'history-v1.db')
     found = normalize_ip(ip)
     ip = str(found) if found is not None else str(ip).strip()
@@ -4331,27 +4356,35 @@ def site_report(ip, config=None, show_all=False, wide=True):
     if not groups:
         if config is not None and not config.get('sites', True):
             print('访问的应用/网站记录已关闭（重装时加 --sites yes 打开）')
-            return
+            return False
         try:
             status = json.loads(status[0]) if status else None
         except ValueError:
             status = None
         if status is None:
             print('还没有记录：后台更新到 ' + VERSION + ' 后，从新产生的连接开始记，等两分钟再看')
-        elif not status.get('sources'):
-            notes = status.get('notes') or []
+            return False
+        notes = status.get('notes') or []
+        if not status.get('sources'):
             print('看不到这个 IP 访问了哪些网站：liuliang 要读代理（Xray/sing-box/Hysteria2）自己的访问记录，现在读不到。')
             for note in notes:
                 print('  原因：' + note)
             if can_enable([], notes):
                 print('  ' + SITE_HELP)
-        else:
-            print('(近7天这个 IP 没有访问记录' + ('，总流量 ' + sz(total) if total else '') + ')')
-            for note in status.get('notes') or []:
-                print('  原因：' + note)
-        return
+                return True
+            return False
+        print('(近7天这个 IP 没有访问记录' + ('，总流量 ' + sz(total) if total else '') + ')')
+        for note in notes:
+            print('  原因：' + note)
+        # 日志来源找得到、但这个 IP 没记录：多半是某个代理的日志级别太高
+        # （比如 Hysteria2 的 warn 只记出错的请求），--enable-log 能修。
+        if notes_can_fix(notes):
+            print('  ' + SITE_HELP)
+            return True
+        return False
     if not wide:
-        return site_compact(ip, groups, total, show_all)
+        site_compact(ip, groups, total, show_all)
+        return False
     items = sorted(groups.items(), key=lambda kv: (-kv[1][0], -kv[1][1], kv[0]))
     limit = len(items) if show_all else 30
     shown, rest = items[:limit], items[limit:]
@@ -4382,6 +4415,7 @@ def site_report(ip, config=None, show_all=False, wide=True):
     print('合计：应用/网站 %d 个 · 访问 %d 次 · 已按网站细分 %s · 该 IP 近7天总流量 %s' % (len(items), sum(g[1] for _n, g in items), sz(counted), sz(max(total, counted))))
     if other > 0 or any(not g[0] for _n, g in items):
         print(col('流量为「-」的网站走的是 UDP（hy2/tuic）或 mux 连接，只能记次数，流量算在「其他」里', D))
+    return False
 
 
 

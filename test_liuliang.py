@@ -2325,4 +2325,109 @@ class V146Tests(unittest.TestCase):
             self.assertEqual(len(calls), 1)   # 没旧表就不动 nft
 
 
+class V147Tests(unittest.TestCase):
+    """1.0.47：hy2 warn 时详情里给打开办法、表格里可一键打开；conntrack 没开字节计数也能记 UDP 端口。"""
+
+    def test_parse_conntrack_without_bytes(self):
+        # 内核默认没开 nf_conntrack_acct：行里只有五元组、没有 packets=/bytes=，以前一条都认不出来。
+        text = '\n'.join([
+            'ipv4 2 udp 17 20 src=8.8.8.8 dst=10.0.0.8 sport=1111 dport=46762 src=10.0.0.8 dst=8.8.8.8 sport=46762 dport=1111 mark=0 use=1',
+            'ipv4 2 udp 17 20 src=1.1.1.1 dst=10.0.0.8 sport=2222 dport=46762 [UNREPLIED] src=10.0.0.8 dst=1.1.1.1 sport=46762 dport=2222 mark=0 use=1',
+            'ipv4 2 tcp 6 100 ESTABLISHED src=2.2.2.2 dst=10.0.0.8 sport=3333 dport=46099 src=10.0.0.8 dst=2.2.2.2 sport=46099 dport=3333 mark=0 use=1',
+        ])
+        flows = m.parse_conntrack(text, [46099, 46762], tcp=True, udp=True)
+        self.assertEqual(flows['udp|8.8.8.8|1111|10.0.0.8|46762'], ('8.8.8.8', 0, 0))
+        self.assertEqual(flows['udp|1.1.1.1|2222|10.0.0.8|46762'], ('1.1.1.1', 0, 0))
+        self.assertEqual(flows['ctcp|2.2.2.2|3333|10.0.0.8|46099'], ('2.2.2.2', 0, 0))
+        # 端口栏能从这些流里记下来
+        c = m.open_db(':memory:')
+        m.record_ports(c, flows, 1000000.0)
+        self.assertEqual(sorted(c.execute('select ip,port from ip_ports').fetchall()),
+                         [('1.1.1.1', 46762), ('2.2.2.2', 46099), ('8.8.8.8', 46762)])
+        c.close()
+
+    def test_parse_conntrack_bytes_still_counted(self):
+        # 开了 acct 时字节照常记（和以前一样）。
+        text = 'ipv4 2 udp 17 20 src=8.8.8.8 dst=10.0.0.8 sport=1111 dport=443 packets=2 bytes=300 src=10.0.0.8 dst=8.8.8.8 sport=443 dport=1111 packets=1 bytes=100 mark=0 use=1'
+        self.assertEqual(m.parse_conntrack(text, [443], udp=True),
+                         {'udp|8.8.8.8|1111|10.0.0.8|443': ('8.8.8.8', 300, 100)})
+
+    def test_port_sources_uses_empty_conntrack_file(self):
+        # 文件能读、但正好没连接时是空的：照样算 UDP 来源，不然要等一小时才记 hy2 端口。
+        with patch.object(m, '_PORT_SOURCES', [0.0, {}]), \
+             patch.object(m, 'ss_works', return_value=True), \
+             patch.object(m, 'conntrack_text', return_value=''):
+            self.assertEqual(m.port_sources(), {'tcp': 'ss', 'udp': 'conntrack'})
+        with patch.object(m, '_PORT_SOURCES', [0.0, {}]), \
+             patch.object(m, 'ss_works', return_value=True), \
+             patch.object(m, 'conntrack_text', return_value=None):
+            self.assertEqual(m.port_sources(), {'tcp': 'ss'})
+
+    def _site_report(self, sources, notes, wide=False):
+        t = m.SiteTracker([46762])
+        t.status = {'sources': sources, 'notes': notes}
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db')
+            now = m.time.time()
+            m.save_sample(db, {('up4', '8.8.8.8'): (2300 * 1024, None)}, now)
+            m.save_sites(db, t, now)
+            db.commit(); db.close()
+            out = io.StringIO()
+            with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                fixed = m.site_report('8.8.8.8', {'ports': [46762]}, wide=wide)
+            return fixed, out.getvalue()
+
+    def test_site_report_shows_fix_when_hy2_warn(self):
+        # 截图里的情况：日志来源找得到（hy2 journal），但级别是 warn，这个 IP 没记录。
+        # 以前只印原因、不给办法；现在印出 --enable-log，并返回 True 让表格接着问。
+        fixed, text = self._site_report(['journal:hysteria-server.service'],
+                                        ['Hysteria2 日志级别是 warn，只能看到出错的请求（要 debug 才能看到全部访问）'])
+        self.assertTrue(fixed)
+        self.assertIn('没有访问记录', text)
+        self.assertIn('warn', text)
+        self.assertIn('liuliang --enable-log', text)
+
+    def test_site_report_no_fix_offer_when_panel(self):
+        fixed, text = self._site_report(['journal:hysteria-server.service'],
+                                        ['Hysteria2 由 x-ui 面板启动，访问记录被面板接走了。请在面板里把日志级别改成 debug 再重启节点'])
+        self.assertFalse(fixed)
+        self.assertNotIn('liuliang --enable-log', text)
+
+    def test_site_report_no_sources_returns_fixable(self):
+        fixed, text = self._site_report([], ['Xray 关闭了访问日志（log.access 为 none），看不到访问的网站'])
+        self.assertTrue(fixed)
+        self.assertIn('liuliang --enable-log', text)
+
+    def test_choose_ip_offers_enable_log_once(self):
+        # 表格里看了一个没记录的 IP：问一次要不要现在打开，输入 y 就调 enable_log（不再二次确认）。
+        inputs = iter(['1', 'y', '1', None])
+        def fake_read(prompt, timeout=600):
+            value = next(inputs)
+            if value is None:
+                raise EOFError
+            return value
+        calls = []
+        with patch.object(m, 'read_line', side_effect=fake_read), \
+             patch.object(m, 'site_report', return_value=True) as sites, \
+             patch.object(m, 'enable_log', side_effect=lambda assume_yes=False: calls.append(assume_yes)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            m.choose_ip({'ports': [443]}, ['8.8.8.8'])
+        self.assertEqual(calls, [True])   # 第二次看同一个 IP 不再问
+        self.assertEqual(sites.call_count, 2)
+
+    def test_choose_ip_skips_enable_log_on_enter(self):
+        inputs = iter(['1', '', None])
+        def fake_read(prompt, timeout=600):
+            value = next(inputs)
+            if value is None:
+                raise EOFError
+            return value
+        with patch.object(m, 'read_line', side_effect=fake_read), \
+             patch.object(m, 'site_report', return_value=True), \
+             patch.object(m, 'enable_log') as enable, \
+             contextlib.redirect_stdout(io.StringIO()):
+            m.choose_ip({'ports': [443]}, ['8.8.8.8'])
+        enable.assert_not_called()
+
+
 if __name__=='__main__':unittest.main(verbosity=2)
