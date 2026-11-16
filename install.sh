@@ -190,7 +190,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.47'
+VERSION = '1.0.48'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -4477,12 +4477,13 @@ def choose_ip(config, picks, show_all=False, wide=False):
         fixable = site_report(str(ip), config, show_all, wide)
         if fixable and not offered:
             offered = True
+            # 默认打开：直接回车就打开，只有明确输入 n 才跳过（和安装时一样）。
             try:
-                answer = read_line('现在就打开访问记录吗？输入 y 回车打开（代理会重启几秒），直接回车跳过：').strip().lower()
+                answer = read_line('现在就打开访问记录吗？直接回车打开（代理会重启几秒），输入 n 跳过：').strip().lower()
             except (EOFError, KeyboardInterrupt, OSError):
                 print()
                 return
-            if answer in ('y', 'yes'):
+            if answer not in ('n', 'no'):
                 try:
                     enable_log(assume_yes=True)
                 except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:

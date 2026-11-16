@@ -2415,8 +2415,29 @@ class V147Tests(unittest.TestCase):
         self.assertEqual(calls, [True])   # 第二次看同一个 IP 不再问
         self.assertEqual(sites.call_count, 2)
 
-    def test_choose_ip_skips_enable_log_on_enter(self):
+
+class V148Tests(unittest.TestCase):
+    """1.0.48：表格里打开访问记录改成默认打开（直接回车就开，只有 n 跳过）。"""
+
+    def test_choose_ip_enter_opens_log_by_default(self):
+        # 默认打开，直接回车就打开。
         inputs = iter(['1', '', None])
+        def fake_read(prompt, timeout=600):
+            value = next(inputs)
+            if value is None:
+                raise EOFError
+            return value
+        calls = []
+        with patch.object(m, 'read_line', side_effect=fake_read), \
+             patch.object(m, 'site_report', return_value=True), \
+             patch.object(m, 'enable_log', side_effect=lambda assume_yes=False: calls.append(assume_yes)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            m.choose_ip({'ports': [443]}, ['8.8.8.8'])
+        self.assertEqual(calls, [True])
+
+    def test_choose_ip_skips_enable_log_on_n(self):
+        # 只有明确输入 n 才跳过。
+        inputs = iter(['1', 'n', None])
         def fake_read(prompt, timeout=600):
             value = next(inputs)
             if value is None:
