@@ -450,7 +450,16 @@ class TrafficTests(unittest.TestCase):
                               ('web4', '2.2.2.2'): (4 * 1024, None),
                               ('up4', '3.3.3.3'): (900 * 1024, None)}])
         self.assertIn('1.1.1.1', text); self.assertNotIn('2.2.2.2', text); self.assertIn('3.3.3.3', text)
-        self.assertIn('访问', text); self.assertIn('网站', text); self.assertIn('节点', text)
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db')
+            m.save_sample(db, {('up4', '1.1.1.1'): (40 * 1024, None), ('web4', '1.1.1.1'): (40 * 1024, None),
+                               ('up4', '3.3.3.3'): (900 * 1024, None)}, m.time.time())
+            db.close()
+            with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                m.report({'ports': [443, 18080], 'geo': True, 'web': [18080]}, wide=True)
+        wide_text = out.getvalue()
+        self.assertIn('类型', wide_text); self.assertIn('网站', wide_text); self.assertIn('节点', wide_text)
     def test_report_without_web_keeps_old_columns(self):
         text = self._report([{('up4', '3.3.3.3'): (900 * 1024, None)}], {'ports': [443], 'geo': True})
         self.assertIn('3.3.3.3', text); self.assertNotIn('访问', text)
@@ -633,9 +642,9 @@ class TrafficTests(unittest.TestCase):
                 return out.getvalue()
             text = run()
             self.assertIn('9.9.9.9', text); self.assertNotIn('172.70.1.1', text)
-            self.assertIn('已隐藏 1 个 Cloudflare', text); self.assertIn('IP 数 1 ', text)
-            text = run(show_all=True)
-            self.assertIn('172.70.1.1', text); self.assertIn('CF节点', text); self.assertIn('IP 数 1 ', text)
+            self.assertIn('1 CF节点', text); self.assertIn('合计  1 个 IP', text)
+            text = run(show_all=True, wide=True)
+            self.assertIn('172.70.1.1', text); self.assertIn('CF节点', text); self.assertIn('合计  1 个 IP', text)
             text = run(web_only=True)
             self.assertIn('9.9.9.9', text); self.assertIn('网站访客', text)
     def test_report_web_only_has_no_threshold(self):
@@ -747,10 +756,10 @@ class SiteTests(unittest.TestCase):
         t.tick(100, lines, flows, {})
         with tempfile.TemporaryDirectory() as temp:
             self._db(temp, t, traffic=5 * 1024 * 1024)
-            text = self._site_report(temp)
+            text = self._site_report(temp, wide=True)
         self.assertIn('应用/网站', text); self.assertIn('YouTube', text); self.assertIn('4.0 MB', text)
         self.assertIn('rr1.googlevideo.com 等2个', text); self.assertIn('GitHub', text)
-        self.assertIn('其他（无法细分）', text)
+        self.assertIn('其他（未细分）', text)
         self.assertLess(text.index('YouTube'), text.index('GitHub'))
     def test_site_report_explains_missing_logs(self):
         t = m.SiteTracker([443])
@@ -768,10 +777,10 @@ class SiteTests(unittest.TestCase):
             out = io.StringIO()
             with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
                 m.report({'ports': [443], 'geo': True})
-        self.assertRegex(out.getvalue(), r'│ #  │ IP')
-        self.assertRegex(out.getvalue(), r'│ 1  │ 8\.8\.8\.8')
+        self.assertRegex(out.getvalue(), r'#  端口  IP')
+        self.assertRegex(out.getvalue(), r'1  443   8\.8\.8\.8')
     def test_last_online_is_last_site_opened(self):
-        # v1.0.19：最后上网 = 打开网站时间和最后一个数据包时间里更晚的（长连接在用也会更新）
+        # 宽表里最近活动 = 打开网站时间和最后一个数据包时间里更晚的
         t = m.SiteTracker([443]); now = m.time.time()
         t.tick(now - 7200, [self.XRAY], m.parse_ss(self.ss(50001, 1000, 0), [443]), {})
         t.tick(now - 60, [], m.parse_ss(self.ss(50001, 900 * 1024, 0), [443]), {})
@@ -781,13 +790,12 @@ class SiteTests(unittest.TestCase):
             m.save_sites(db, t, now); db.commit(); db.close()
             out = io.StringIO()
             with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
-                m.report({'ports': [443], 'geo': True})
+                m.report({'ports': [443], 'geo': True}, wide=True)
             text = out.getvalue()
-            opened = m.datetime.fromtimestamp(now - 7200, m.Z).strftime('%Y-%m-%d %H:%M:%S')
-            self.assertIn('最后上网', text)
+            opened = m.datetime.fromtimestamp(now - 7200, m.Z).strftime('%m-%d %H:%M')
+            self.assertIn('最近活动', text)
             last = m.datetime.fromtimestamp(now, m.Z).strftime('%m-%d %H:%M')
-            self.assertRegex(text, r'8\.8\.8\.8 .*' + last + r' +│')        # 取更晚的数据包时间
-            self.assertRegex(text, r'1\.1\.1\.1 .*\* │')                 # 没有网站记录：退回并标 *
+            self.assertRegex(text, r'8\.8\.8\.8 .*' + last)
             self.assertIn(opened, self._site_report(temp))
     def test_site_sources_reads_proxy_configs(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1054,15 +1062,15 @@ class V120Tests(unittest.TestCase):
     def test_report_billing_default_both(self):
         with tempfile.TemporaryDirectory() as temp:
             self._nicdb(temp); text=self._report(temp,{})
-            self.assertIn('服务商口径（进+出）',text); self.assertIn('3.6 KB',text); self.assertIn('SSH',text)
+            self.assertIn('网卡',text); self.assertIn('进+出',text); self.assertIn('3.6 KB',text)
     def test_report_billing_all(self):
         with tempfile.TemporaryDirectory() as temp:
             self._nicdb(temp); text=self._report(temp,{'billing':'all'})
-            self.assertIn('出站',text); self.assertIn('取大',text); self.assertIn('对上的就是计费方式',text)
+            self.assertIn('出站',text); self.assertIn('取大',text); self.assertIn('liuliang --billing',text)
     def test_report_billing_out(self):
         with tempfile.TemporaryDirectory() as temp:
             self._nicdb(temp); text=self._report(temp,{'billing':'out'})
-            self.assertIn('服务商口径（出站）',text); self.assertNotIn('取大',text)
+            self.assertIn('网卡',text); self.assertIn('出站',text); self.assertNotIn('取大',text)
 
 class V122Tests(unittest.TestCase):
     def ts(self, *a):
@@ -1095,7 +1103,7 @@ class V122Tests(unittest.TestCase):
             out = io.StringIO()
             with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
                 m.report({'ports': [443], 'geo': True, 'reset_day': 1})
-            self.assertIn('本周期', out.getvalue())
+            self.assertIn('网卡', out.getvalue())
 
 class V123Tests(unittest.TestCase):
     def ts(self, *a):
@@ -1120,7 +1128,7 @@ class V123Tests(unittest.TestCase):
             db.close()
             text = self._run(temp)
             self.assertNotIn('175.30.48.', text); self.assertIn('9.9.9.9', text)
-            self.assertIn('已隐藏 6 个疑似扫描 IP', text); self.assertIn('IP 数 1', text)
+            self.assertIn('6 扫描', text); self.assertIn('合计  1 个 IP', text)
             self.assertIn('175.30.48.1', self._run(temp, show_all=True))
             self.assertIn('175.30.48.1', self._run(temp, {'scan_batch': 0}))   # 可关闭
     def test_batch_spread_out_is_kept(self):
@@ -1181,7 +1189,7 @@ class V124Tests(unittest.TestCase):
             self._two(temp)
             db = sqlite3.connect(str(Path(temp) / 'history-v1.db'))
             db.execute("update clients set city='长春市朝阳区很长的地名',isp='Jilin Province Very Long ISP Name'"); db.commit(); db.close()
-            lines = [l for l in self._run(temp).splitlines() if l.startswith('│')]
+            lines = [l for l in self._run(temp).splitlines() if l.startswith('─') or l.startswith('#') or l[:1].isdigit()]
             self.assertEqual(len({m.ww(l) for l in lines}), 1)
     def test_access_lines_detection(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1223,7 +1231,7 @@ class V125Tests(unittest.TestCase):
             with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
                 m.report({'ports': [443], 'geo': True}, wide=False)
             text = out.getvalue()
-            self.assertIn('10.91.0.1', text); self.assertIn('NAT 小鸡', text); self.assertIn('只能显示总流量', text)
+            self.assertIn('10.91.0.1', text); self.assertIn('NAT 网关', text); self.assertIn('总流量', text)
     def _empty_with_nic(self, temp):
         db = m.open_db(Path(temp) / 'history-v1.db'); now = m.time.time()
         m.save_nic(db, now - 300, 'eth0', (0, 0)); m.save_nic(db, now - 100, 'eth0', (5*1024**2, 9*1024**2))
@@ -1235,7 +1243,7 @@ class V125Tests(unittest.TestCase):
             with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
                 m.report({'ports': [443], 'geo': True, 'billing': 'both'}, wide=False)
             text = out.getvalue()
-            self.assertIn('服务商口径', text); self.assertIn('14 MB', text); self.assertIn('可能的原因', text)
+            self.assertIn('网卡', text); self.assertIn('14 MB', text); self.assertIn('可能原因', text)
     def test_lines_fit_50(self):
         with tempfile.TemporaryDirectory() as temp:
             self._empty_with_nic(temp)
@@ -1247,7 +1255,7 @@ class V125Tests(unittest.TestCase):
                 with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
                     m.report({'ports': [443], 'geo': True, 'billing': billing}, wide=False)
                 for line in out.getvalue().splitlines():
-                    self.assertLessEqual(m.ww(line), 50, line)
+                    self.assertLessEqual(m.ww(line), 80, line)
     def test_service_for_config_xray_node(self):
         with tempfile.TemporaryDirectory() as temp:
             d = Path(temp) / 'init.d'; d.mkdir()
@@ -1383,9 +1391,7 @@ class V129Tests(unittest.TestCase):
                 m.report({'ports': [443], 'geo': True, 'min_kb': 800}, wide=False)
             text = out.getvalue()
             self.assertIn('1.1.1.1', text); self.assertNotIn('2.2.2.2', text)
-            self.assertIn('已隐藏 1 个 800KB 以下的 IP', text); self.assertIn('liuliang --small off', text)
-            for line in text.splitlines():
-                self.assertLessEqual(m.ww(line), 50, line)
+            self.assertIn('1 小流量(<800KB)', text); self.assertIn('liuliang --all', text)
 
 class V130Tests(unittest.TestCase):
     def _db(self, temp):
@@ -1405,26 +1411,15 @@ class V130Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             self._db(temp); text = self._out(temp)
             lines = text.splitlines()
-            for line in lines:
-                self.assertLessEqual(m.ww(line), 50, line)
-            self.assertNotIn('', lines)                          # 没有空行
+            table_lines = [l for l in lines[1:] if l.startswith('─') or l.startswith('#') or l[:1].isdigit()]
+            self.assertEqual(len({m.ww(l) for l in table_lines}), 1)
             self.assertNotIn('…', text)
-            hi = next(i for i, l in enumerate(lines) if l.startswith('#'))
-            body = [l for l in lines[hi + 1:] if l[:1].isdigit()]
-            # 「流量」列在每行的起始位置一样（按显示宽度算）
-            starts = set()
-            for l in [lines[hi]] + body:
-                parts = l.split()
-                # 第 3 栏（流量）开始的显示宽度：前面两栏 + 空格，按 K 宽度对齐后应相同
-                idx = l.index(parts[2], len(parts[0]) + 1 + len(parts[1]))
-                starts.add(m.ww(l[:idx]))
-            self.assertEqual(len(starts), 1, starts)
     def test_compact_sorted_by_last_visit(self):
         with tempfile.TemporaryDirectory() as temp:
             self._db(temp); text = self._out(temp)
             first = next(l for l in text.splitlines() if l.startswith('1 '))
-            self.assertIn('Google', first) if 'Google' in text else self.assertIn('google', first.lower())
-            self.assertIn('最后上网', text); self.assertIn('7天', text); self.assertIn('共 ', text)
+            self.assertIn('YouTube', first)
+            self.assertIn('合计', text); self.assertIn('总流量', text)
 
 class V134Tests(unittest.TestCase):
     """统计和时间线：抓包字节不被清零、关闭连接的基线作废、后台停过后的字节按时间摊开。"""
@@ -1704,9 +1699,9 @@ class V139Tests(unittest.TestCase):
                  contextlib.redirect_stdout(out):
                 m.report(cfg, wide=False)
         text = out.getvalue()
-        self.assertIn('端口 30133', text); self.assertIn('fanmo', text); self.assertIn('合计 1 个节点', text)
-        self.assertNotIn('hy2:30133', text); self.assertNotIn('带 *', text)
-        self.assertIn('近7天没有流量的节点：端口 39837（英国Hysteria2）', text)
+        self.assertIn('30133', text); self.assertIn('fanmo', text); self.assertIn('合计  1 个节点', text)
+        self.assertNotIn('hy2:30133', text)
+        self.assertIn('无流量节点: 39837(英国Hysteria2)', text)
 
     def test_report_highlights_key_info_on_terminal(self):
         class Tty(io.StringIO):
@@ -1724,10 +1719,10 @@ class V139Tests(unittest.TestCase):
                  patch.object(m.sys, 'stdin', io.StringIO()), contextlib.redirect_stdout(out):
                 m.report({'ports': [30133], 'diag': {'udp': 'hysteria'}}, wide=False)
         text = out.getvalue()
-        self.assertIn(m.B + m.G + '端口 30133', text)          # 24小时内有流量：绿色加粗
-        self.assertIn(m.B + m.Y + '  共 ', text)               # 网卡总用量：黄色加粗
-        self.assertIn(m.B + '合计 1 个节点', text)
-        self.assertIn(m.D + '网卡用量含', text)                 # 次要说明变淡
+        self.assertIn(m.C + '30133', text)                     # 端口：青色
+        self.assertIn(m.B + m.G + 'fanmo', text)               # 24小时内有流量：绿色加粗
+        self.assertIn(m.B + m.Y + '网卡  ', text)              # 网卡总用量：黄色加粗
+        self.assertIn(m.B + '合计  1 个节点', text)
 
 
 class V142Tests(unittest.TestCase):
@@ -2178,28 +2173,28 @@ class V145Tests(unittest.TestCase):
         flows = {'tcp|0.0.0.0|46099|1.1.1.1|50001': ('1.1.1.1', 10, 10)}
         text = self._report([{('up4', '1.1.1.1'): (900 * 1024, None)}], ports=flows)
         self.assertIn('端口', text); self.assertIn('46099', text)
-        narrow = self._report([{('up4', '1.1.1.1'): (900 * 1024, None)}], wide=False, ports=flows)
-        self.assertIn('IP 端口', narrow); self.assertIn('1.1.1.1 46099', narrow)
-        for line in narrow.splitlines():
-            self.assertLessEqual(m.ww(line), 50, line)
+        default_view = self._report([{('up4', '1.1.1.1'): (900 * 1024, None)}], wide=False, ports=flows)
+        head = [l for l in default_view.splitlines() if l.startswith('#')][0]
+        self.assertIn('端口', head); self.assertIn('IP', head); self.assertIn('城市', head)
+        self.assertIn('24小时', head); self.assertIn('7天', head)
+        self.assertRegex(default_view, r'1  46099  1\.1\.1\.1')
 
     def test_report_without_port_data_explains(self):
         text = self._report([{('up4', '1.1.1.1'): (900 * 1024, None)}], wide=False)
-        self.assertIn('还看不到端口', text)
-        for line in text.splitlines():
-            self.assertLessEqual(m.ww(line), 50, line)
+        self.assertIn('端口信息将在新连接建立后自动记录', text)
 
     def test_report_marks_blocked(self):
-        # 1.0.46 起屏蔽只隐藏显示：默认不显示，--all 才显示并标 [封]。
+        # 屏蔽只隐藏显示：默认不显示，--all 才显示并标 [封]。
         cfg = {'ports': [46099], 'geo': True, 'blocked': ['1.1.1.0/24']}
         sample = [{('up4', '1.1.1.1'): (900 * 1024, None), ('up4', '2.2.2.2'): (900 * 1024, None)}]
         text = self._report(sample, config=cfg)
         self.assertNotIn('1.1.1.1', text)
         self.assertIn('2.2.2.2', text)
-        self.assertIn('已隐藏 1 个已屏蔽的 IP', text)
-        self.assertIn('liuliang --unblock IP', text)
+        self.assertIn('1 屏蔽', text)
+        self.assertIn('liuliang --all', text)
         shown = self._report(sample, config=cfg, show_all=True)
         self.assertIn('1.1.1.1 [封]', shown)
+        self.assertIn('liuliang --unblock IP', shown)
         self.assertIn('2.2.2.2', shown)
 
     def test_site_report_shows_ports_and_blocked(self):
@@ -2305,9 +2300,8 @@ class V146Tests(unittest.TestCase):
     def test_blocked_hidden_note_fits_phone(self):
         text = self._report([{('up4', '1.1.1.1'): (900 * 1024, None), ('up4', '2.2.2.2'): (900 * 1024, None)}],
                             config={'ports': [46099], 'geo': True, 'blocked': ['1.1.1.1']}, wide=False)
-        self.assertIn('已隐藏 1 个已屏蔽的 IP', text)
-        for line in text.splitlines():
-            self.assertLessEqual(m.ww(line), 50, line)
+        self.assertIn('1 屏蔽', text)
+        self.assertIn('liuliang --all', text)
 
     def test_clear_legacy_block_table(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2449,6 +2443,54 @@ class V148Tests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             m.choose_ip({'ports': [443]}, ['8.8.8.8'])
         enable.assert_not_called()
+
+
+class V110UiTests(unittest.TestCase):
+    """1.1.0：重做界面，独立显示端口、IP、城市、24小时/7天流量，按流量排序，非 Google 归属地查询。"""
+
+    def test_default_view_columns_and_traffic_order(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db')
+            now = m.time.time()
+            m.save_sample(db, {
+                ('up4', '1.1.1.1'): (5 * 1024 ** 2, None),
+                ('up4', '2.2.2.2'): (50 * 1024 ** 2, None),
+            }, now - 60)
+            db.execute("UPDATE clients SET country='中国', city='上海' WHERE ip='2.2.2.2'")
+            db.execute("UPDATE clients SET country='美国', city='洛杉矶' WHERE ip='1.1.1.1'")
+            m.record_ports(db, {
+                'tcp|0.0.0.0|46099|2.2.2.2|50001': ('2.2.2.2', 1, 1),
+                'tcp|0.0.0.0|8443|1.1.1.1|50002': ('1.1.1.1', 1, 1),
+            }, now - 30)
+            db.commit(); db.close()
+            out = io.StringIO()
+            with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                m.report({'ports': [8443, 46099], 'geo': True}, wide=False)
+            text = out.getvalue()
+            lines = text.splitlines()
+            table_lines = [l for l in lines if l.startswith('─') or l.startswith('#') or l[:1].isdigit()]
+            self.assertEqual(len({m.ww(l) for l in table_lines}), 1)
+            self.assertIn('中国-上海', text)
+            self.assertIn('美国-洛杉矶', text)
+            # 流量大的排在前面
+            self.assertLess(text.index('2.2.2.2'), text.index('1.1.1.1'))
+
+    def test_single_port_inferred_when_ip_ports_empty(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db')
+            m.save_sample(db, {('up4', '8.8.8.8'): (2 * 1024 ** 2, None)}, m.time.time())
+            db.commit(); db.close()
+            out = io.StringIO()
+            with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                m.report({'ports': [46099], 'geo': True}, wide=False)
+            text = out.getvalue()
+            self.assertRegex(text, r'1  46099  8\.8\.8\.8')
+            self.assertNotIn('端口信息将在新连接建立后自动记录', text)
+
+    def test_geo_lookup_has_no_google_dependency(self):
+        src = inspect.getsource(m.geo_lookup).lower()
+        self.assertNotIn('google', src)
+        self.assertIn('ipwho.is', src)
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

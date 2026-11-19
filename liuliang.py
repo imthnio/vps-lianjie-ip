@@ -18,7 +18,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.0.48'
+VERSION = '1.1.0'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -1017,34 +1017,25 @@ def billing_figure(mode, rx, tx):
 
 
 def billing_lines(config, c, now):
-    """合计下面那几行：服务商口径的整块网卡用量。"""
+    """合计下面那一行：服务商口径的整块网卡用量（精简显示）。"""
     d = nic_usage(c, now - 86400, now); w = nic_usage(c, now - 604800, now)
-    # 本计费周期：从上一个重置日到现在。
     a, b = cycle_bounds(now, config.get('reset_day', 1)); cyc = nic_usage(c, a, now)
     if not any(d + w + cyc):
         return []
-    # 每行不超过 50 格，手机竖屏不折行。
     span = '%s~%s' % (datetime.fromtimestamp(a, Z).strftime('%m-%d'), datetime.fromtimestamp(b - 1, Z).strftime('%m-%d'))
     mode = config.get('billing', 'both')
-    if mode in BILLING:
-        out = ['服务商口径（%s）本周期 %s' % (BILLING[mode], span),
-               '  共 %s · 24小时 %s · 7天 %s' % (sz(billing_figure(mode, *cyc)), sz(billing_figure(mode, *d)), sz(billing_figure(mode, *w)))]
-    else:
-        out = ['整块网卡用量 本周期 %s' % span,
-               '  ' + ' · '.join('%s %s' % (BILLING[k], sz(billing_figure(k, *cyc))) for k in ('out', 'both', 'max')),
-               '  和服务商后台对一下，对上的就是计费方式',
-               '  改计费方式：liuliang --billing']
-    out.append('网卡用量含 SSH、系统更新等全部流量')
-    # 表格只算「用户 ↔ 节点」这一段；节点替用户去外网取数据的那一段也走网卡，所以网卡差不多是 2 倍多。
-    out.append('表格只算用户↔节点，网卡还算节点↔外网，约 2 倍多')
-    # 刚装好（或刚修好）时，网卡用量里有一段是统计开始之前的，对不上是正常的。
     try:
         first = c.execute('SELECT min(ts) FROM traffic').fetchone()[0]
     except sqlite3.OperationalError:
         first = None
-    if first and first > now - 604800 + 3600:
-        out.append('%s 起才开始记，更早的网卡用量没统计到' % datetime.fromtimestamp(first, Z).strftime('%m-%d %H:%M'))
-    return out
+    since_note = (' · %s 起记' % datetime.fromtimestamp(first, Z).strftime('%m-%d %H:%M')) if (first and first > now - 604800 + 3600) else ''
+    if mode in BILLING:
+        return ['网卡  %s（%s）%s · 24小时 %s · 7天 %s%s' % (
+            span, BILLING[mode], sz(billing_figure(mode, *cyc)), sz(billing_figure(mode, *d)), sz(billing_figure(mode, *w)), since_note)]
+    return [
+        '网卡  %s  %s%s' % (span, ' · '.join('%s %s' % (BILLING[k], sz(billing_figure(k, *cyc))) for k in ('out', 'both', 'max')), since_note),
+        '提示: 核对服务商后台后可用 liuliang --billing 设置计费方式',
+    ]
 
 
 def set_billing(value=None):
@@ -4065,183 +4056,282 @@ def main():
         report(config, web_only=args.web, show_all=args.all, wide=args.wide)
 
 
-from datetime import datetime,timedelta,timezone
-Z=timezone(timedelta(hours=8)); E='\33[0m'; B='\33[1m'; C='\33[36m'; G='\33[32m'; Y='\33[33m'; D='\33[2m'; X='\33[90m'
-def col(x,*a): return ''.join(a)+str(x)+E if sys.stdout.isatty() and a else str(x)
+from datetime import datetime, timedelta, timezone
+Z = timezone(timedelta(hours=8))
+E = '\33[0m'; B = '\33[1m'; C = '\33[36m'; G = '\33[32m'; Y = '\33[33m'; D = '\33[2m'; X = '\33[90m'
+
+
+def col(x, *a):
+    return ''.join(a) + str(x) + E if sys.stdout.isatty() and a else str(x)
+
+
 def sz(n):
- u=['B','KB','MB','GB','TB'];v=float(max(0,n or 0))
- for q in u:
-  if v<1024 or q==u[-1]: break
-  v/=1024
- return f'{v:.0f} {q}' if q=='B' or v>=10 else f'{v:.1f} {q}'
+    u = ['B', 'KB', 'MB', 'GB', 'TB']
+    v = float(max(0, n or 0))
+    for q in u:
+        if v < 1024 or q == u[-1]:
+            break
+        v /= 1024
+    return f'{v:.0f} {q}' if q == 'B' or v >= 10 else f'{v:.1f} {q}'
+
+
 def tip(t):
- # 表格下面的说明：要紧的（网卡总用量、没统计到的时段、没流量的节点）加粗/黄色，其余变淡。
- s=t.strip()
- if s.startswith('共 ') or re.match(r'(出站|进\+出|取大) ',s):return col(t,B,Y)
- if '才开始记' in s or '没有流量的节点' in s:return col(t,B,Y)
- return col(t,D)
-def ww(s): return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in 'WFA' else 1 for c in str(s))
-def cell(s,n): return str(s)+' '*(n-ww(s))
-def diff(c,ip,a,b,col='bytes'):
- return c.execute(f'select coalesce(sum({col}),0) from traffic where ip=? and ts>? and ts<=?',(ip,a,b)).fetchone()[0]
-def report(config, web_only=False, show_all=False, wide=True):
- DB=str(DATA / "history-v1.db")
- now=time.time();print(col('端口 '+','.join(map(str,config['ports']))+' · 近7天'+('网站访客' if web_only else '连接'),B,C))
- if not os.path.exists(DB):
-  if DATA.exists() and not os.access(str(DATA), os.R_OK | os.X_OK):
-   print('无法读取流量数据，请使用 root 运行：liuliang');return
-  print('(暂无流量数据库记录)');return
- # 显示门槛：默认 0（全显示），config.json 里 min_kb 可调。
- limit=int(config.get('min_kb',MIN_TRAFFIC_BYTES//1024) or 0)*1024
- c=sqlite3.connect(DB, timeout=30); rows=[]; cfhidden=0; picks=[]; smallhidden=0; names=None
- try:
-  hasweb='web' in [r[1] for r in c.execute('PRAGMA table_info(traffic)')]
-  cols=[r[1] for r in c.execute('PRAGMA table_info(clients)')]
-  sel='ip,country,city,isp,last_seen' if 'isp' in cols else 'ip,country,city,last_seen'
-  # 最后上网 = 这个 IP 最后一次打开网站/App 的时间（代理访问日志里最后一次访问）。
-  # 读不到访问日志的 IP 退回到最后一个数据包的时间，标 *（手机后台心跳也算，会偏晚）。
-  hassites='sites' in {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
-  opened=dict(c.execute('select ip,max(last) from sites where ts>? and hits>0 group by ip',(now-604800,))) if hassites and not web_only else {}
-  # 「端口」栏：这个 IP 近7天连过哪些本机端口。老数据库没有 ip_ports 表（后台还没更新到 1.0.45），没有就先空着。
-  portmap={}
-  if 'ip_ports' in {r[0] for r in c.execute("select name from sqlite_master where type='table'")}:
-   for pip,pport in c.execute('select ip,port from ip_ports where last_seen>?',(now-604800,)):
-    portmap.setdefault(pip,set()).add(pport)
-  bnets=blocked_networks(config.get('blocked') or []);bset=set()
-  for rec in c.execute(f'select {sel} from clients where last_seen>=? order by last_seen desc',(now-604800,)):
-   ip,co,ci=rec[0],rec[1],rec[2]; isp,ls=(rec[3],rec[4]) if len(rec)==5 else ('',rec[3])
-   d=diff(c,ip,now-86400,now);w=diff(c,ip,now-604800,now);wb=diff(c,ip,now-604800,now,'web') if hasweb else 0
-   # Cloudflare 回源节点不是访客：真实访客已经从请求头单独记了，默认不显示。
-   # 只认「几乎全是网站流量」的：用 WARP 连节点的人出口也在 Cloudflare 网段，照常显示。
-   cf=is_cloudflare(ip) and wb>0 and w-wb<WEB_MIN_BYTES
-   if cf and not show_all:
-    if w>0: cfhidden+=1
-    continue
-   if web_only:
-    if wb<=0: continue
-    d=diff(c,ip,now-86400,now,'web') if hasweb else 0;w=wb
-   # 节点流量 800KB 起显示；网站（文件分享）访客上传/下载 20KB 起就显示。
-   # 节点流量（总流量减网站部分）大于 0 且达到门槛就显示；纯网站访客仍要 20KB 起，挡掉扫描器。
-   # 设了 min_kb：只看表格里「7天」那一栏的数字（进+出合计，1KB=1024 字节），低于就藏，和显示的完全一致。
-   elif not show_all and limit and w<limit:
-    smallhidden+=1;continue
-   # 没设门槛：有节点流量就显示；纯网站访客仍要 20KB 起，挡掉扫描器。
-   elif not show_all and not limit and not w-wb>0 and wb<WEB_MIN_BYTES: continue
-   kind='CF节点' if cf else '+'.join(k for k,ok in (('节点',w-wb>=WEB_MIN_BYTES),('网站',wb>=WEB_MIN_BYTES or web_only and wb>0)) if ok) or ('网站' if wb>0 and wb>=w-wb else '节点')
-   # 最后上网 = 最后打开网站时间 和 最后一个数据包时间 里更晚的那个：
-   # 长连接（看视频、下载）一直有数据时，时间也会跟着走，不会停在刚连上那一刻。
-   mark='' if web_only or opened.get(ip) else '*';ls=max(float(opened.get(ip) or 0),float(ls))
-   age=max(0,now-float(ls));place=place_name(co,ci) or ('Cloudflare' if cf else '未解析');net=isp_display(isp)
-   # hy2 按节点记的流量：城市栏放节点名，没有 IP 也就没有运营商；「*」是给读不到访问日志的 IP 用的，这里不标。
-   # 端口栏：hy2 按节点记，端口就是节点端口；普通 IP 取连接快照里采到的端口。
-   plist=sorted(portmap.get(ip,()))
-   if ip.startswith(HY_PREFIX):
-    if names is None:names=hy_names()
-    port=ip[len(HY_PREFIX):].split('/')[0];place=names.get(int(port)) if port.isdigit() else '';place=place or 'hy2 节点';net='-';mark=''
-    plist=[int(port)] if port.isdigit() else []
-   if bnets and blocked_match(ip,bnets):bset.add(ip)
-   rows.append((ip,net,place,d,w,ls,age,kind,mark,plist))
-  rows.sort(key=lambda r:-float(r[5]))
-  # 疑似扫描 IP 不显示、不计入合计（规则见 scan_ips；liuliang --all 全显示）。
-  scanhidden=0
-  if not show_all and not web_only:
-   bad=scan_ips(c,[r for r in rows if r[7]!='CF节点'],config,opened,now,hasweb)
-   scanhidden=len(bad);rows=[r for r in rows if r[0] not in bad]
-  # 已屏蔽的 IP 默认也不显示、不计入合计（liuliang --all 才显示，标 [封]）。
-  blockedhidden=0
-  if not show_all:
-   blockedhidden=len([r for r in rows if r[0] in bset]);rows=[r for r in rows if r[0] not in bset]
-  note=('已隐藏 %d 个 Cloudflare 节点 IP（橙色云/Tunnel）\n真实访客已单独列出，查看：liuliang --all'%cfhidden) if cfhidden else ''
-  if scanhidden:note=(note+'\n' if note else '')+'已隐藏 %d 个疑似扫描 IP，查看：liuliang --all'%scanhidden
-  if blockedhidden:note=(note+'\n' if note else '')+'已隐藏 %d 个已屏蔽的 IP，查看：liuliang --all\n解除屏蔽：liuliang --unblock IP'%blockedhidden
-  # 打开了「隐藏小流量 IP」时，在表格下面说清楚藏了几个、怎么看、怎么关。
-  if smallhidden:note=(note+'\n' if note else '')+'已隐藏 %d 个 %dKB 以下的 IP\n查看：liuliang --all · 关闭：liuliang --small off'%(smallhidden,limit//1024)
-  # NAT 小鸡：来访地址全是商家网关的内网地址，看不到真实用户。
-  if any(r[0].startswith(HY_PREFIX) for r in rows):
-   gw=nat_gateway()
-   note=(note+'\n' if note else '')+('端口 X = 这个 hy2 节点的总流量。这台是 NAT 小鸡：\n用户连进来时，商家网关 %s 把来源地址\n换成了它自己，真实 IP 到不了这台机器，\n只能按节点统计（要看真实 IP 得找商家）'%gw if gw else
-    '端口 X = 这个 hy2 节点的总流量：这台是容器，\n看不到用户 IP，只能按节点统计')
-  # hy2 节点按端口统计，近7天一点流量都没有的也说一声，免得以为漏统计了。
-  if (config.get('diag') or {}).get('udp')=='hysteria' and not web_only:
-   if names is None:names=hy_names()
-   idle=[p for p in config['ports'] if p in names and not c.execute('select 1 from traffic where ts>? and (ip=? or ip like ?) limit 1',(now-604800,HY_PREFIX+str(p),HY_PREFIX+str(p)+'/%')).fetchone()]
-   if idle:note=(note+'\n' if note else '')+'近7天没有流量的节点：'+'、'.join('端口 %d%s'%(p,'（'+names[p]+'）' if names.get(p) else '') for p in idle)
-  natips=[r[0] for r in rows if is_nat_ip(r[0])]
-  if natips and len(natips)*2>=len(rows):
-   note=(note+'\n' if note else '')+'这台是 NAT 小鸡，商家的网关把来访地址\n换成了 %s，看不到用户真实 IP，\n只能显示总流量'%'、'.join(natips[:2])
-  # 端口栏全是空：后台还没更新到 1.0.45，或者 ss/conntrack 都读不到，端口记不下来。
-  if rows and not any(r[9] for r in rows):
-   note=(note+'\n' if note else '')+'还看不到端口：后台更新到 '+VERSION+' 后，\n从新产生的连接开始记（TCP 靠 ss，\nUDP 靠 conntrack；短连接可能错过采样）'
-  if bset and show_all:
-   note=(note+'\n' if note else '')+'带 [封] 的 IP 已屏蔽，平时不显示\n解除：liuliang --unblock IP'
-  if not rows:
-   if blockedhidden:
-    print('(近7天有流量的 IP 都已屏蔽，查看：liuliang --all)')
-   else:
-    print('(近7天没有网站访客)' if web_only else ('(近7天无达到 %dKB 的流量记录'%(limit//1024) if limit else '(近7天没有流量记录')+('，也没有网站访客' if config.get('web') else '')+')')
-   if note:print('\n'.join(tip(t) for t in note.split('\n')))
-   # 没有任何 IP 记录时，说一下最可能的原因。
-   if not web_only and not cfhidden and not scanhidden and not blockedhidden:
-    # 端口填错（NAT 外网端口、只绑 127.0.0.1 的端口）是最常见的原因，查得到就直接说。
-    for t in port_notes(config['ports']):print(col('注意：'+t,Y))
-    for t in ('可能的原因：','  1. 还没人用过节点（用一下，2 分钟后再看）','  2. 节点端口没在统计里：liuliang --doctor','  3. 统计没在跑：liuliang --doctor 看后台服务'):print(col(t,D))
-   # 网卡用量不依赖 IP 记录，有数据就照样显示。
-   for t in billing_lines(config,c,now):print(tip(t))
-   if cfhidden and not c.execute("select 1 from metadata where key='realip_last'").fetchone():
-    print('只看到 Cloudflare 的 IP、没有真实访客：运行 liuliang --doctor 排查')
-   return
-  showkind=web_only is False and any(r[7]!='节点' for r in rows)
-  # 全是 hy2 节点时没有 IP、也没有城市：表头改成「节点」「名称」，免得把节点名看成城市。
-  hyonly=all(r[0].startswith(HY_PREFIX) for r in rows);hip,hpl=('节点','名称') if hyonly else ('IP','城市')
-  h=['#',hip,'端口','运营商',hpl,'24小时','7天','最后上网' if not web_only else '最近访问']+(['访问'] if showkind else []);N=[2,15,5,8,6,7,7,11]+([4] if showkind else [])
-  vals=lambda n,ip,net,pl,d,w,ls,kind,mark,ports:[n,hy_show(ip)+(' [封]' if ip in bset else ''),port_text(ports),short(net),short(pl,14),sz(d),sz(w),datetime.fromtimestamp(ls,Z).strftime('%m-%d %H:%M')+mark]+([kind] if showkind else [])
-  for n,r in enumerate(rows,1):N=[max(N[i],ww(x)) for i,x in enumerate(vals(n,*r[:6],r[7],r[8],r[9]))]
-  if wide:
-   def line(a,m,b):return a+m.join('─'*(n+2) for n in N)+b
-   print(line('┌','┬','┐'));print(col('│ '+' │ '.join(cell(x,N[i]) for i,x in enumerate(h))+' │',B,C));print(line('├','┼','┤'))
-   for n,(ip,net,pl,d,w,ls,age,kind,mark,ports) in enumerate(rows,1):
-    v=vals(n,ip,net,pl,d,w,ls,kind,mark,ports);out=[]
-    for i,x in enumerate(v):
-     st=[D,X] if d<=0 and w<=0 or kind=='CF节点' else ([B,G] if i==1 and d>0 else [])
-     if i==6 and w>0 and not st:st=[B]
-     if i==5 and d>=100*1024**2 or i==6 and w>=1024**3:st=[B,Y]
-     if i==7:st=[B,G] if age<=3600 else ([D,X] if age>259200 else [])
-     out.append(col(cell(x,N[i]),*st))
-    print('│ '+' │ '.join(out)+' │')
-   real=[r for r in rows if r[7]!='CF节点']
-   print(line('└','┴','┘'));a=sum(1 for r in real if r[3]>0 or r[4]>0);print(col(('合计：节点数 %d · 有流量节点数 %d' if real and all(r[0].startswith(HY_PREFIX) for r in real) else '合计：IP 数 %d · 有流量 IP 数 %d')%(len(real),a)+' · 近24小时总流量 %s · 近7天总流量 %s'%(sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))),B))
-  else:
-   real=[r for r in rows if r[7]!='CF节点']
-   # 窄表（默认）：只放 序号、IP、7天流量、最后上网、城市，手机竖屏也能一行看完。
-   # 端口直接跟在 IP 后面（1.2.3.4 46099），不另开一栏：多一栏就超过 50 格，手机上得左右滑。
-   # 运营商、近24小时在 liuliang --wide 里看。
-   K=[2,15,7,12,6];hc=['#','节点' if hyonly else 'IP 端口','7天','最后上网' if not web_only else '最近访问',hpl]
-   cv=lambda n,r:[str(n),hy_show(r[0])+(' '+port_text(r[9]) if r[9] and not r[0].startswith(HY_PREFIX) else '')+(' [封]' if r[0] in bset else ''),sz(r[4]),datetime.fromtimestamp(r[5],Z).strftime('%m-%d %H:%M')+r[8],short(r[2],14 if r[0].startswith(HY_PREFIX) else 10)]
-   for n,r in enumerate(rows,1):K=[max(K[i],ww(x)) for i,x in enumerate(cv(n,r))]
-   print(col(' '.join(cell(x,K[i]) for i,x in enumerate(hc)).rstrip(),B,C))
-   for n,r in enumerate(rows,1):
-    v=cv(n,r)
-    if r[4]<=0 or r[7]=='CF节点':
-     print(col(' '.join(cell(x,K[i]) for i,x in enumerate(v)).rstrip(),D,X));continue
-    # 醒目：24 小时内有流量的 IP 绿色加粗，7天流量加粗（满 1GB 黄色），1 小时内上过网的时间绿色加粗。
-    st=[[],[B,G] if r[3]>0 else [B],[B,Y] if r[4]>=1024**3 else [B],[B,G] if r[6]<=3600 else ([D] if r[6]>259200 else []),[]]
-    print(' '.join(col(cell(x,K[i]) if i<len(v)-1 else x,*st[i]) for i,x in enumerate(v)))
-   print(col('合计 %d %s · 24小时 %s · 7天 %s'%(len(real),'个节点' if real and all(r[0].startswith(HY_PREFIX) for r in real) else '个 IP',sz(sum(r[3] for r in real)),sz(sum(r[4] for r in real))),B))
-  # 服务商口径：整块网卡的进/出用量，按 config.json 里的 billing 显示。
-  for t in billing_lines(config,c,now):print(tip(t))
-  if any(r[8] for r in rows) and not wide:print(col('带 * = 没有访问记录，按最后有数据的时间',D))
-  if any(r[8] for r in rows) and wide:print(col('最后上网：这个 IP 最后一次打开网站/App 或最后有数据来往的时间（取更晚的，每分钟更新）。带 * 的读不到它打开网站的记录（代理没开日志，或是网站访客），'
-   '手机放着不用、后台心跳也算数据，所以可能比实际晚',D))
-  if note:print('\n'.join(tip(t) for t in note.split('\n')))
-  picks=[r[0] for r in rows]
- finally:
-  c.close()
- # 在终端里看表时，可以接着选一个 IP 看它访问了哪些应用/网站。
- if picks and sys.stdin.isatty() and sys.stdout.isatty():choose_ip(config,picks,show_all,wide)
+    s = t.strip()
+    if s.startswith('网卡'):
+        return col(t, B, Y)
+    if s.startswith('无流量节点:') or s.startswith('注意:'):
+        return col(t, B, Y)
+    return col(t, D)
 
 
-# 表格下面等输入序号时，10 分钟没人输入就自动退出。以前会一直等：SSH 断线后终端没被关掉，
-# 留下的 liuliang 一个占 10~20MB 内存，挂好几天，小内存机器被一个个堆满。
+def ww(s):
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in str(s))
+
+
+def cell(s, n):
+    return str(s) + ' ' * max(0, n - ww(s))
+
+
+def rcell(s, n):
+    return ' ' * max(0, n - ww(s)) + str(s)
+
+
+def _pad(s, n, align):
+    return rcell(s, n) if align == 'r' else cell(s, n)
+
+
+def fmt_table(headers, rows, aligns, styles=None):
+    """干净的现代终端表格：细横线分隔、无竖线干扰、数值右对齐、CJK 精确对齐。"""
+    widths = [max([ww(h)] + [ww(r[i]) for r in rows]) for i, h in enumerate(headers)]
+    rule = '─' * (sum(widths) + 2 * (len(widths) - 1))
+    print(col(rule, D))
+    print(col('  '.join(_pad(h, widths[i], aligns[i]) for i, h in enumerate(headers)), B, C))
+    print(col(rule, D))
+    for idx, r in enumerate(rows):
+        row_st = styles[idx] if styles else None
+        parts = []
+        for i, val in enumerate(r):
+            st = row_st[i] if row_st else ()
+            parts.append(col(_pad(val, widths[i], aligns[i]), *st))
+        print('  '.join(parts))
+    print(col(rule, D))
+
+
+def diff(c, ip, a, b, col='bytes'):
+    return c.execute(f'select coalesce(sum({col}),0) from traffic where ip=? and ts>? and ts<=?', (ip, a, b)).fetchone()[0]
+
+
+def report(config, web_only=False, show_all=False, wide=False):
+    DB = str(DATA / 'history-v1.db')
+    now = time.time()
+    title = 'liuliang · 网站访客（近7天）' if web_only else 'liuliang · 节点流量（近7天）'
+    ports_str = ', '.join(map(str, config.get('ports') or []))
+    print(col(title, B, C) + ('  ' + col('端口: ' + ports_str, D) if ports_str else ''))
+    if not os.path.exists(DB):
+        if DATA.exists() and not os.access(str(DATA), os.R_OK | os.X_OK):
+            print('无法读取流量数据，请使用 root 运行：liuliang')
+            return
+        print('(暂无流量数据库记录)')
+        return
+    limit = int(config.get('min_kb', MIN_TRAFFIC_BYTES // 1024) or 0) * 1024
+    c = sqlite3.connect(DB, timeout=30)
+    rows = []; cfhidden = 0; picks = []; smallhidden = 0; names = None
+    try:
+        hasweb = 'web' in [r[1] for r in c.execute('PRAGMA table_info(traffic)')]
+        cols = [r[1] for r in c.execute('PRAGMA table_info(clients)')]
+        sel = 'ip,country,city,isp,last_seen' if 'isp' in cols else 'ip,country,city,last_seen'
+        tables = {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
+        opened = dict(c.execute('select ip,max(last) from sites where ts>? and hits>0 group by ip', (now - 604800,))) if ('sites' in tables and not web_only) else {}
+        portmap = {}
+        if 'ip_ports' in tables:
+            for pip, pport in c.execute('select ip,port from ip_ports where last_seen>?', (now - 604800,)):
+                portmap.setdefault(pip, set()).add(pport)
+        bnets = blocked_networks(config.get('blocked') or [])
+        bset = set()
+        single_port = config['ports'][0] if len(config.get('ports') or []) == 1 else None
+        for rec in c.execute(f'select {sel} from clients where last_seen>=? order by last_seen desc', (now - 604800,)):
+            ip, co, ci = rec[0], rec[1], rec[2]
+            isp, ls = (rec[3], rec[4]) if len(rec) == 5 else ('', rec[3])
+            d = diff(c, ip, now - 86400, now)
+            w = diff(c, ip, now - 604800, now)
+            wb = diff(c, ip, now - 604800, now, 'web') if hasweb else 0
+            cf = is_cloudflare(ip) and wb > 0 and w - wb < WEB_MIN_BYTES
+            if cf and not show_all:
+                if w > 0:
+                    cfhidden += 1
+                continue
+            if web_only:
+                if wb <= 0:
+                    continue
+                d = diff(c, ip, now - 86400, now, 'web') if hasweb else 0
+                w = wb
+            elif not show_all and limit and w < limit:
+                smallhidden += 1
+                continue
+            elif not show_all and not limit and not w - wb > 0 and wb < WEB_MIN_BYTES:
+                continue
+            kind = 'CF节点' if cf else '+'.join(k for k, ok in (('节点', w - wb >= WEB_MIN_BYTES), ('网站', wb >= WEB_MIN_BYTES or (web_only and wb > 0))) if ok) or ('网站' if wb > 0 and wb >= w - wb else '节点')
+            mark = '' if web_only or opened.get(ip) else '*'
+            ls = max(float(opened.get(ip) or 0), float(ls))
+            age = max(0, now - float(ls))
+            place = place_name(co, ci) or ('Cloudflare' if cf else '未解析')
+            net = isp_display(isp)
+            plist = sorted(portmap.get(ip, ()))
+            if ip.startswith(HY_PREFIX):
+                if names is None:
+                    names = hy_names()
+                port = ip[len(HY_PREFIX):].split('/')[0]
+                place = names.get(int(port)) if port.isdigit() else ''
+                place = place or 'hy2 节点'
+                net = '-'
+                mark = ''
+                plist = [int(port)] if port.isdigit() else []
+            elif not plist and single_port is not None and not web_only:
+                plist = [single_port]
+            if bnets and blocked_match(ip, bnets):
+                bset.add(ip)
+            rows.append((ip, net, place, d, w, ls, age, kind, mark, plist))
+        # 按 7 天流量从高到低排，再按 24 小时、最近活动时间：一眼看到谁用得最多。
+        rows.sort(key=lambda r: (-r[4], -r[3], -float(r[5])))
+        scanhidden = 0
+        if not show_all and not web_only:
+            bad = scan_ips(c, [r for r in rows if r[7] != 'CF节点'], config, opened, now, hasweb)
+            scanhidden = len(bad)
+            rows = [r for r in rows if r[0] not in bad]
+        blockedhidden = 0
+        if not show_all:
+            blockedhidden = len([r for r in rows if r[0] in bset])
+            rows = [r for r in rows if r[0] not in bset]
+        # 汇总隐藏项为紧凑的一行。
+        hidden_parts = []
+        if scanhidden:
+            hidden_parts.append('%d 扫描' % scanhidden)
+        if blockedhidden:
+            hidden_parts.append('%d 屏蔽' % blockedhidden)
+        if smallhidden:
+            hidden_parts.append('%d 小流量(<%dKB)' % (smallhidden, limit // 1024))
+        if cfhidden:
+            hidden_parts.append('%d CF节点' % cfhidden)
+        notes = []
+        if hidden_parts:
+            notes.append('已隐藏: ' + ' · '.join(hidden_parts) + '（liuliang --all 查看）')
+        if any(r[0].startswith(HY_PREFIX) for r in rows):
+            gw = nat_gateway()
+            notes.append('提示: hy2 节点无法获取真实来源 IP（%s），按端口统计总流量' % ('NAT 网关 ' + gw if gw else '容器环境'))
+        if (config.get('diag') or {}).get('udp') == 'hysteria' and not web_only:
+            if names is None:
+                names = hy_names()
+            idle = [p for p in config['ports'] if p in names and not c.execute(
+                'select 1 from traffic where ts>? and (ip=? or ip like ?) limit 1',
+                (now - 604800, HY_PREFIX + str(p), HY_PREFIX + str(p) + '/%')).fetchone()]
+            if idle:
+                notes.append('无流量节点: ' + '、'.join('%d%s' % (p, '(%s)' % names[p] if names.get(p) else '') for p in idle))
+        natips = [r[0] for r in rows if is_nat_ip(r[0])]
+        if natips and len(natips) * 2 >= len(rows):
+            notes.append('提示: 检测到 NAT 网关地址（%s），真实来源 IP 已被网关替换，仅能统计总流量' % '、'.join(natips[:2]))
+        if rows and not any(r[9] for r in rows):
+            notes.append('提示: 端口信息将在新连接建立后自动记录')
+        if bset and show_all:
+            notes.append('提示: [封] 为已屏蔽 IP（解除屏蔽: liuliang --unblock IP）')
+        if not rows:
+            if blockedhidden:
+                print('(近7天有流量的 IP 都已屏蔽，查看: liuliang --all)')
+            else:
+                empty = '(近7天没有网站访客)' if web_only else ('(近7天无达到 %dKB 的流量记录' % (limit // 1024) if limit else '(近7天没有流量记录') + ('，也没有网站访客' if config.get('web') else '') + ')'
+                print(empty)
+            for t in notes:
+                print(tip(t))
+            if not web_only and not cfhidden and not scanhidden and not blockedhidden:
+                for t in port_notes(config['ports']):
+                    print(col('注意: ' + t, Y))
+                for t in ('可能原因:', '  1. 暂无连接（使用节点后约 1~2 分钟显示）', '  2. 端口未加入统计或后台未运行: liuliang --doctor'):
+                    print(col(t, D))
+            for t in billing_lines(config, c, now):
+                print(tip(t))
+            if cfhidden and not c.execute("select 1 from metadata where key='realip_last'").fetchone():
+                print(col('提示: 只看到 Cloudflare IP、没有真实访客，运行 liuliang --doctor 排查', Y))
+            return
+        hyonly = all(r[0].startswith(HY_PREFIX) for r in rows)
+        showkind = (not web_only) and any(r[7] != '节点' for r in rows)
+        narrow_tty = (not wide) and sys.stdout.isatty() and shutil.get_terminal_size((80, 24)).columns < 58
+        if hyonly:
+            if wide:
+                headers = ['#', '端口', '节点名称', '24小时', '7天', '最近活动']
+                aligns = ['r', 'l', 'l', 'r', 'r', 'l']
+            elif narrow_tty:
+                headers = ['#', '端口', '节点名称', '7天']
+                aligns = ['r', 'l', 'l', 'r']
+            else:
+                headers = ['#', '端口', '节点名称', '24小时', '7天']
+                aligns = ['r', 'l', 'l', 'r', 'r']
+        else:
+            if wide:
+                headers = ['#', '端口', 'IP', '城市', '运营商', '24小时', '7天', '最近活动'] + (['类型'] if showkind else [])
+                aligns = ['r', 'l', 'l', 'l', 'l', 'r', 'r', 'l'] + (['l'] if showkind else [])
+            elif narrow_tty:
+                headers = ['#', '端口', 'IP', '城市', '7天']
+                aligns = ['r', 'l', 'l', 'l', 'r']
+            else:
+                headers = ['#', '端口', 'IP', '城市', '24小时', '7天']
+                aligns = ['r', 'l', 'l', 'l', 'r', 'r']
+        trows = []
+        tstyles = []
+        for idx, (ip, net, pl, d, w, ls, age, kind, mark, plist) in enumerate(rows, 1):
+            ptxt = port_text(plist)
+            ip_label = (hy_show(ip) if ip.startswith(HY_PREFIX) else ip) + (' [封]' if ip in bset else '')
+            city_txt = short(pl, 20 if wide else (12 if narrow_tty else 16))
+            ts_txt = datetime.fromtimestamp(ls, Z).strftime('%m-%d %H:%M')
+            dim_row = (d <= 0 and w <= 0) or kind == 'CF节点'
+            st_num = [D, X] if dim_row else [D]
+            st_port = [D, X] if dim_row else ([C] if ptxt != '-' else [D])
+            st_ip = [D, X] if dim_row else ([B, G] if d > 0 else [B])
+            st_city = [D, X] if dim_row else []
+            st_net = [D, X] if dim_row else [D]
+            st_d = [D, X] if dim_row else ([B, Y] if d >= 100 * 1024 ** 2 else ([D] if d <= 0 else []))
+            st_w = [D, X] if dim_row else ([B, Y] if w >= 1024 ** 3 else ([B] if w > 0 else [D]))
+            st_ts = [D, X] if dim_row else ([G] if age <= 3600 else ([D] if age > 259200 else []))
+            st_kind = [D, X] if dim_row else [D]
+            if hyonly:
+                if wide:
+                    trows.append([str(idx), ptxt, city_txt, sz(d), sz(w), ts_txt])
+                    tstyles.append([st_num, st_port, st_ip, st_d, st_w, st_ts])
+                elif narrow_tty:
+                    trows.append([str(idx), ptxt, city_txt, sz(w)])
+                    tstyles.append([st_num, st_port, st_ip, st_w])
+                else:
+                    trows.append([str(idx), ptxt, city_txt, sz(d), sz(w)])
+                    tstyles.append([st_num, st_port, st_ip, st_d, st_w])
+            else:
+                if wide:
+                    row_v = [str(idx), ptxt, ip_label, city_txt, short(net, 12), sz(d), sz(w), ts_txt] + ([kind] if showkind else [])
+                    row_s = [st_num, st_port, st_ip, st_city, st_net, st_d, st_w, st_ts] + ([st_kind] if showkind else [])
+                    trows.append(row_v)
+                    tstyles.append(row_s)
+                elif narrow_tty:
+                    trows.append([str(idx), ptxt, ip_label, city_txt, sz(w)])
+                    tstyles.append([st_num, st_port, st_ip, st_city, st_w])
+                else:
+                    trows.append([str(idx), ptxt, ip_label, city_txt, sz(d), sz(w)])
+                    tstyles.append([st_num, st_port, st_ip, st_city, st_d, st_w])
+        fmt_table(headers, trows, aligns, tstyles)
+        real = [r for r in rows if r[7] != 'CF节点']
+        unit = '个节点' if real and all(r[0].startswith(HY_PREFIX) for r in real) else '个 IP'
+        print(col('合计  %d %s  │  24小时 %s  │  7天 %s' % (
+            len(real), unit, sz(sum(r[3] for r in real)), sz(sum(r[4] for r in real))), B))
+        for t in billing_lines(config, c, now):
+            print(tip(t))
+        if notes:
+            print()
+            for t in notes:
+                print(tip(t))
+        picks = [r[0] for r in rows]
+    finally:
+        c.close()
+    if picks and sys.stdin.isatty() and sys.stdout.isatty():
+        choose_ip(config, picks, show_all, wide)
+
+
+# 表格下面等输入序号时，10 分钟没人输入就自动退出。
 CHOOSE_IDLE = 600
 
 
@@ -4261,17 +4351,15 @@ def read_line(prompt, timeout=CHOOSE_IDLE):
 
 
 def choose_ip(config, picks, show_all=False, wide=False):
-    offered = False   # 打开访问记录的提示，一次表格里只问一回
+    offered = False
     while True:
         try:
-            text = read_line('\n输入序号或 IP 看访问记录，b+序号 屏蔽，u+序号 解除屏蔽（直接回车退出）：').strip()
+            text = read_line('\n操作: 输入序号/IP 查访问网站 · b序号 屏蔽 · u序号 解封 · 回车退出 > ').strip()
         except (EOFError, KeyboardInterrupt, OSError):
             print()
             return
         if not text:
             return
-        # b3 / b 3 / 封3 = 屏蔽，u3 / u 3 / 解3 = 解除屏蔽。b/u 后面必须是数字或空格：
-        # IPv6 地址里也有字母 b（如 b::1），不能误当成命令。
         low = text.lower()
         action = None
         rest = ''
@@ -4305,7 +4393,6 @@ def choose_ip(config, picks, show_all=False, wide=False):
         fixable = site_report(str(ip), config, show_all, wide)
         if fixable and not offered:
             offered = True
-            # 默认打开：直接回车就打开，只有明确输入 n 才跳过（和安装时一样）。
             try:
                 answer = read_line('现在就打开访问记录吗？直接回车打开（代理会重启几秒），输入 n 跳过：').strip().lower()
             except (EOFError, KeyboardInterrupt, OSError):
@@ -4318,16 +4405,16 @@ def choose_ip(config, picks, show_all=False, wide=False):
                     print('错误：' + str(exc))
 
 
-def site_report(ip, config=None, show_all=False, wide=True):
+def site_report(ip, config=None, show_all=False, wide=False):
     """一个 IP 近7天访问的应用/网站：按应用归类，显示流量、访问次数和最近访问时间。
-    没记录、且原因是 --enable-log 能修的日志问题时返回 True（表格里可以接着问要不要现在打开），其他情况返回 False。"""
+    没记录、且原因是 --enable-log 能修的日志问题时返回 True，其他情况返回 False。"""
     DB = str(DATA / 'history-v1.db')
     found = normalize_ip(ip)
     ip = str(found) if found is not None else str(ip).strip()
     now = time.time(); since = now - 604800
     if not os.path.exists(DB):
         print('无法读取流量数据，请使用 root 运行：liuliang' if DATA.exists() and not os.access(str(DATA), os.R_OK | os.X_OK) else '(暂无流量数据库记录)')
-        return
+        return False
     c = sqlite3.connect(DB, timeout=30)
     try:
         tables = {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
@@ -4336,20 +4423,21 @@ def site_report(ip, config=None, show_all=False, wide=True):
         info = c.execute('select * from clients where ip=?', (ip,)).fetchone()
         info = dict(zip([d[0] for d in c.execute('select * from clients limit 0').description], info)) if info else {}
         status = c.execute("select value from metadata where key='sites'").fetchone()
-        # 最后上网：和主表一样，取最后打开网站时间和最后一个数据包时间里更晚的。
-        opened = c.execute('select max(last) from sites where ip=? and ts>? and hits>0', (ip, since)).fetchone()[0] if 'sites' in tables else None
         iports = sorted(p for (p,) in c.execute('select port from ip_ports where ip=? and last_seen>?', (ip, since))) if 'ip_ports' in tables else []
     finally:
         c.close()
-    place = ' '.join(x for x in (isp_display(info.get('isp')) if info.get('isp') else '', place_name(info.get('country'), info.get('city'))) if x)
-    seen = max(float(opened or 0), float(info.get('last_seen') or 0))
-    extra = (' · 端口 ' + port_text(iports) if iports else '') + (' · 已屏蔽' if config is not None and blocked_match(ip, blocked_networks(config.get('blocked') or [])) else '')
-    if wide:
-        print(col(ip + (' · ' + place if place else '') + extra + ' · 近7天访问的应用/网站', B, C))
-    else:
-        # 窄版开头两行：IP 和城市；7天流量和最后上网。
-        print(col(ip + ' · ' + short(place_name(info.get('country'), info.get('city')) or '未解析', 14) + extra, B, C))
-        print('7天 %s · 最后上网 %s' % (sz(total), datetime.fromtimestamp(seen, Z).strftime('%m-%d %H:%M') if seen else '-'))
+    city = place_name(info.get('country'), info.get('city'))
+    isp = isp_display(info.get('isp')) if info.get('isp') else ''
+    head_parts = [ip]
+    if iports:
+        head_parts.append('端口 ' + port_text(iports))
+    if city:
+        head_parts.append(city)
+    if wide and isp and isp != '未解析':
+        head_parts.append(isp)
+    if config is not None and blocked_match(ip, blocked_networks(config.get('blocked') or [])):
+        head_parts.append('已屏蔽')
+    print(col(' · '.join(head_parts) + ' · 近7天访问记录', B, C))
     groups = {}
     for host, b, h, last in rows:
         g = groups.setdefault(site_label(host), [0, 0, 0, []])
@@ -4377,69 +4465,58 @@ def site_report(ip, config=None, show_all=False, wide=True):
         print('(近7天这个 IP 没有访问记录' + ('，总流量 ' + sz(total) if total else '') + ')')
         for note in notes:
             print('  原因：' + note)
-        # 日志来源找得到、但这个 IP 没记录：多半是某个代理的日志级别太高
-        # （比如 Hysteria2 的 warn 只记出错的请求），--enable-log 能修。
         if notes_can_fix(notes):
             print('  ' + SITE_HELP)
             return True
         return False
-    if not wide:
-        site_compact(ip, groups, total, show_all)
-        return False
-    items = sorted(groups.items(), key=lambda kv: (-kv[1][0], -kv[1][1], kv[0]))
+    items = sorted(groups.items(), key=lambda kv: (-kv[1][0], -kv[1][1], -kv[1][2], kv[0]))
     limit = len(items) if show_all else 30
     shown, rest = items[:limit], items[limit:]
-    def hosts(lst):
+    counted = sum(g[0] for _name, g in items)
+    other = total - counted
+    def hosts_str(lst):
         lst = sorted(lst, key=lambda x: (-x[0], -x[1], x[2]))
         top = lst[0][2] if len(lst[0][2]) <= 36 else lst[0][2][:33] + '...'
         return top + (' 等%d个' % len(lst) if len(lst) > 1 else '')
-    table = [[str(n), name, hosts(g[3]), sz(g[0]) if g[0] else '-', str(g[1]), datetime.fromtimestamp(g[2], Z).strftime('%Y-%m-%d %H:%M:%S') if g[2] else '-']
-             for n, (name, g) in enumerate(shown, 1)]
-    counted = sum(g[0] for _name, g in items)
+    trows = []
+    tstyles = []
+    if wide:
+        headers = ['#', '应用/网站', '域名', '流量', '次数', '最近访问']
+        aligns = ['r', 'l', 'l', 'r', 'r', 'l']
+        for idx, (name, g) in enumerate(shown, 1):
+            big = g[0] >= 1024 ** 3
+            trows.append([str(idx), name, hosts_str(g[3]), sz(g[0]) if g[0] else '-', str(g[1]),
+                          datetime.fromtimestamp(g[2], Z).strftime('%m-%d %H:%M') if g[2] else '-'])
+            tstyles.append([[D], [B, G], [D], [B, Y] if big else ([B] if g[0] else [D]), [], [D]])
+        if rest:
+            trows.append(['', '其余 %d 个' % len(rest), 'liuliang --ip ' + ip + ' --all',
+                          sz(sum(g[0] for _n, g in rest)), str(sum(g[1] for _n, g in rest)), ''])
+            tstyles.append([[D, X]] * 6)
+        if other > 0:
+            trows.append(['', '其他（未细分）', 'UDP/mux 连接、协议开销', sz(other), '', ''])
+            tstyles.append([[D, X]] * 6)
+    else:
+        headers = ['#', '应用/网站', '流量', '次数', '最近访问']
+        aligns = ['r', 'l', 'r', 'r', 'l']
+        for idx, (name, g) in enumerate(shown, 1):
+            big = g[0] >= 1024 ** 3
+            trows.append([str(idx), short(name, 18), sz(g[0]) if g[0] else '-', str(g[1]),
+                          datetime.fromtimestamp(g[2], Z).strftime('%m-%d %H:%M') if g[2] else '-'])
+            tstyles.append([[D], [B, G], [B, Y] if big else ([B] if g[0] else [D]), [], [D]])
+        if rest:
+            trows.append(['', '其余 %d 个' % len(rest), sz(sum(g[0] for _n, g in rest)), str(sum(g[1] for _n, g in rest)), ''])
+            tstyles.append([[D, X]] * 5)
+        if other > 0:
+            trows.append(['', '其他（未细分）', sz(other), '', ''])
+            tstyles.append([[D, X]] * 5)
+    fmt_table(headers, trows, aligns, tstyles)
+    print(col('合计  %d 个应用/网站  │  访问 %d 次  │  总流量 %s' % (
+        len(items), sum(g[1] for _n, g in items), sz(max(total, counted))), B))
     if rest:
-        table.append(['', '其余 %d 个' % len(rest), 'liuliang --ip ' + ip + ' --all', sz(sum(g[0] for _n, g in rest)), str(sum(g[1] for _n, g in rest)), ''])
-    other = total - counted
-    if other > 0:
-        table.append(['', '其他（无法细分）', 'UDP/mux 连接、协议开销', sz(other), '', ''])
-    h = ['#', '应用/网站', '域名', '流量', '次数', '最近访问']
-    N = [max([ww(x) for x in [h[i]] + [r[i] for r in table]]) for i in range(len(h))]
-    line = lambda a, m, b: a + m.join('─' * (n + 2) for n in N) + b
-    print(line('┌', '┬', '┐')); print(col('│ ' + ' │ '.join(cell(x, N[i]) for i, x in enumerate(h)) + ' │', B, C)); print(line('├', '┼', '┤'))
-    for r in table:
-        out = []
-        for i, x in enumerate(r):
-            big = r[0] and groups[r[1]][0] >= 1024 ** 3
-            st = [D, X] if not r[0] else ([B, G] if i == 1 else ([B, Y] if i == 3 and big else []))
-            out.append(col(cell(x, N[i]), *st))
-        print('│ ' + ' │ '.join(out) + ' │')
-    print(line('└', '┴', '┘'))
-    print('合计：应用/网站 %d 个 · 访问 %d 次 · 已按网站细分 %s · 该 IP 近7天总流量 %s' % (len(items), sum(g[1] for _n, g in items), sz(counted), sz(max(total, counted))))
+        print(col('查看全部: liuliang --ip %s --all' % ip, D))
     if other > 0 or any(not g[0] for _n, g in items):
-        print(col('流量为「-」的网站走的是 UDP（hy2/tuic）或 mux 连接，只能记次数，流量算在「其他」里', D))
+        print(col('提示: 流量为「-」的连接走 UDP/mux，仅计次数，流量计入「其他」', D))
     return False
-
-
-
-def site_compact(ip, groups, total, show_all=False):
-    """窄版的「这个 IP 访问了哪些应用/网站」：和主表同样的样式，每行不超过 50 格，按最后访问时间从新到旧。"""
-    items = sorted(groups.items(), key=lambda kv: (-kv[1][2], -kv[1][1], kv[0]))
-    limit = len(items) if show_all else 30
-    shown, rest = items[:limit], items[limit:]
-    # 列：序号、应用/网站（最多 16 格，超出用 .. 截断）、流量、次数、最后访问。
-    rows = [[str(n), short(name, 16), sz(g[0]) if g[0] else '-', str(g[1]),
-             datetime.fromtimestamp(g[2], Z).strftime('%m-%d %H:%M') if g[2] else '-'] for n, (name, g) in enumerate(shown, 1)]
-    h = ['#', '应用/网站', '流量', '次数', '最后访问']
-    K = [max([ww(x) for x in [h[i]] + [r[i] for r in rows]]) for i in range(len(h))]
-    print(col(' '.join(cell(x, K[i]) for i, x in enumerate(h)).rstrip(), B, C))
-    for r in rows:
-        print(' '.join(cell(x, K[i]) for i, x in enumerate(r)).rstrip())
-    counted = sum(g[0] for _n, g in items)
-    print('共 %d 个 · 访问 %d 次 · 总流量 %s' % (len(items), sum(g[1] for _n, g in items), sz(max(total, counted))))
-    if rest:
-        print(col('还有 %d 个没显示：liuliang --ip %s --all' % (len(rest), ip), D))
-    if total - counted > 0 or any(not g[0] for _n, g in items):
-        print(col('「-」= UDP/mux 连接，只记次数', D))
-    print(col('看域名明细：liuliang --ip %s --wide' % ip, D))
 
 
 if __name__ == '__main__':
