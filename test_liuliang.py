@@ -793,7 +793,7 @@ class SiteTests(unittest.TestCase):
                 m.report({'ports': [443], 'geo': True}, wide=True)
             text = out.getvalue()
             opened = m.datetime.fromtimestamp(now - 7200, m.Z).strftime('%m-%d %H:%M')
-            self.assertIn('最近活动', text)
+            self.assertIn('最后使用', text)
             last = m.datetime.fromtimestamp(now, m.Z).strftime('%m-%d %H:%M')
             self.assertRegex(text, r'8\.8\.8\.8 .*' + last)
             self.assertIn(opened, self._site_report(temp))
@@ -1182,7 +1182,8 @@ class V124Tests(unittest.TestCase):
             rows = [l for l in text.splitlines() if l[:1].isdigit() or l.startswith('#')]
             self.assertTrue(rows)
             for l in rows:
-                self.assertLessEqual(m.ww(l), 50, l)
+                self.assertLessEqual(m.ww(l), 80, l)
+            self.assertEqual(len({m.ww(l) for l in rows}), 1)
             self.assertNotIn('…', text)
     def test_wide_cells_aligned(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2446,16 +2447,15 @@ class V148Tests(unittest.TestCase):
 
 
 class V110UiTests(unittest.TestCase):
-    """1.1.0：重做界面，独立显示端口、IP、城市、24小时/7天流量，按流量排序，非 Google 归属地查询。"""
+    """1.1.0+：重做界面，独立显示端口、IP、城市、24小时/7天流量与最后使用时间，按最新使用时间排序，内核级端口记录。"""
 
-    def test_default_view_columns_and_traffic_order(self):
+    def test_default_view_columns_and_latest_time_order(self):
         with tempfile.TemporaryDirectory() as temp:
             db = m.open_db(Path(temp) / 'history-v1.db')
             now = m.time.time()
-            m.save_sample(db, {
-                ('up4', '1.1.1.1'): (5 * 1024 ** 2, None),
-                ('up4', '2.2.2.2'): (50 * 1024 ** 2, None),
-            }, now - 60)
+            # 2.2.2.2 流量大但较早使用；1.1.1.1 流量小但最新使用 -> 1.1.1.1 应排在第 1 行
+            m.save_sample(db, {('up4', '2.2.2.2'): (50 * 1024 ** 2, None)}, now - 3600)
+            m.save_sample(db, {('up4', '1.1.1.1'): (5 * 1024 ** 2, None)}, now - 60)
             db.execute("UPDATE clients SET country='中国', city='上海' WHERE ip='2.2.2.2'")
             db.execute("UPDATE clients SET country='美国', city='洛杉矶' WHERE ip='1.1.1.1'")
             m.record_ports(db, {
@@ -2470,10 +2470,11 @@ class V110UiTests(unittest.TestCase):
             lines = text.splitlines()
             table_lines = [l for l in lines if l.startswith('─') or l.startswith('#') or l[:1].isdigit()]
             self.assertEqual(len({m.ww(l) for l in table_lines}), 1)
+            self.assertIn('最后使用', text)
             self.assertIn('中国-上海', text)
             self.assertIn('美国-洛杉矶', text)
-            # 流量大的排在前面
-            self.assertLess(text.index('2.2.2.2'), text.index('1.1.1.1'))
+            # 按最新使用时间排序：1.1.1.1 排在 2.2.2.2 前面
+            self.assertLess(text.index('1.1.1.1'), text.index('2.2.2.2'))
 
     def test_single_port_inferred_when_ip_ports_empty(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2486,6 +2487,30 @@ class V110UiTests(unittest.TestCase):
             text = out.getvalue()
             self.assertRegex(text, r'1  46099  8\.8\.8\.8')
             self.assertNotIn('端口信息将在新连接建立后自动记录', text)
+
+    def test_nft_port_tracking_rules_and_parser(self):
+        text = m.rules([46099, 46762], forward=True, track_ports=True)
+        self.assertIn('set port4 { type ipv4_addr . inet_service;', text)
+        self.assertIn('set port6 { type ipv6_addr . inet_service;', text)
+        self.assertIn('update @port4 { ip saddr . tcp dport }', text)
+        self.assertIn('update @port6 { ip6 saddr . udp dport }', text)
+        doc = {'nftables': [
+            {'set': {'name': 'port4', 'elem': [
+                {'elem': {'val': {'concat': ['111.1.2.3', 46762]}, 'expires': 691100}},
+            ]}},
+            {'set': {'name': 'port6', 'elem': [
+                {'elem': {'val': {'concat': ['2408:8207::1', 46762]}, 'expires': 691000}},
+                {'concat': ['2408:8207::2', 46099]},
+            ]}},
+        ]}
+        pairs = m.parse_nft_ports(doc)
+        self.assertEqual([(ip, p) for ip, p, _e in pairs],
+                         [('111.1.2.3', 46762), ('2408:8207::1', 46762), ('2408:8207::2', 46099)])
+        c = m.open_db(':memory:')
+        m.record_nft_ports(c, pairs, 1000000.0)
+        self.assertEqual(sorted(c.execute('select ip,port from ip_ports').fetchall()),
+                         [('111.1.2.3', 46762), ('2408:8207::1', 46762), ('2408:8207::2', 46099)])
+        c.close()
 
     def test_geo_lookup_has_no_google_dependency(self):
         src = inspect.getsource(m.geo_lookup).lower()

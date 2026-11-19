@@ -18,7 +18,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.1.0'
+VERSION = '1.1.1'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -66,8 +66,9 @@ def ports(value):
     return result
 
 
-def rules(selected, web=(), forward=False):
+def rules(selected, web=(), forward=False, track_ports=False):
     """up/down 四个集合按 IP 数全部端口的字节；web4/web6 只数网站端口（两个方向合计）。
+    track_ports=True 时再建 port4/port6 集合，在内核逐包记录 (IP, 端口)，避免短连接或 IPv6 漏记端口。
 
     forward=True 再加一条 forward 链：中转机用 iptables/nft 把端口转发给别的机器、
     Docker 用 -p 映射的端口，包不进 input/output，只走 forward，以前一个字节都数不到。
@@ -86,11 +87,15 @@ def rules(selected, web=(), forward=False):
         names += [('web', 4), ('web', 6)]
     for direction, version in names:
         lines.append(f' set {direction}{version} {{ type ipv{version}_addr; flags dynamic,timeout; timeout 8d; size 16384; }}')
+    if track_ports:
+        for version in (4, 6):
+            lines.append(f' set port{version} {{ type ipv{version}_addr . inet_service; flags dynamic,timeout; timeout 8d; size 16384; }}')
     for chain, direction, field, address in [('input','up','dport','saddr'), ('output','down','sport','daddr')]:
         lines.append(f' chain {chain} {{ type filter hook {chain} priority 11; policy accept;')
         for version, family in [(4, 'ip'), (6, 'ip6')]:
             for protocol in ('tcp', 'udp'):
-                lines.append(f'  meta nfproto ipv{version} {protocol} {field} {portset} update @{direction}{version} {{ {family} {address} counter }}')
+                pt = f' update @port{version} {{ {family} {address} . {protocol} {field} }}' if (track_ports and chain == 'input') else ''
+                lines.append(f'  meta nfproto ipv{version} {protocol} {field} {portset} update @{direction}{version} {{ {family} {address} counter }}{pt}')
             if web:
                 lines.append(f'  meta nfproto ipv{version} tcp {field} {webset} update @web{version} {{ {family} {address} counter }}')
         lines.append(' }')
@@ -99,16 +104,18 @@ def rules(selected, web=(), forward=False):
         lines.append(' chain forward { type filter hook forward priority 11; policy accept;')
         for version, family in [(4, 'ip'), (6, 'ip6')]:
             for direction, ct, address in [('up', 'original', 'saddr'), ('down', 'reply', 'daddr')]:
-                lines.append(f'  meta nfproto ipv{version} meta l4proto {{ tcp, udp }} ct status dnat ct direction {ct} ct original proto-dst {portset} update @{direction}{version} {{ {family} {address} counter }}')
+                pt = f' update @port{version} {{ {family} {address} . ct original proto-dst }}' if (track_ports and direction == 'up') else ''
+                lines.append(f'  meta nfproto ipv{version} meta l4proto {{ tcp, udp }} ct status dnat ct direction {ct} ct original proto-dst {portset} update @{direction}{version} {{ {family} {address} counter }}{pt}')
         lines.append(' }')
     return '\n'.join(lines + ['}', ''])
 
 
 def nft_rules(selected, web=()):
-    """优先用带 forward 链的规则；这台的 nft/内核不认 conntrack 表达式时，退回只数本机进出的规则。"""
-    text = rules(selected, web, forward=True)
-    if nft_works(text)[0]:
-        return text
+    """优先启用内核逐包端口记录 + forward 链；旧内核不支持时自动逐级回退。"""
+    for fwd, tp in ((True, True), (False, True), (True, False)):
+        text = rules(selected, web, forward=fwd, track_ports=tp)
+        if nft_works(text)[0]:
+            return text
     return rules(selected, web)
 
 
@@ -220,6 +227,45 @@ def parse_counters(document):
         obj = entry.get('set', {})
         if obj.get('name') in ('up4','down4','up6','down6','web4','web6'):
             walk(obj.get('elem', []), obj['name'])
+    return result
+
+
+def parse_nft_ports(document):
+    """从 nft -j 的 port4/port6 集合里解析 [(ip, port, expires)]。"""
+    result = []
+    def walk(obj):
+        if isinstance(obj, dict):
+            if 'elem' in obj and isinstance(obj['elem'], dict):
+                elem = obj['elem']
+                val = elem.get('val')
+                exp = parse_duration(elem.get('expires'))
+                if isinstance(val, dict) and isinstance(val.get('concat'), list) and len(val['concat']) >= 2:
+                    ip = acceptable_ip(val['concat'][0])
+                    try:
+                        port = int(val['concat'][1])
+                    except (TypeError, ValueError):
+                        port = None
+                    if ip is not None and port is not None and 1 <= port <= 65535:
+                        result.append((str(ip), port, exp))
+                return
+            if isinstance(obj.get('concat'), list) and len(obj['concat']) >= 2:
+                ip = acceptable_ip(obj['concat'][0])
+                try:
+                    port = int(obj['concat'][1])
+                except (TypeError, ValueError):
+                    port = None
+                if ip is not None and port is not None and 1 <= port <= 65535:
+                    result.append((str(ip), port, None))
+                return
+            for child in obj.values():
+                walk(child)
+        elif isinstance(obj, list):
+            for child in obj:
+                walk(child)
+    for entry in document.get('nftables', []):
+        obj = entry.get('set', {})
+        if obj.get('name') in ('port4', 'port6'):
+            walk(obj.get('elem', []))
     return result
 
 
@@ -469,6 +515,7 @@ def collect(config, sniffer=None, sites=None):
             boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
             last_boot = c.execute("SELECT value FROM metadata WHERE key='boot'").fetchone()
             save_sample(c, current, now, recreated or not last_boot or last_boot[0] != boot)
+            record_nft_ports(c, parse_nft_ports(doc), now)
             record_ports(c, flows, now)
             save_realip(c, sniffer, now)
             take_pending(c, now)
@@ -1476,29 +1523,33 @@ def parse_ip_packet(pkt):
     return nxt, src, dst, pkt[off:], total
 
 
-def account_packet(pkt, ports, count_tcp, count_udp, local=()):
+def account_packet_port(pkt, ports, count_tcp, count_udp, local=()):
+    """和 account_packet 一样，同时返回命中的本机服务端口：(ip, total, port)。"""
     parsed = parse_ip_packet(pkt)
     if not parsed:
-        return None, 0
+        return None, 0, None
     proto, src, dst, l4, total = parsed
     if proto == 6 and not count_tcp:
-        return None, 0
+        return None, 0, None
     if proto == 17 and not count_udp:
-        return None, 0
+        return None, 0, None
     if proto not in (6, 17) or len(l4) < 4:
-        return None, 0
+        return None, 0, None
     sport, dport = struct.unpack('!HH', l4[:4])
-    # 用户在哪一头：对着统计端口的那一头的对面，而且不能是本机自己
-    # （本机往外连别人的 443 时，两头都不是用户）。
     if dport in ports and src not in local:
-        ip = normalize_ip(src)
+        ip, matched = normalize_ip(src), dport
     elif sport in ports and dst not in local:
-        ip = normalize_ip(dst)
+        ip, matched = normalize_ip(dst), sport
     else:
-        return None, 0
+        return None, 0, None
     if ip is None or total <= 0:
-        return None, 0
-    return str(ip), total
+        return None, 0, None
+    return str(ip), total, matched
+
+
+def account_packet(pkt, ports, count_tcp, count_udp, local=()):
+    ip, total, _port = account_packet_port(pkt, ports, count_tcp, count_udp, local)
+    return ip, total
 
 
 class PacketPump:
@@ -1512,6 +1563,7 @@ class PacketPump:
         self.lock = threading.Lock()
         self.pending = {}
         self.pending_web = {}
+        self.pending_ports = set()
 
     def start(self):
         if not hasattr(socket, 'AF_PACKET'):
@@ -1539,11 +1591,13 @@ class PacketPump:
                 except OSError:
                     continue
                 local = local_ips()
-                ip, n = account_packet(pkt, self.ports, self.count_tcp, self.count_udp, local)
+                ip, n, port = account_packet_port(pkt, self.ports, self.count_tcp, self.count_udp, local)
                 if ip and n > 0:
                     wip, wn = account_packet(pkt, self.web, self.count_tcp, False, local) if self.web else (None, 0)
                     with self.lock:
                         self.pending[ip] = self.pending.get(ip, 0) + n
+                        if port is not None:
+                            self.pending_ports.add((ip, port))
                         if wip and wn > 0:
                             self.pending_web[wip] = self.pending_web.get(wip, 0) + wn
 
@@ -1555,6 +1609,12 @@ class PacketPump:
             data, web = self.pending, self.pending_web
             self.pending, self.pending_web = {}, {}
             return data, web
+
+    def drain_ports(self):
+        with self.lock:
+            pairs = self.pending_ports
+            self.pending_ports = set()
+            return pairs
 
 
 # ---- Hysteria2 自带的流量统计接口 ----
@@ -2023,10 +2083,19 @@ def flow_port(key):
         return None
 
 
-def record_ports(c, flows, now):
-    """连接快照里（IP，本机端口）记下来，表格里的「端口」栏就从这里取。只记「连过哪个端口」，不记流量：
-    nft 按 IP 计数时端口信息已经丢了，ss/conntrack 快照是唯一的来源。短连接可能正好错过采样，
-    看不到不代表没连过；代理连接一般都长，基本都能采到。"""
+def record_nft_ports(c, pairs, now):
+    """把 nft port4/port6 集合里的 (ip, port, expires) 写入 ip_ports。"""
+    for ip, port, exp in pairs or ():
+        if not ip or str(ip).startswith(HY_PREFIX):
+            continue
+        seen = now - max(0.0, SET_TIMEOUT - exp) if exp is not None else now
+        c.execute('INSERT INTO ip_ports(ip,port,last_seen) VALUES(?,?,?) '
+                  'ON CONFLICT(ip,port) DO UPDATE SET last_seen=max(ip_ports.last_seen, excluded.last_seen)',
+                  (str(ip), int(port), seen))
+
+
+def record_ports(c, flows, now, pairs=()):
+    """把连接快照 flows 和抓包得到的 (ip, port) 对记入 ip_ports。"""
     for key, value in (flows or {}).items():
         port = flow_port(key)
         ip = value[0] if value else None
@@ -2035,6 +2104,12 @@ def record_ports(c, flows, now):
         c.execute('INSERT INTO ip_ports(ip,port,last_seen) VALUES(?,?,?) '
                   'ON CONFLICT(ip,port) DO UPDATE SET last_seen=max(ip_ports.last_seen, excluded.last_seen)',
                   (str(ip), port, now))
+    for ip, port in pairs or ():
+        if not ip or port is None or str(ip).startswith(HY_PREFIX):
+            continue
+        c.execute('INSERT INTO ip_ports(ip,port,last_seen) VALUES(?,?,?) '
+                  'ON CONFLICT(ip,port) DO UPDATE SET last_seen=max(ip_ports.last_seen, excluded.last_seen)',
+                  (str(ip), int(port), now))
     c.execute('DELETE FROM ip_ports WHERE last_seen<?', (now - 8 * 86400,))
 
 
@@ -2162,9 +2237,11 @@ def diag_tick(config, flush, pump=None, watcher=None, sniffer=None, sites=None, 
             save_flows(c, baselines)
             add_pending(c, activity, now, web)
             save_realip(c, sniffer, now)
+            pump_ports = pump.drain_ports() if (pump is not None and hasattr(pump, 'drain_ports')) else ()
+            if current or pump_ports:
+                record_ports(c, current, now, pump_ports)
             if flush:
                 take_pending(c, now)
-                record_ports(c, current, now)
                 save_sites(c, sites, now)
                 save_nic(c, now)
                 c.execute("INSERT OR REPLACE INTO metadata VALUES('sample',?)", (str(now),))
@@ -4191,8 +4268,8 @@ def report(config, web_only=False, show_all=False, wide=False):
             if bnets and blocked_match(ip, bnets):
                 bset.add(ip)
             rows.append((ip, net, place, d, w, ls, age, kind, mark, plist))
-        # 按 7 天流量从高到低排，再按 24 小时、最近活动时间：一眼看到谁用得最多。
-        rows.sort(key=lambda r: (-r[4], -r[3], -float(r[5])))
+        # 按最后使用时间从新到旧排序，同时间再按 7 天流量从高到低。
+        rows.sort(key=lambda r: (-float(r[5]), -r[4]))
         scanhidden = 0
         if not show_all and not web_only:
             bad = scan_ips(c, [r for r in rows if r[7] != 'CF节点'], config, opened, now, hasweb)
@@ -4253,27 +4330,24 @@ def report(config, web_only=False, show_all=False, wide=False):
             return
         hyonly = all(r[0].startswith(HY_PREFIX) for r in rows)
         showkind = (not web_only) and any(r[7] != '节点' for r in rows)
-        narrow_tty = (not wide) and sys.stdout.isatty() and shutil.get_terminal_size((80, 24)).columns < 58
+        narrow_tty = (not wide) and sys.stdout.isatty() and shutil.get_terminal_size((80, 24)).columns < 66
         if hyonly:
-            if wide:
-                headers = ['#', '端口', '节点名称', '24小时', '7天', '最近活动']
-                aligns = ['r', 'l', 'l', 'r', 'r', 'l']
-            elif narrow_tty:
-                headers = ['#', '端口', '节点名称', '7天']
-                aligns = ['r', 'l', 'l', 'r']
+            if narrow_tty:
+                headers = ['#', '端口', '节点名称', '7天', '最后使用']
+                aligns = ['r', 'l', 'l', 'r', 'l']
             else:
-                headers = ['#', '端口', '节点名称', '24小时', '7天']
-                aligns = ['r', 'l', 'l', 'r', 'r']
+                headers = ['#', '端口', '节点名称', '24小时', '7天', '最后使用']
+                aligns = ['r', 'l', 'l', 'r', 'r', 'l']
         else:
             if wide:
-                headers = ['#', '端口', 'IP', '城市', '运营商', '24小时', '7天', '最近活动'] + (['类型'] if showkind else [])
+                headers = ['#', '端口', 'IP', '城市', '运营商', '24小时', '7天', '最后使用'] + (['类型'] if showkind else [])
                 aligns = ['r', 'l', 'l', 'l', 'l', 'r', 'r', 'l'] + (['l'] if showkind else [])
             elif narrow_tty:
-                headers = ['#', '端口', 'IP', '城市', '7天']
-                aligns = ['r', 'l', 'l', 'l', 'r']
+                headers = ['#', '端口', 'IP', '城市', '7天', '最后使用']
+                aligns = ['r', 'l', 'l', 'l', 'r', 'l']
             else:
-                headers = ['#', '端口', 'IP', '城市', '24小时', '7天']
-                aligns = ['r', 'l', 'l', 'l', 'r', 'r']
+                headers = ['#', '端口', 'IP', '城市', '24小时', '7天', '最后使用']
+                aligns = ['r', 'l', 'l', 'l', 'r', 'r', 'l']
         trows = []
         tstyles = []
         for idx, (ip, net, pl, d, w, ls, age, kind, mark, plist) in enumerate(rows, 1):
@@ -4292,15 +4366,12 @@ def report(config, web_only=False, show_all=False, wide=False):
             st_ts = [D, X] if dim_row else ([G] if age <= 3600 else ([D] if age > 259200 else []))
             st_kind = [D, X] if dim_row else [D]
             if hyonly:
-                if wide:
+                if narrow_tty:
+                    trows.append([str(idx), ptxt, city_txt, sz(w), ts_txt])
+                    tstyles.append([st_num, st_port, st_ip, st_w, st_ts])
+                else:
                     trows.append([str(idx), ptxt, city_txt, sz(d), sz(w), ts_txt])
                     tstyles.append([st_num, st_port, st_ip, st_d, st_w, st_ts])
-                elif narrow_tty:
-                    trows.append([str(idx), ptxt, city_txt, sz(w)])
-                    tstyles.append([st_num, st_port, st_ip, st_w])
-                else:
-                    trows.append([str(idx), ptxt, city_txt, sz(d), sz(w)])
-                    tstyles.append([st_num, st_port, st_ip, st_d, st_w])
             else:
                 if wide:
                     row_v = [str(idx), ptxt, ip_label, city_txt, short(net, 12), sz(d), sz(w), ts_txt] + ([kind] if showkind else [])
@@ -4308,11 +4379,11 @@ def report(config, web_only=False, show_all=False, wide=False):
                     trows.append(row_v)
                     tstyles.append(row_s)
                 elif narrow_tty:
-                    trows.append([str(idx), ptxt, ip_label, city_txt, sz(w)])
-                    tstyles.append([st_num, st_port, st_ip, st_city, st_w])
+                    trows.append([str(idx), ptxt, ip_label, city_txt, sz(w), ts_txt])
+                    tstyles.append([st_num, st_port, st_ip, st_city, st_w, st_ts])
                 else:
-                    trows.append([str(idx), ptxt, ip_label, city_txt, sz(d), sz(w)])
-                    tstyles.append([st_num, st_port, st_ip, st_city, st_d, st_w])
+                    trows.append([str(idx), ptxt, ip_label, city_txt, sz(d), sz(w), ts_txt])
+                    tstyles.append([st_num, st_port, st_ip, st_city, st_d, st_w, st_ts])
         fmt_table(headers, trows, aligns, tstyles)
         real = [r for r in rows if r[7] != 'CF节点']
         unit = '个节点' if real and all(r[0].startswith(HY_PREFIX) for r in real) else '个 IP'
