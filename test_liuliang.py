@@ -709,13 +709,13 @@ class SiteTests(unittest.TestCase):
         t.tick(101, [self.XRAY], {}, {})
         data, _ = t.drain()
         self.assertEqual(data[('8.8.8.8', 'www.youtube.com')][:2], [7100, 1])
-    def test_tracker_mux_only_counts_hits(self):
+    def test_tracker_mux_splits_bytes_by_weight(self):
         t = m.SiteTracker([443])
         two = [self.XRAY, self.XRAY.replace('www.youtube.com', 'www.netflix.com')]
         t.tick(100, two, m.parse_ss(self.ss(50001, 9000, 0), [443]), {})
         data, _ = t.drain()
-        self.assertEqual(data[('8.8.8.8', 'www.youtube.com')][:2], [0, 1])
-        self.assertEqual(data[('8.8.8.8', 'www.netflix.com')][:2], [0, 1])
+        self.assertEqual(data[('8.8.8.8', 'www.youtube.com')][:2], [4500, 1])
+        self.assertEqual(data[('8.8.8.8', 'www.netflix.com')][:2], [4500, 1])
     def test_tracker_port_reuse_after_close(self):
         t = m.SiteTracker([443])
         t.tick(100, [self.XRAY], m.parse_ss(self.ss(50001, 100, 0), [443]), {})
@@ -757,9 +757,10 @@ class SiteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             self._db(temp, t, traffic=5 * 1024 * 1024)
             text = self._site_report(temp, wide=True)
-        self.assertIn('应用/网站', text); self.assertIn('YouTube', text); self.assertIn('4.0 MB', text)
+        self.assertIn('应用/网站', text); self.assertIn('YouTube', text); self.assertIn('4.7 MB', text)
         self.assertIn('rr1.googlevideo.com 等2个', text); self.assertIn('GitHub', text)
-        self.assertIn('其他（未细分）', text)
+        self.assertNotIn('其他（未细分）', text)
+        self.assertNotIn('未知', text)
         self.assertLess(text.index('YouTube'), text.index('GitHub'))
     def test_site_report_explains_missing_logs(self):
         t = m.SiteTracker([443])
@@ -2516,6 +2517,45 @@ class V110UiTests(unittest.TestCase):
         src = inspect.getsource(m.geo_lookup).lower()
         self.assertNotIn('google', src)
         self.assertIn('ipwho.is', src)
+
+
+class V120DomainTrafficTests(unittest.TestCase):
+    """1.2.0：每个域名显示使用流量，UDP/Hysteria2/mux 连接自动归属流量，不留『其他（未细分）』或『未知』。"""
+
+    def test_udp_hysteria_domains_receive_attributed_traffic(self):
+        # 模拟用户截图场景：kzgrbpzgr.com (5次)、Telegram (4次)、Google (3次)、wmzfylgdsz.com (1次)，原记 bytes=0，总流量 1.1 GB
+        with tempfile.TemporaryDirectory() as temp:
+            db = m.open_db(Path(temp) / 'history-v1.db')
+            now = m.time.time()
+            total = int(1.1 * 1024 ** 3)
+            m.save_sample(db, {('up4', '8.8.8.8'): (total, None)}, now)
+            for host, hits in (('kzgrbpzgr.com', 5), ('149.154.167.51', 4), ('mtalk.google.com', 3), ('wmzfylgdsz.com', 1)):
+                db.execute('INSERT INTO sites(ts,ip,host,bytes,hits,last) VALUES(?,?,?,?,?,?)',
+                           (now, '8.8.8.8', host, 0, hits, now - 60))
+            db.commit(); db.close()
+            out = io.StringIO()
+            with patch.object(m, 'DATA', Path(temp)), contextlib.redirect_stdout(out):
+                m.site_report('8.8.8.8', {'ports': [443]}, wide=False)
+            text = out.getvalue()
+            self.assertNotIn('其他（未细分）', text)
+            self.assertNotIn('未知', text)
+            for label in ('kzgrbpzgr.com', 'Telegram', 'Google', 'wmzfylgdsz.com'):
+                self.assertIn(label, text)
+            # 没有任何一行的流量是 '-'
+            data_lines = [l for l in text.splitlines()[1:] if l[:1].isdigit()]
+            self.assertEqual(len(data_lines), 4)
+            for l in data_lines:
+                self.assertTrue('MB' in l or 'GB' in l or 'KB' in l, l)
+
+    def test_site_tracker_feed_ip_deltas_attributes_uncounted_bytes(self):
+        t = m.SiteTracker([46762])
+        line1 = '2026-11-15T16:18:00+08:00 DEBUG TCP request {"addr": "8.8.8.8:63275", "id": "user", "reqAddr": "www.youtube.com:443"}'
+        line2 = '2026-11-15T16:18:01+08:00 DEBUG TCP request {"addr": "8.8.8.8:63275", "id": "user", "reqAddr": "api.telegram.org:443"}'
+        t.tick(100, [line1, line1, line2], {}, {})
+        t.feed_ip_deltas({'8.8.8.8': 3000}, 100)
+        data, _ = t.drain()
+        self.assertEqual(data[('8.8.8.8', 'www.youtube.com')][0], 2000)
+        self.assertEqual(data[('8.8.8.8', 'api.telegram.org')][0], 1000)
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

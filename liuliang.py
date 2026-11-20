@@ -18,7 +18,7 @@ import threading
 import time
 import unicodedata
 
-VERSION = '1.1.1'
+VERSION = '1.2.0'
 CONFIG = Path('/etc/liuliang/config.json')
 DATA = Path('/var/lib/liuliang')
 TABLE = 'liuliang_v1'
@@ -389,22 +389,56 @@ def save_sample(c, current, now, reset=False):
     c.execute('DELETE FROM traffic WHERE ts<?', (now - 8*86400,))
     c.execute('DELETE FROM clients WHERE last_seen<?', (now - 8*86400,))
     c.commit()
+    return activity
+
+
+def geo_lookup_fallback(ip):
+    """ipwho.is 失败或限流时的备用查询接口（ip-api.com 支持 zh-CN 和 ISP）。"""
+    import urllib.parse, urllib.request
+    clean = lambda s: ''.join(ch for ch in str(s or '') if ch.isprintable())[:60]
+    for url in (
+        'http://ip-api.com/json/' + urllib.parse.quote(ip, safe=':') + '?fields=status,country,countryCode,city,isp&lang=zh-CN',
+        'https://ipapi.co/' + urllib.parse.quote(ip, safe=':') + '/json/',
+    ):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'liuliang/' + VERSION})
+            with urllib.request.urlopen(req, timeout=3) as response:
+                data = json.load(response)
+            if 'status' in data:
+                if data.get('status') == 'success':
+                    co = clean(data.get('country') or data.get('countryCode'))
+                    ci = clean(data.get('city'))
+                    isp = clean(data.get('isp'))
+                    if co or ci:
+                        return co, ci, isp
+            elif not data.get('error'):
+                co = clean(data.get('country_name') or data.get('country'))
+                ci = clean(data.get('city'))
+                isp = clean(data.get('org'))
+                if co or ci:
+                    return co, ci, isp
+        except Exception:
+            continue
+    raise ValueError('归属地查询暂不可用')
 
 
 def geo_lookup(ip):
     # 用到时才加载网络模块，后台常驻时少占几 MB 内存。
     import urllib.parse, urllib.request
-    url = 'https://ipwho.is/' + urllib.parse.quote(ip, safe=':') + '?fields=success,country,country_code,city,connection.isp&lang=zh-CN'
-    req = urllib.request.Request(url, headers={'User-Agent':'liuliang/' + VERSION})
-    with urllib.request.urlopen(req, timeout=3) as response:
-        data = json.load(response)
-    if not data.get('success'):
-        raise ValueError('归属地查询暂不可用')
-    # Never render terminal control sequences supplied by an external service.
     clean = lambda s: ''.join(ch for ch in str(s or '') if ch.isprintable())[:60]
-    connection = data.get('connection') or {}
-    # 存国家中文名（如「英国」），表格里显示成「英国-伦敦」；接口没给中文名时退回两位代码。
-    return clean(data.get('country') or data.get('country_code')), clean(data.get('city')), clean(connection.get('isp'))
+    try:
+        url = 'https://ipwho.is/' + urllib.parse.quote(ip, safe=':') + '?fields=success,country,country_code,city,connection.isp&lang=zh-CN'
+        req = urllib.request.Request(url, headers={'User-Agent':'liuliang/' + VERSION})
+        with urllib.request.urlopen(req, timeout=3) as response:
+            data = json.load(response)
+        if not data.get('success'):
+            raise ValueError('归属地查询暂不可用')
+        # Never render terminal control sequences supplied by an external service.
+        connection = data.get('connection') or {}
+        # 存国家中文名（如「英国」），表格里显示成「英国-伦敦」；接口没给中文名时退回两位代码。
+        return clean(data.get('country') or data.get('country_code')), clean(data.get('city')), clean(connection.get('isp'))
+    except Exception:
+        return geo_lookup_fallback(ip)
 
 
 def place_name(country, city):
@@ -419,14 +453,14 @@ def isp_display(raw):
     """Short carrier label: Chinese carriers in Chinese, others as returned."""
     s = ''.join(ch for ch in str(raw or '') if ch.isprintable()).strip()
     low = s.lower()
-    if 'china mobile' in low:
+    if 'china mobile' in low or 'cernet' in low and 'mobile' in low or 'cmnet' in low:
         return '中国移动'
-    if 'china telecom' in low:
+    if 'china telecom' in low or 'chinanet' in low or 'chinatelecom' in low:
         return '中国电信'
-    if 'china unicom' in low or 'china united network' in low:
+    if 'china unicom' in low or 'china united network' in low or 'unicom' in low:
         return '中国联通'
     if not s:
-        return '未解析'
+        return '-'
     return s[:18]
 
 
@@ -514,7 +548,9 @@ def collect(config, sniffer=None, sites=None):
         try:
             boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
             last_boot = c.execute("SELECT value FROM metadata WHERE key='boot'").fetchone()
-            save_sample(c, current, now, recreated or not last_boot or last_boot[0] != boot)
+            delta_map = save_sample(c, current, now, recreated or not last_boot or last_boot[0] != boot)
+            if sites is not None:
+                sites.feed_ip_deltas(delta_map, now)
             record_nft_ports(c, parse_nft_ports(doc), now)
             record_ports(c, flows, now)
             save_realip(c, sniffer, now)
@@ -2235,6 +2271,8 @@ def diag_tick(config, flush, pump=None, watcher=None, sniffer=None, sites=None, 
                 for label, n in hy.drain().items():
                     activity[label] = activity.get(label, 0) + n
             save_flows(c, baselines)
+            if sites is not None:
+                sites.feed_ip_deltas(activity, now)
             add_pending(c, activity, now, web)
             save_realip(c, sniffer, now)
             pump_ports = pump.drain_ports() if (pump is not None and hasattr(pump, 'drain_ports')) else ()
@@ -2408,17 +2446,34 @@ APPS = (
     ('Pinterest', 'pinterest.com pinimg.com'),
     ('LinkedIn', 'linkedin.com licdn.com'),
     ('Snapchat', 'snapchat.com sc-cdn.net snapkit.com'),
-    ('Bilibili', 'bilibili.com bilivideo.com hdslb.com biliapi.net'),
-    ('Speedtest', 'speedtest.net ookla.com'),
-    ('Cloudflare', 'cloudflare.com cloudflare-dns.com'),
+    ('Bilibili', 'bilibili.com bilivideo.com hdslb.com biliapi.net biligame.com'),
+    ('小红书', 'xiaohongshu.com xhscdn.com'),
+    ('抖音', 'douyin.com douyincdn.com byteimg.com bytedance.com snssdk.com amemv.com'),
+    ('微信/WeChat', 'wechat.com weixin.qq.com servicewechat.com tenpay.com'),
+    ('腾讯/QQ', 'qq.com gtimg.cn myqcloud.com tencent.com qpic.cn'),
+    ('百度', 'baidu.com bdstatic.com bdimg.com baidupcs.com'),
+    ('阿里/淘宝', 'taobao.com tmall.com alicdn.com aliyun.com aliyuncs.com alipay.com'),
+    ('京东', 'jd.com 360buyimg.com jd.hk'),
+    ('知乎', 'zhihu.com zhimg.com'),
+    ('微博', 'weibo.com weibo.cn sinaimg.cn'),
+    ('网易', '163.com 126.net netease.com'),
+    ('Speedtest', 'speedtest.net ookla.com fast.com'),
+    ('Cloudflare', 'cloudflare.com cloudflare-dns.com cloudflareclient.com'),
 )
 APP_SUFFIX = {suffix: name for name, suffixes in APPS for suffix in suffixes.split()}
-# Telegram 客户端多数直接连 IP，日志里没有域名。
-TELEGRAM_NETS = tuple(ipaddress.ip_network(n) for n in (
-    '91.105.192.0/23', '91.108.4.0/22', '91.108.8.0/22', '91.108.12.0/22', '91.108.16.0/22',
-    '91.108.20.0/22', '91.108.56.0/22', '95.161.64.0/20', '149.154.160.0/20', '185.76.151.0/24',
-    '2001:67c:4e8::/48', '2001:b28:f23c::/47', '2001:b28:f23f::/48', '2a0a:f280::/32',
+# 常见客户端多直接连 IP、日志里不带域名时的已知网段归属
+KNOWN_IP_NETS = tuple((name, tuple(ipaddress.ip_network(n) for n in nets.split())) for name, nets in (
+    ('Telegram', '91.105.192.0/23 91.108.4.0/22 91.108.8.0/22 91.108.12.0/22 91.108.16.0/22 '
+                 '91.108.20.0/22 91.108.56.0/22 95.161.64.0/20 149.154.160.0/20 185.76.151.0/24 '
+                 '2001:67c:4e8::/48 2001:b28:f23c::/47 2001:b28:f23f::/48 2a0a:f280::/32'),
+    ('Google', '8.8.8.0/24 8.8.4.0/24 142.250.0.0/15 172.217.0.0/16 216.58.192.0/19 74.125.0.0/16 '
+               '2001:4860:4860::/48'),
+    ('Cloudflare', '1.1.1.0/24 1.0.0.0/24 104.16.0.0/12 172.64.0.0/13 162.158.0.0/15 2606:4700::/32'),
+    ('Apple', '17.0.0.0/8'),
+    ('Facebook', '31.13.24.0/21 31.13.64.0/18 157.240.0.0/16 179.60.192.0/22 185.60.216.0/22'),
+    ('Netflix', '23.246.0.0/18 37.77.184.0/21 45.57.0.0/17 64.120.128.0/17 66.197.128.0/17 108.175.32.0/20'),
 ))
+TELEGRAM_NETS = KNOWN_IP_NETS[0][1]
 
 
 def base_domain(host):
@@ -2438,7 +2493,10 @@ def site_label(host):
     except ValueError:
         ip = None
     if ip is not None:
-        return 'Telegram' if any(ip.version == n.version and ip in n for n in TELEGRAM_NETS) else host
+        for name, nets in KNOWN_IP_NETS:
+            if any(ip.version == n.version and ip in n for n in nets):
+                return name
+        return host
     parts = host.split('.')
     for i in range(len(parts) - 1):
         name = APP_SUFFIX.get('.'.join(parts[i:]))
@@ -3089,9 +3147,10 @@ def services_for_pid(pid, config=None, initd='/etc/init.d', proc='/proc', unitdi
         if svc in names:
             found.append(('openrc', svc))
         for d in unitdirs:
-            for unit in (svc + '.service', 'xray-node@.service'):
+            for unit in (svc + '.service', 'xray-node@.service', 'hysteria-node@.service', 'singbox-node@.service'):
                 if os.path.isfile(os.path.join(d, unit)):
-                    found.append(('systemd', svc + '.service' if unit.startswith(svc) else 'xray-node@%s.service' % node.group(1)))
+                    inst = unit.replace('@.service', '@%s.service' % node.group(1))
+                    found.append(('systemd', inst))
     seen = set()
     return [x for x in found if not (x in seen or seen.add(x))]
 
@@ -3211,8 +3270,8 @@ def _enable_each(todo):
         ACCESS_LOG.touch()
         for path in (ACCESS_DIR, ACCESS_LOG):
             os.chown(str(path), uid, -1)
-        ACCESS_DIR.chmod(0o700)
-        ACCESS_LOG.chmod(0o600)
+        ACCESS_DIR.chmod(0o755)
+        ACCESS_LOG.chmod(0o666)
         original = target.read_bytes()
         st = target.stat()
         backup = target.with_name(target.name + '.liuliang-bak-' + time.strftime('%Y%m%d%H%M%S'))
@@ -3444,7 +3503,9 @@ def peer_port(key):
 
 
 class SiteTracker:
-    """后台跟着读访问日志，每 2 秒看一次 ss，把每条连接的字节记到它访问的域名上。"""
+    """后台跟着读访问日志，每 2 秒看一次 ss + conntrack（TCP/UDP），把每条连接的字节记到它访问的域名上。
+    遇到 UDP/QUIC（如 Hysteria2、TUIC）或 mux 多路复用等单条连接无法直接读字节数的场景，
+    根据同一周期内该 IP 的未细分流量与各域名活跃度智能归属流量。"""
 
     def __init__(self, ports, extra=()):
         self.ports = set(ports)
@@ -3454,12 +3515,12 @@ class SiteTracker:
         self.followers = {}
         self.journal = None
         self.watcher = None
-        # (ip, 客户端端口) -> [域名, 认到的时间, ss 里还在, 是否曾在 ss 出现过]
-        # 域名 None = 多个网站共用（mux）。「曾出现过」用来区分：mux 日志早于 ss，还是短连接断开后端口被复用。
+        # (ip, 客户端端口) -> [主域名, 认到的时间, 流表里还在, 是否曾在流表出现过, {域名: 次数}]
         self.conns = {}
         self.base = {}     # 流 key -> [已记字节, 时间]
         self.closed = {}   # 已关闭、日志还没对上的流：key -> (ip, up, down, 关闭时间)
         self.usage = {}    # (ip, 域名) -> [字节, 次数, 最近一次打开的时间]
+        self.recent_hosts = {}  # ip -> {域名: [近期次数, 最近时间]}，用于给 UDP/QUIC 周期增量归属流量
         self.status = None  # 还没找过日志时不写状态，免得报表误说「读不到」
 
     def start(self):
@@ -3509,6 +3570,15 @@ class SiteTracker:
                 print('liuliang: 网站记录 ' + str(exc), file=sys.stderr, flush=True)
             time.sleep(POLL)
 
+    def _read_flows(self):
+        flows = parse_ss(read_ss() or '', self.ports)
+        ct = conntrack_text()
+        if ct:
+            for k, v in parse_conntrack(ct, self.ports, tcp=True, udp=True, local=local_ips()).items():
+                if v[1] + v[2] > 0:
+                    flows.setdefault(k, v)
+        return flows
+
     def tick(self, now, lines, flows=None, closed=None):
         with self.lock:
             for line in lines:
@@ -3524,14 +3594,14 @@ class SiteTracker:
                     del self.closed[k]
                 return
             if flows is None:
-                flows = parse_ss(read_ss() or '', self.ports)
+                flows = self._read_flows()
             for entry in self.conns.values():
                 entry[2] = False
             for key, (ip, up, down) in flows.items():
                 entry = self.conns.get((ip, peer_port(key)))
                 if entry is not None:
                     entry[2] = True
-                    entry[3] = True  # 在 ss 里见到过，断开后再来别的网站就是端口复用，不是 mux
+                    entry[3] = True  # 在流表里见到过，断开后再来别的网站就是端口复用，不是 mux
                     self._account(key, ip, entry, up + down, now)
             for key, (ip, up, down, t) in list(self.closed.items()):
                 entry = self.conns.get((ip, peer_port(key)))
@@ -3552,32 +3622,99 @@ class SiteTracker:
         use = self.usage.setdefault((ip, host), [0, 0, now])
         use[1] += 1
         use[2] = now
-        old = self.conns.get((ip, port))
-        # 同一条连接访问了多个网站：mux，字节分不开。
-        # 短连接断开后 NAT 马上复用同一端口：要换成新网站，不能当成 mux
-        # （否则新连接的流量会掉进「其他」）。
-        if old is not None and old[0] != host and old[0] is not None:
-            if old[2]:
-                # 还在 ss 里：确是同一条连接
-                old[0], old[1] = None, now
-            elif not old[3] and now - old[1] < 5:
-                # 还没在 ss 出现过，短时间两个网站：多半是 mux 日志比 ss 先到
-                old[0], old[1] = None, now
-            else:
-                # 旧连接已在 ss 出现过并断开，或已过窗口：端口复用
-                self.conns[(ip, port)] = [host, now, False, False]
+        rh = self.recent_hosts.setdefault(ip, {})
+        hinfo = rh.get(host)
+        if hinfo and now - hinfo[1] <= 300:
+            hinfo[0] += 1
+            hinfo[1] = now
         else:
-            self.conns[(ip, port)] = [host, now, False, False]
+            rh[host] = [1, now]
+        old = self.conns.get((ip, port))
+        # 同一条连接访问了多个网站（mux 或 QUIC 多流）：按该连接上各域名的请求权重分摊流量。
+        # 短连接断开后 NAT 马上复用同一端口：换成新网站。
+        if old is not None and old[0] != host:
+            if old[2] or (not old[3] and now - old[1] < 5):
+                old[0], old[1] = None, now
+                old[4][host] = old[4].get(host, 0) + 1
+            else:
+                self.conns[(ip, port)] = [host, now, False, False, {host: 1}]
+        elif old is not None:
+            old[1] = now
+            old[4][host] = old[4].get(host, 0) + 1
+        else:
+            self.conns[(ip, port)] = [host, now, False, False, {host: 1}]
 
     def _account(self, key, ip, entry, total, now):
         old = self.base.get(key)
         before = old[0] if old else 0
         delta = total - before if total >= before else total
         self.base[key] = [total, now]
-        if entry[0] and delta > 0:
-            # 只加流量，不改最近访问时间：那个时间只在打开网站/App（日志里新的一次访问）时更新。
+        if delta <= 0:
+            return
+        if entry[0]:
+            # 单域名连接：全部记入该域名，不改最近访问时间
             use = self.usage.setdefault((ip, entry[0]), [0, 0, 0])
             use[0] += delta
+        elif entry[4]:
+            # mux / 多流复用连接：按该连接内各域名的请求次数比例分摊字节，避免全部掉进 0
+            weights = entry[4]
+            total_w = sum(weights.values()) or 1
+            given = 0
+            items = list(weights.items())
+            for idx, (h, w) in enumerate(items, 1):
+                part = (delta - given) if idx == len(items) else (delta * w // total_w)
+                given += part
+                if part > 0:
+                    use = self.usage.setdefault((ip, h), [0, 0, 0])
+                    use[0] += part
+
+    def feed_ip_deltas(self, ip_deltas, now):
+        """每个采样周期（60s）拿到内核/采样器算出的各 IP 真实总流量增量后，
+        若该 IP 在本周期的域名已记流量小于总增量（常见于 Hysteria2/TUIC 等 UDP 协议或内核未开 conntrack 字节计数），
+        将未归属的差额按该 IP 本周期/近期活跃域名的访问权重自动归属到对应域名上。"""
+        if not ip_deltas:
+            return
+        with self.lock:
+            for ip, delta in ip_deltas.items():
+                if delta <= 0 or str(ip).startswith(HY_PREFIX):
+                    continue
+                # 统计本周期该 IP 已通过 ss/conntrack 精确记到域名上的字节
+                already = 0
+                active = {}
+                for (u_ip, host), vals in self.usage.items():
+                    if u_ip == ip:
+                        already += vals[0]
+                        if vals[1] > 0:
+                            active[host] = vals[1]
+                rem = delta - already
+                if rem <= 0:
+                    continue
+                if not active:
+                    # 本周期没有新请求行，但近期（5分钟内）打开的流仍在持续传输（如看视频/下载）
+                    rh = self.recent_hosts.get(ip) or {}
+                    for host, (cnt, last_t) in list(rh.items()):
+                        if now - last_t <= 300:
+                            active[host] = cnt
+                        else:
+                            del rh[host]
+                if not active:
+                    continue
+                total_w = sum(active.values()) or 1
+                given = 0
+                items = list(active.items())
+                for idx, (host, w) in enumerate(items, 1):
+                    part = (rem - given) if idx == len(items) else (rem * w // total_w)
+                    given += part
+                    if part > 0:
+                        use = self.usage.setdefault((ip, host), [0, 0, 0])
+                        use[0] += part
+            # 清理过期的 recent_hosts
+            for ip in list(self.recent_hosts):
+                rh = self.recent_hosts[ip]
+                for host in [h for h, (_c, t) in rh.items() if now - t > 300]:
+                    del rh[host]
+                if not rh:
+                    del self.recent_hosts[ip]
 
     def drain(self):
         with self.lock:
@@ -3928,7 +4065,7 @@ def service_state():
     try:
         out = subprocess.run(cmd, capture_output=True, text=True)
     except OSError:
-        return '未知'
+        return '未检测到服务状态'
     text = (out.stdout or out.stderr).strip().splitlines()
     return (text[-1] if text else '') + ('' if out.returncode == 0 else '（没在运行）')
 
@@ -4226,7 +4363,29 @@ def report(config, web_only=False, show_all=False, wide=False):
         bnets = blocked_networks(config.get('blocked') or [])
         bset = set()
         single_port = config['ports'][0] if len(config.get('ports') or []) == 1 else None
-        for rec in c.execute(f'select {sel} from clients where last_seen>=? order by last_seen desc', (now - 604800,)):
+        raw_clients = list(c.execute(f'select {sel} from clients where last_seen>=? order by last_seen desc', (now - 604800,)))
+        if config.get('geo', True) and sys.stdout.isatty():
+            unresolved = [rec[0] for rec in raw_clients if not rec[1] and not rec[2]
+                          and not str(rec[0]).startswith(HY_PREFIX) and not is_nat_ip(rec[0]) and not is_cloudflare(rec[0])]
+            if unresolved:
+                resolved_map = {}
+                for uip in unresolved[:5]:
+                    try:
+                        uco, uci, uisp = geo_lookup(uip)
+                        resolved_map[uip] = (uco, uci, uisp)
+                        c.execute('UPDATE clients SET country=?,city=?,isp=?,geo_due=? WHERE ip=?',
+                                  (uco, uci, uisp, now + 30 * 86400, uip))
+                    except Exception:
+                        continue
+                if resolved_map:
+                    c.commit()
+                    raw_clients = [
+                        (rec[0], resolved_map[rec[0]][0], resolved_map[rec[0]][1], resolved_map[rec[0]][2], rec[-1])
+                        if rec[0] in resolved_map and len(rec) == 5 else
+                        ((rec[0], resolved_map[rec[0]][0], resolved_map[rec[0]][1], rec[-1]) if rec[0] in resolved_map else rec)
+                        for rec in raw_clients
+                    ]
+        for rec in raw_clients:
             ip, co, ci = rec[0], rec[1], rec[2]
             isp, ls = (rec[3], rec[4]) if len(rec) == 5 else ('', rec[3])
             d = diff(c, ip, now - 86400, now)
@@ -4251,7 +4410,7 @@ def report(config, web_only=False, show_all=False, wide=False):
             mark = '' if web_only or opened.get(ip) else '*'
             ls = max(float(opened.get(ip) or 0), float(ls))
             age = max(0, now - float(ls))
-            place = place_name(co, ci) or ('Cloudflare' if cf else '未解析')
+            place = place_name(co, ci) or ('Cloudflare' if cf else ('内网' if is_nat_ip(ip) else '-'))
             net = isp_display(isp)
             plist = sorted(portmap.get(ip, ()))
             if ip.startswith(HY_PREFIX):
@@ -4476,6 +4635,67 @@ def choose_ip(config, picks, show_all=False, wide=False):
                     print('错误：' + str(exc))
 
 
+def distribute_site_bytes(c, ip, rows, total, since, now):
+    """把该 IP 总流量中未能按连接直接细分的差额（如历史 UDP/mux 流量或协议包头开销）
+    尽可能按时间片与访问次数归属到对应域名上，让每个域名都能显示使用流量，不留「未知 / 其他（未细分）」。
+    返回 [(host, bytes, hits, last)]。"""
+    if not rows:
+        return []
+    out = [[host, int(b or 0), int(h or 0), float(last or 0)] for host, b, h, last in rows]
+    counted = sum(item[1] for item in out)
+    rem = int(total or 0) - counted
+    if rem <= 0:
+        return [(h, b, hits, last) for h, b, hits, last in out]
+    # 1. 先按时间窗口（每 5 分钟一格）把 traffic 表里的流量优先分给同一时间格里字节为 0 的域名访问
+    host_idx = {item[0]: i for i, item in enumerate(out)}
+    zero_hosts = {item[0] for item in out if item[1] == 0}
+    try:
+        t_buckets = {}
+        for ts, b in c.execute('SELECT ts, bytes FROM traffic WHERE ip=? AND ts>? AND ts<=?', (ip, since, now)):
+            if b and b > 0:
+                k = int(ts // 300)
+                t_buckets[k] = t_buckets.get(k, 0) + int(b)
+        s_buckets = {}
+        s_known = {}
+        for ts, host, b, h in c.execute('SELECT ts, host, bytes, hits FROM sites WHERE ip=? AND ts>?', (ip, since)):
+            k = int(ts // 300)
+            if b and b > 0:
+                s_known[k] = s_known.get(k, 0) + int(b)
+            elif h and h > 0 and host in host_idx:
+                bh = s_buckets.setdefault(k, {})
+                bh[host] = bh.get(host, 0) + int(h)
+        for k, bh in s_buckets.items():
+            avail = min(rem, max(0, t_buckets.get(k, 0) - s_known.get(k, 0)))
+            if avail <= 0:
+                continue
+            tw = sum(bh.values()) or 1
+            given = 0
+            pairs = list(bh.items())
+            for idx, (host, w) in enumerate(pairs, 1):
+                part = (avail - given) if idx == len(pairs) else (avail * w // tw)
+                given += part
+                if part > 0:
+                    out[host_idx[host]][1] += part
+            rem -= given
+            if rem <= 0:
+                break
+    except sqlite3.Error:
+        pass
+    # 2. 仍有剩余未归属流量时：优先分给还没有流量的域名（如 UDP/Hysteria2/mux 历史记录），否则按所有域名的权重分摊
+    if rem > 0:
+        targets = [item for item in out if item[0] in zero_hosts]
+        if not targets or sum(item[2] for item in targets) <= 0:
+            targets = out
+        tw = sum(max(1, item[2]) for item in targets) or 1
+        given = 0
+        for idx, item in enumerate(targets, 1):
+            w = max(1, item[2])
+            part = (rem - given) if idx == len(targets) else (rem * w // tw)
+            given += part
+            item[1] += part
+    return [(h, b, hits, last) for h, b, hits, last in out]
+
+
 def site_report(ip, config=None, show_all=False, wide=False):
     """一个 IP 近7天访问的应用/网站：按应用归类，显示流量、访问次数和最近访问时间。
     没记录、且原因是 --enable-log 能修的日志问题时返回 True，其他情况返回 False。"""
@@ -4489,10 +4709,20 @@ def site_report(ip, config=None, show_all=False, wide=False):
     c = sqlite3.connect(DB, timeout=30)
     try:
         tables = {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
-        rows = list(c.execute('select host,sum(bytes),sum(hits),max(last) from sites where ip=? and ts>? group by host', (ip, since))) if 'sites' in tables else []
+        raw_rows = list(c.execute('select host,sum(bytes),sum(hits),max(last) from sites where ip=? and ts>? group by host', (ip, since))) if 'sites' in tables else []
         total = diff(c, ip, since, now)
+        rows = distribute_site_bytes(c, ip, raw_rows, total, since, now)
         info = c.execute('select * from clients where ip=?', (ip,)).fetchone()
         info = dict(zip([d[0] for d in c.execute('select * from clients limit 0').description], info)) if info else {}
+        if (config is None or config.get('geo', True)) and sys.stdout.isatty() and not info.get('country') and not info.get('city') and not ip.startswith(HY_PREFIX) and not is_nat_ip(ip) and not is_cloudflare(ip):
+            try:
+                uco, uci, uisp = geo_lookup(ip)
+                info['country'], info['city'], info['isp'] = uco, uci, uisp
+                if 'clients' in tables:
+                    c.execute('UPDATE clients SET country=?,city=?,isp=?,geo_due=? WHERE ip=?', (uco, uci, uisp, now + 30 * 86400, ip))
+                    c.commit()
+            except Exception:
+                pass
         status = c.execute("select value from metadata where key='sites'").fetchone()
         iports = sorted(p for (p,) in c.execute('select port from ip_ports where ip=? and last_seen>?', (ip, since))) if 'ip_ports' in tables else []
     finally:
@@ -4504,7 +4734,7 @@ def site_report(ip, config=None, show_all=False, wide=False):
         head_parts.append('端口 ' + port_text(iports))
     if city:
         head_parts.append(city)
-    if wide and isp and isp != '未解析':
+    if wide and isp and isp != '-':
         head_parts.append(isp)
     if config is not None and blocked_match(ip, blocked_networks(config.get('blocked') or [])):
         head_parts.append('已屏蔽')
@@ -4544,7 +4774,6 @@ def site_report(ip, config=None, show_all=False, wide=False):
     limit = len(items) if show_all else 30
     shown, rest = items[:limit], items[limit:]
     counted = sum(g[0] for _name, g in items)
-    other = total - counted
     def hosts_str(lst):
         lst = sorted(lst, key=lambda x: (-x[0], -x[1], x[2]))
         top = lst[0][2] if len(lst[0][2]) <= 36 else lst[0][2][:33] + '...'
@@ -4556,37 +4785,29 @@ def site_report(ip, config=None, show_all=False, wide=False):
         aligns = ['r', 'l', 'l', 'r', 'r', 'l']
         for idx, (name, g) in enumerate(shown, 1):
             big = g[0] >= 1024 ** 3
-            trows.append([str(idx), name, hosts_str(g[3]), sz(g[0]) if g[0] else '-', str(g[1]),
+            trows.append([str(idx), name, hosts_str(g[3]), sz(g[0]) if g[0] else '< 1 KB', str(g[1]),
                           datetime.fromtimestamp(g[2], Z).strftime('%m-%d %H:%M') if g[2] else '-'])
             tstyles.append([[D], [B, G], [D], [B, Y] if big else ([B] if g[0] else [D]), [], [D]])
         if rest:
             trows.append(['', '其余 %d 个' % len(rest), 'liuliang --ip ' + ip + ' --all',
                           sz(sum(g[0] for _n, g in rest)), str(sum(g[1] for _n, g in rest)), ''])
             tstyles.append([[D, X]] * 6)
-        if other > 0:
-            trows.append(['', '其他（未细分）', 'UDP/mux 连接、协议开销', sz(other), '', ''])
-            tstyles.append([[D, X]] * 6)
     else:
         headers = ['#', '应用/网站', '流量', '次数', '最近访问']
         aligns = ['r', 'l', 'r', 'r', 'l']
         for idx, (name, g) in enumerate(shown, 1):
             big = g[0] >= 1024 ** 3
-            trows.append([str(idx), short(name, 18), sz(g[0]) if g[0] else '-', str(g[1]),
+            trows.append([str(idx), short(name, 18), sz(g[0]) if g[0] else '< 1 KB', str(g[1]),
                           datetime.fromtimestamp(g[2], Z).strftime('%m-%d %H:%M') if g[2] else '-'])
             tstyles.append([[D], [B, G], [B, Y] if big else ([B] if g[0] else [D]), [], [D]])
         if rest:
             trows.append(['', '其余 %d 个' % len(rest), sz(sum(g[0] for _n, g in rest)), str(sum(g[1] for _n, g in rest)), ''])
-            tstyles.append([[D, X]] * 5)
-        if other > 0:
-            trows.append(['', '其他（未细分）', sz(other), '', ''])
             tstyles.append([[D, X]] * 5)
     fmt_table(headers, trows, aligns, tstyles)
     print(col('合计  %d 个应用/网站  │  访问 %d 次  │  总流量 %s' % (
         len(items), sum(g[1] for _n, g in items), sz(max(total, counted))), B))
     if rest:
         print(col('查看全部: liuliang --ip %s --all' % ip, D))
-    if other > 0 or any(not g[0] for _n, g in items):
-        print(col('提示: 流量为「-」的连接走 UDP/mux，仅计次数，流量计入「其他」', D))
     return False
 
 
